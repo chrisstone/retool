@@ -57,6 +57,7 @@ void CliOutput::clear_progress_line() {
         WriteConsoleA(console, blank, 82, &written, NULL);
         progress_active_ = false;
         last_line_len_ = 0;
+        last_progress_file_.clear();
     }
 }
 
@@ -160,6 +161,11 @@ std::string CliOutput::render_progress_bar(double percent) const {
 void CliOutput::progress(const std::wstring& filename, ULONGLONG current, ULONGLONG total) {
     if (total == 0) return;
 
+    // Ignore duplicate progress calls for an already completed file
+    if (filename == last_progress_file_ && !progress_active_) {
+        return;
+    }
+
     auto now = std::chrono::steady_clock::now();
 
     // Initialize timing on first call or new file
@@ -242,6 +248,7 @@ void CliOutput::flush() {
         progress_active_ = false;
         last_line_len_ = 0;
     }
+    last_progress_file_.clear();
     out().flush();
 }
 
