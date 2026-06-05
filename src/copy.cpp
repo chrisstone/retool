@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <expected>
 #include <memory>
 #include <string>
@@ -12,6 +13,9 @@
 #include "util.h"
 
 namespace copy {
+
+std::atomic<bool> g_cancel_requested{false};
+BOOL g_cancel_requested_bool = FALSE;
 
 // ============================================================================
 // Data Structures
@@ -513,11 +517,14 @@ std::expected<bool, std::wstring> copy_bytes_physical(
         return std::unexpected(L"SetFilePointerEx failed on destination: " + util::get_win32_error_message(GetLastError()));
     }
 
-    // Copy in 64 KB chunks
-    std::vector<BYTE> io_buffer(64 * 1024);
+    // Copy in 4 MB chunks to optimize sequential I/O throughput
+    std::vector<BYTE> io_buffer(4 * 1024 * 1024);
     ULONGLONG copied = 0;
 
     while (copied < byte_count) {
+        if (g_cancel_requested) {
+            return std::unexpected(L"Copy cancelled by user.");
+        }
         DWORD to_read = static_cast<DWORD>(std::min<ULONGLONG>(io_buffer.size(), byte_count - copied));
         DWORD read = 0;
         if (!ReadFile(src_handle, io_buffer.data(), to_read, &read, NULL) || read == 0) {
@@ -608,7 +615,7 @@ struct FallbackCopyStrategy : ICopyStrategy {
 
         // Use progress callback for CopyFileExW
         ProgressContext prog_ctx{src, context.out};
-        if (!CopyFileExW(src.c_str(), dest.c_str(), &copy_progress_callback, &prog_ctx, NULL, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
+        if (!CopyFileExW(src.c_str(), dest.c_str(), &copy_progress_callback, &prog_ctx, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
             DWORD error = GetLastError();
             return std::unexpected(L"Fallback CopyFileExW failed: " + util::get_win32_error_message(error));
         }
@@ -645,6 +652,9 @@ private:
     ) {
         auto* ctx = static_cast<ProgressContext*>(lpData);
         ctx->total_size = TotalFileSize.QuadPart;
+        if (g_cancel_requested) {
+            return PROGRESS_CANCEL;
+        }
         if (ctx->out) {
             ctx->out->progress(ctx->filename,
                 static_cast<ULONGLONG>(TotalBytesTransferred.QuadPart),
@@ -696,22 +706,53 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
 
         // Query extents
         auto extents_result = query_retrieval_pointers(src_handle.get());
-        if (!extents_result) return attempt_fallback(src, dest, extents_result.error(), context);
+        if (!extents_result) {
+            dest_handle.close();
+            src_handle.close();
+            if (g_cancel_requested) {
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            return attempt_fallback(src, dest, extents_result.error(), context);
+        }
 
         // Clone each extent
         ULONGLONG bytes_cloned = 0;
         for (const auto& ext : *extents_result) {
             if (ext.is_sparse()) continue;
 
+            if (g_cancel_requested) {
+                dest_handle.close();
+                src_handle.close();
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+
             ULONGLONG src_offset = ext.vcn * context.src_cluster_size;
             ULONGLONG byte_count = ext.cluster_count() * context.src_cluster_size;
             ULONGLONG required_size = src_offset + byte_count;
 
             auto size_ok = ensure_dest_size(dest_handle.get(), tracker, required_size);
-            if (!size_ok) return attempt_fallback(src, dest, size_ok.error(), context);
+            if (!size_ok) {
+                dest_handle.close();
+                src_handle.close();
+                if (g_cancel_requested) {
+                    DeleteFileW(dest.c_str());
+                    return std::unexpected(L"Copy cancelled by user.");
+                }
+                return attempt_fallback(src, dest, size_ok.error(), context);
+            }
 
             auto clone_ok = clone_extent_same_volume(dest_handle.get(), src_handle.get(), src_offset, src_offset, byte_count);
-            if (!clone_ok) return attempt_fallback(src, dest, clone_ok.error(), context);
+            if (!clone_ok) {
+                dest_handle.close();
+                src_handle.close();
+                if (g_cancel_requested) {
+                    DeleteFileW(dest.c_str());
+                    return std::unexpected(L"Copy cancelled by user.");
+                }
+                return attempt_fallback(src, dest, clone_ok.error(), context);
+            }
 
             bytes_cloned += byte_count;
             context.out->progress(src, bytes_cloned, static_cast<ULONGLONG>(src_size.QuadPart));
@@ -719,7 +760,15 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
 
         // Finalize
         auto final_ok = finalize_dest_file(dest_handle.get(), src_handle.get(), src_size.QuadPart);
-        if (!final_ok) return std::unexpected(final_ok.error());
+        if (!final_ok) {
+            dest_handle.close();
+            src_handle.close();
+            if (g_cancel_requested) {
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            return std::unexpected(final_ok.error());
+        }
 
         context.stats.cloned_files++;
         context.stats.total_files++;
@@ -738,10 +787,13 @@ private:
         const std::wstring& original_error, CopyContext& context
     ) {
         DeleteFileW(dest.c_str());
+        if (g_cancel_requested) {
+            return std::unexpected(L"Copy cancelled by user.");
+        }
         context.out->warn(L"Deduplication-preserving copy failed (" + original_error
             + L"). Falling back to standard copy for: " + src);
 
-        if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, NULL, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
+        if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
             DWORD error = GetLastError();
             return std::unexpected(L"Dedup copy failed (" + original_error + L"), and fallback copy failed: " + util::get_win32_error_message(error));
         }
@@ -795,25 +847,54 @@ struct CrossVolumeRefsCopyStrategy : ICopyStrategy {
 
         // Query extents
         auto extents_result = query_retrieval_pointers(src_handle.get());
-        if (!extents_result) return attempt_fallback(src, dest, extents_result.error(), context);
+        if (!extents_result) {
+            dest_handle.close();
+            src_handle.close();
+            if (g_cancel_requested) {
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            return attempt_fallback(src, dest, extents_result.error(), context);
+        }
 
         // Process each extent cluster-by-cluster
         ULONGLONG bytes_processed = 0;
         for (const auto& ext : *extents_result) {
             if (ext.is_sparse()) continue;
 
+            if (g_cancel_requested) {
+                dest_handle.close();
+                src_handle.close();
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+
             auto result = process_cross_volume_extent(
                 ext, src_handle.get(), dest_handle.get(),
                 src_size.QuadPart, src, dest, tracker, context, bytes_processed
             );
             if (!result) {
+                dest_handle.close();
+                src_handle.close();
+                if (g_cancel_requested) {
+                    DeleteFileW(dest.c_str());
+                    return std::unexpected(L"Copy cancelled by user.");
+                }
                 return attempt_fallback(src, dest, result.error(), context);
             }
         }
 
         // Finalize
         auto final_ok = finalize_dest_file(dest_handle.get(), src_handle.get(), src_size.QuadPart);
-        if (!final_ok) return std::unexpected(final_ok.error());
+        if (!final_ok) {
+            dest_handle.close();
+            src_handle.close();
+            if (g_cancel_requested) {
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            return std::unexpected(final_ok.error());
+        }
 
         context.stats.cloned_files++;
         context.stats.total_files++;
@@ -838,6 +919,9 @@ private:
     ) {
         ULONGLONG c_offset = 0;
         while (c_offset < ext.cluster_count()) {
+            if (g_cancel_requested) {
+                return std::unexpected(L"Copy cancelled by user.");
+            }
             LONGLONG current_lcn = ext.lcn + c_offset;
             ULONGLONG src_offset = (ext.vcn + c_offset) * context.src_cluster_size;
 
@@ -977,12 +1061,14 @@ private:
         const std::wstring& original_error,
         CopyContext& context
     ) {
-        // Release handles before fallback (dest was already scoped)
         DeleteFileW(dest.c_str());
+        if (g_cancel_requested) {
+            return std::unexpected(L"Copy cancelled by user.");
+        }
         context.out->warn(L"Deduplication-preserving copy failed (" + original_error
             + L"). Falling back to standard copy for: " + src);
 
-        if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, NULL, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
+        if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
             DWORD error = GetLastError();
             return std::unexpected(L"Dedup copy failed (" + original_error + L"), and fallback copy failed: " + util::get_win32_error_message(error));
         }
@@ -1097,6 +1183,11 @@ std::expected<bool, std::wstring> copy_directory_recursive(
     }
 
     do {
+        if (g_cancel_requested) {
+            FindClose(find_handle);
+            return std::unexpected(L"Copy cancelled by user.");
+        }
+
         std::wstring name = find_data.cFileName;
         if (name == L"." || name == L"..") continue;
 
@@ -1109,6 +1200,10 @@ std::expected<bool, std::wstring> copy_directory_recursive(
             if (args.recursive) {
                 auto res = copy_directory_recursive(src_item, dest_item, args, context);
                 if (!res) {
+                    if (g_cancel_requested) {
+                        FindClose(find_handle);
+                        return std::unexpected(res.error());
+                    }
                     context.stats.errors.push_back(src_item + L": " + res.error());
                     if (args.strict) {
                         FindClose(find_handle);
@@ -1119,6 +1214,10 @@ std::expected<bool, std::wstring> copy_directory_recursive(
         } else {
             auto res = context.strategy->copy_file(src_item, dest_item, args, context);
             if (!res) {
+                if (g_cancel_requested) {
+                    FindClose(find_handle);
+                    return std::unexpected(res.error());
+                }
                 context.stats.errors.push_back(src_item + L": " + res.error());
                 if (args.strict) {
                     FindClose(find_handle);

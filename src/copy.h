@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <expected>
 #include <string>
 
@@ -12,6 +13,9 @@
 #include "util.h"
 
 namespace copy {
+
+extern std::atomic<bool> g_cancel_requested;
+extern BOOL g_cancel_requested_bool;
 
 /**
  * @brief Executes the copy subcommand using the parsed command line arguments.

@@ -4,6 +4,8 @@
 #include <string>
 #include <string_view>
 
+#include <windows.h>
+
 #include "copy.h"
 #include "inspect.h"
 #include "output.h"
@@ -65,6 +67,19 @@ void print_command_help(const std::wstring& cmd) {
     } else {
         print_general_help();
     }
+}
+
+/**
+ * @brief Windows console control handler callback to process Ctrl+C and Ctrl+Break.
+ * Sets the copy cancellation flags to signal active copying operations to stop and clean up.
+ */
+BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
+    if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT) {
+        copy::g_cancel_requested = true;
+        copy::g_cancel_requested_bool = TRUE;
+        return TRUE; // Consume event to prevent default immediate termination
+    }
+    return FALSE;
 }
 
 /**
@@ -137,6 +152,12 @@ int wmain(int argc, wchar_t* argv[]) {
         out = std::make_unique<output::CliOutput>(args.output_file);
     }
 
+    // Register console control handler for long-running copy command
+    const bool is_copy = (args.command == L"copy" || args.command == L"cp");
+    if (is_copy) {
+        SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+    }
+
     // Dispatch subcommands
     std::expected<int, std::wstring> run_res;
     if (args.command == L"inspect" || args.command == L"i") {
@@ -148,7 +169,14 @@ int wmain(int argc, wchar_t* argv[]) {
     } else {
         std::wcerr << L"ERROR: Unknown command '" << args.command << L"'.\n" << std::endl;
         print_general_help();
+        if (is_copy) {
+            SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+        }
         return 1;
+    }
+
+    if (is_copy) {
+        SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
     }
 
     // Finalize output (JSON serializes here)

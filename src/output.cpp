@@ -56,6 +56,7 @@ void CliOutput::clear_progress_line() {
         blank[81] = '\r';
         WriteConsoleA(console, blank, 82, &written, NULL);
         progress_active_ = false;
+        last_line_len_ = 0;
     }
 }
 
@@ -208,18 +209,28 @@ void CliOutput::progress(const std::wstring& filename, ULONGLONG current, ULONGL
     std::string narrow_name = util::to_string(display_name);
 
     char line[256];
-    std::snprintf(line, sizeof(line), "\r[%s] %-30s %llu MBps",
+    int len = std::snprintf(line, sizeof(line), "\r[%s] %-30s %llu MBps",
         bar.c_str(), narrow_name.c_str(), mbps);
 
-    // Write directly via console handle for code page control
-    // Progress always goes to console, never to file
-    HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD written = 0;
-    WriteConsoleA(console, line, static_cast<DWORD>(strlen(line)), &written, NULL);
+    if (len > 0) {
+        size_t current_len = static_cast<size_t>(len);
+        std::string out_line(line);
+        if (current_len < last_line_len_) {
+            out_line.append(last_line_len_ - current_len, ' ');
+        }
+        last_line_len_ = current_len;
 
-    if (is_complete) {
-        WriteConsoleA(console, "\n", 1, &written, NULL);
-        progress_active_ = false;
+        // Write directly via console handle for code page control
+        // Progress always goes to console, never to file
+        HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD written = 0;
+        WriteConsoleA(console, out_line.c_str(), static_cast<DWORD>(out_line.size()), &written, NULL);
+
+        if (is_complete) {
+            WriteConsoleA(console, "\n", 1, &written, NULL);
+            progress_active_ = false;
+            last_line_len_ = 0;
+        }
     }
 }
 
@@ -229,6 +240,7 @@ void CliOutput::flush() {
         DWORD written = 0;
         WriteConsoleA(console, "\n", 1, &written, NULL);
         progress_active_ = false;
+        last_line_len_ = 0;
     }
     out().flush();
 }

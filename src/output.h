@@ -138,6 +138,7 @@ private:
     std::chrono::steady_clock::time_point last_progress_time_{};           ///< Timestamp of last progress render.
     std::chrono::steady_clock::time_point progress_start_time_{};          ///< Start time for throughput calc.
     bool progress_active_ = false;                                         ///< True if a progress line is on screen.
+    size_t last_line_len_ = 0;                                             ///< Length of the last rendered progress line.
     std::vector<std::wstring> table_columns_;                              ///< Current table column headers.
 };
 
