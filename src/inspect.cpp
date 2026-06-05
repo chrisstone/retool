@@ -33,6 +33,14 @@ struct FileInspectResult {
 
 
 
+/**
+ * @brief Reads a list of file paths from a newline-delimited text file.
+ * 
+ * Skips empty lines and lines starting with '#'. Strips BOM and trailing spaces.
+ * 
+ * @param path The path to the text file list.
+ * @return std::expected<std::vector<std::wstring>, std::wstring> List of paths, or error string.
+ */
 std::expected<std::vector<std::wstring>, std::wstring> read_file_list(const std::wstring& path) {
     std::ifstream file(path, std::ios::in | std::ios::binary);
     if (!file.is_open()) {
@@ -70,6 +78,15 @@ std::expected<std::vector<std::wstring>, std::wstring> read_file_list(const std:
     return paths;
 }
 
+/**
+ * @brief Inspects the virtual and physical extents of a single file on ReFS.
+ * 
+ * Queries the filesystem type, cluster size, file size, and queries extents iteratively using
+ * FSCTL_GET_RETRIEVAL_POINTERS.
+ * 
+ * @param path The path of the target file to inspect.
+ * @return FileInspectResult A structure containing paths, extents, size, and error context.
+ */
 FileInspectResult inspect_file(const std::wstring& path) {
     FileInspectResult res;
     res.path = path;
@@ -178,7 +195,16 @@ FileInspectResult inspect_file(const std::wstring& path) {
     return res;
 }
 
-std::expected<int, std::wstring> run(const util::CliArg& args) {
+/**
+ * @brief Executes the inspect subcommand.
+ * 
+ * Performs block layout query for a single file, or builds a block sharing/overlap index across
+ * multiple files to report deduplication metrics.
+ * 
+ * @param args CLI arguments containing files, input-list, and output redirect.
+ * @return std::expected<int, std::wstring> Exit code on success, or error string on failure.
+ */
+std::expected<int, std::wstring> execute_inspect(const util::CliArg& args) {
     std::vector<std::wstring> target_paths = args.positional;
 
     // Load file list if specified

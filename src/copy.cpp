@@ -70,6 +70,13 @@ struct CopyContext {
     }
 };
 
+/**
+ * @brief Checks if the given volume root path is formatted with the ReFS filesystem.
+ * 
+ * @param volume_root The root path of the volume (e.g. L"C:\\").
+ * @return true If the volume is ReFS.
+ * @return false If the volume is not ReFS or information could not be retrieved.
+ */
 bool is_refs_volume(const std::wstring& volume_root) {
     wchar_t fs_name[MAX_PATH] = {0};
     if (GetVolumeInformationW(volume_root.c_str(), NULL, 0, NULL, NULL, NULL, fs_name, MAX_PATH)) {
@@ -78,6 +85,12 @@ bool is_refs_volume(const std::wstring& volume_root) {
     return false;
 }
 
+/**
+ * @brief Retrieves the cluster allocation size for the given volume.
+ * 
+ * @param volume_root The root path of the volume.
+ * @return DWORD The cluster size in bytes, or 0 if retrieval fails.
+ */
 DWORD get_cluster_size(const std::wstring& volume_root) {
     DWORD sectors_per_cluster = 0, bytes_per_sector = 0, free_clusters = 0, total_clusters = 0;
     if (GetDiskFreeSpaceW(volume_root.c_str(), &sectors_per_cluster, &bytes_per_sector, &free_clusters, &total_clusters)) {
@@ -86,6 +99,12 @@ DWORD get_cluster_size(const std::wstring& volume_root) {
     return 0;
 }
 
+/**
+ * @brief Converts a relative path into a fully qualified absolute path name.
+ * 
+ * @param path The relative or absolute path.
+ * @return std::wstring The fully qualified absolute path.
+ */
 std::wstring get_absolute_path(const std::wstring& path) {
     wchar_t buffer[MAX_PATH];
     DWORD length = GetFullPathNameW(path.c_str(), MAX_PATH, buffer, NULL);
@@ -95,6 +114,18 @@ std::wstring get_absolute_path(const std::wstring& path) {
     return path;
 }
 
+/**
+ * @brief Copies a single file from source to destination, preserving deduplication if possible.
+ * 
+ * Inspects block allocations, matches duplicates against the context map, duplicates extents via 
+ * FSCTL_DUPLICATE_EXTENTS_TO_FILE, and falls back to standard CopyFileExW if operations fail.
+ * 
+ * @param src The source file path.
+ * @param dest The destination file path.
+ * @param args The command line arguments.
+ * @param context The shared copy tracking context.
+ * @return std::expected<bool, std::wstring> True on success, or an error message on failure.
+ */
 std::expected<bool, std::wstring> copy_file_preserving_dedup(
     const std::wstring& src,
     const std::wstring& dest,
@@ -535,6 +566,18 @@ std::expected<bool, std::wstring> copy_file_preserving_dedup(
     return true;
 }
 
+/**
+ * @brief Recursively copies a directory tree from source to destination.
+ * 
+ * Replicates the directory structure and invokes copy_file_preserving_dedup on files.
+ * Ignores system-attributed files and folders.
+ * 
+ * @param src_dir The source directory path.
+ * @param dest_dir The destination directory path.
+ * @param args The command line arguments.
+ * @param context The shared copy tracking context.
+ * @return std::expected<bool, std::wstring> True on success, or an error message on failure.
+ */
 std::expected<bool, std::wstring> copy_directory_recursive(
     const std::wstring& src_dir,
     const std::wstring& dest_dir,
@@ -600,7 +643,16 @@ std::expected<bool, std::wstring> copy_directory_recursive(
     return true;
 }
 
-std::expected<int, std::wstring> run(const util::CliArg& args) {
+/**
+ * @brief Executes the copy subcommand.
+ * 
+ * Resolves source/destination bounds, establishes mapping contexts, and coordinates
+ * recursive/single file copying. Prints summary statistics at completion.
+ * 
+ * @param args CLI arguments containing positional source and destination paths.
+ * @return std::expected<int, std::wstring> Exit code on success, or error string on failure.
+ */
+std::expected<int, std::wstring> execute_copy(const util::CliArg& args) {
     if (args.positional.size() < 2) {
         return std::unexpected(L"Error: Missing source or destination path. Usage: retool copy <src> <dest> [options]");
     }

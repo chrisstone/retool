@@ -95,3 +95,13 @@ cmake --build --preset release
 ```
 
 > Note: Test infrastructure is not yet defined. When adding tests, follow the conventions established by the first test added and document the approach here.
+
+## Production
+
+- **Branching Strategy:** Do not perform any development directly on the `main` branch. Use the `devel` branch or feature-specific branches (e.g., `feature/...`) for all development work.
+- **Commit Cadence:** Make frequent commits. Only commit changes after verifying that the code compiles successfully, passes linting (`clang-tidy`), and passes all existing tests.
+- **Standards:**
+  - **Versioning:** The project uses semantic versioning.
+  - **Commit Messages:** Follow the Conventional Commits specification.
+  - **Documentation:** Use Doxygen formatting for inline code documentation.
+- **Tags:** Version tags (e.g., `v*`) must only be created/added by the user directly. Do not automate or push version tags.

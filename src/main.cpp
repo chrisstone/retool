@@ -11,6 +11,9 @@
 
 constexpr std::wstring_view APP_VERSION = RETOOL_VERSION;
 
+/**
+ * @brief Prints the general usage instructions and available subcommands to standard output.
+ */
 void print_general_help() {
     std::wcout << L"retool - ReFS block-level inspection and copy utility\n\n"
                << L"Usage:\n"
@@ -24,6 +27,11 @@ void print_general_help() {
                << L"Use 'retool help <command>' for command-specific options." << std::endl;
 }
 
+/**
+ * @brief Prints command-specific usage instructions for the given command name.
+ * 
+ * @param cmd The command name or alias (e.g. "inspect", "copy", "volume").
+ */
 void print_command_help(const std::wstring& cmd) {
     if (cmd == L"inspect" || cmd == L"i") {
         std::wcout << L"Usage: retool inspect <file1> [file2 ...] [options]\n\n"
@@ -44,6 +52,16 @@ void print_command_help(const std::wstring& cmd) {
     }
 }
 
+/**
+ * @brief Application entry point.
+ * 
+ * Parses command line arguments, handles help and version flags, performs privilege
+ * checks, checks OS-level ReFS support, and dispatches the specified subcommand.
+ * 
+ * @param argc The number of command line arguments.
+ * @param argv The array of wide command line arguments.
+ * @return int 0 on success, 1 on syntax or privilege error, 2 on operational error.
+ */
 int wmain(int argc, wchar_t* argv[]) {
     // Parse arguments
     auto args_res = util::parse_arguments(argc, argv);
@@ -97,11 +115,11 @@ int wmain(int argc, wchar_t* argv[]) {
     // Dispatch subcommands
     std::expected<int, std::wstring> run_res;
     if (args.command == L"inspect" || args.command == L"i") {
-        run_res = inspect::run(args);
+        run_res = inspect::execute_inspect(args);
     } else if (args.command == L"copy" || args.command == L"cp") {
-        run_res = copy::run(args);
+        run_res = copy::execute_copy(args);
     } else if (args.command == L"volume" || args.command == L"vol") {
-        run_res = volume::run(args);
+        run_res = volume::execute_volume(args);
     } else {
         std::wcerr << L"ERROR: Unknown command '" << args.command << L"'.\n" << std::endl;
         print_general_help();

@@ -1,0 +1,19 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+ColumnLimit: 120
+UseTab: ForContinuationAndIndentation
+---
+Language: Cpp
+IncludeBlocks: Regroup
+SortIncludes: true
+IncludeCategories:
+  - Regex:           '(?P<is_main_include>([-_](test|unittest))?)$'
+    Priority:        0
+  - Regex:           '^<.*>'
+    Priority:        1
+  - Regex:           '^".*"'
+    Priority:        2
+MaxEmptyLinesToKeep: 1
+BinPackArguments: false
+BinPackParameters: false

@@ -10,7 +10,15 @@
 
 namespace volume {
 
-std::expected<int, std::wstring> run(const util::CliArg& args) {
+/**
+ * @brief Executes the volume subcommand.
+ * 
+ * Resolves the volume path name, queries filesystem information, and prints statistics.
+ * 
+ * @param args CLI arguments containing positional drive/volume path.
+ * @return std::expected<int, std::wstring> Exit code on success, or error string on failure.
+ */
+std::expected<int, std::wstring> execute_volume(const util::CliArg& args) {
     if (args.positional.empty()) {
         return std::unexpected(L"Error: Missing volume path argument. Usage: retool volume <drive-letter or path>");
     }
