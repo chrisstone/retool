@@ -40,6 +40,8 @@ retool/
 │   ├── inspect.h
 │   ├── copy.cpp            # Deduplication-preserving copy (block cloning)
 │   ├── copy.h
+│   ├── output.cpp          # Polymorphic output (CLI, JSON, silent)
+│   ├── output.h
 │   ├── volume.cpp          # Volume-level statistics
 │   ├── volume.h
 │   ├── util.cpp            # Project-wide pure functions and shared helpers
@@ -57,15 +59,16 @@ retool/
 
 | Module | Responsibility |
 |-------|---------------|
-| `main.cpp` | CLI entry point, environment setup (e.g., elevation checks), command dispatching. |
-| `inspect` | Retrieval pointer queries (`FSCTL_GET_RETRIEVAL_POINTERS`), single-file extent dumps, cross-file deduplication mapping, and plain-text output serialization for inspection. |
+| `main.cpp` | CLI entry point, environment setup (e.g., elevation checks), command dispatching, outputter construction. |
+| `inspect` | Retrieval pointer queries (`FSCTL_GET_RETRIEVAL_POINTERS`), single-file extent dumps, cross-file deduplication mapping. |
 | `copy` | Directory tree recursion, block duplication (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`), fallback to standard copy, dry-run simulation. |
+| `output` | Polymorphic output abstraction (`IOutput` base): `NoOutput` (silent), `CliOutput` (console + progress bar), `JsonOutput` (nlohmann/json). |
 | `volume` | Volume information retrieval (cluster size, total clusters, free/used space). |
 | `util` | CLI argument parsing, wide/narrow string conversions, date/time formatting, memory sizing helpers. |
 
 ## Technical Constraints
 
-- **Windows SDK/DDK only.** Do not introduce any third-party libraries (Boost, etc.) without explicit user approval.
+- **Windows SDK/DDK only.** Do not introduce any third-party libraries (Boost, etc.) without explicit user approval. Approved: `nlohmann/json` (header-only, via CMake FetchContent).
 - **C++20** minimum (`std::expected`, structured bindings, ranges).
 - **Administrator privileges** are required at runtime; do not attempt to work around this.
 - **Unicode throughout.** Use `wchar_t` / `std::wstring` / `LPWSTR` for all paths and system strings.
