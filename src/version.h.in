@@ -1,0 +1,5 @@
+#pragma once
+
+#include <string_view>
+
+constexpr std::wstring_view RETOOL_VERSION = L"@RETOOL_VERSION@";

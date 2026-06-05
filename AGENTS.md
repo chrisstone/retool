@@ -58,7 +58,7 @@ retool/
 | Module | Responsibility |
 |-------|---------------|
 | `main.cpp` | CLI entry point, environment setup (e.g., elevation checks), command dispatching. |
-| `inspect` | Retrieval pointer queries (`FSCTL_GET_RETRIEVAL_POINTERS`), single-file extent dumps, cross-file deduplication mapping, and JSON/plain-text output serialization for inspection. |
+| `inspect` | Retrieval pointer queries (`FSCTL_GET_RETRIEVAL_POINTERS`), single-file extent dumps, cross-file deduplication mapping, and plain-text output serialization for inspection. |
 | `copy` | Directory tree recursion, block duplication (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`), fallback to standard copy, dry-run simulation. |
 | `volume` | Volume information retrieval (cluster size, total clusters, free/used space). |
 | `util` | CLI argument parsing, wide/narrow string conversions, date/time formatting, memory sizing helpers. |

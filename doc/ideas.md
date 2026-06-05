@@ -7,22 +7,74 @@
 * [Volume-Wide Deduplication Scan](#volume-wide-deduplication-scan)
 * [Fragmentation Report](#fragmentation-report)
 * [In-Place File Deduplication](#in-place-file-deduplication)
+* [Cross-Volume Copy target-side Dedup](#cross-volume-copy-target-side-dedup)
 
 ---
 
 ### Structured Output (JSON/CSV)
 
-Post-1.0, retool should offer machine-readable output formats for integration with
-PowerShell scripts, monitoring tools, and report pipelines.
+Offer machine-readable output formats for integration with PowerShell scripts, monitoring tools, and report pipelines.
 
-* **Objective**: Allow programmatic consumption of `inspect` and `volume` output without
-  screen-scraping plain text. Enables workflows like: enumerate all backup files → inspect
-  → parse JSON → compute savings report in PowerShell.
-* **Implementation**: Add `--json` and `--csv` flags. A minimal JSON serializer lives in
-  `src/util/Json.cpp`; CSV is straightforward tabular output. The `--json` flag is
-  already partially described in `doc/features.md` but deferred from 1.0 scope.
-* **Effort Estimate**: Low (~1 day). JSON schema is already drafted in features.md; it is
-  primarily a serialization layer on top of existing model structs.
+* **Objective**: Allow programmatic consumption of `inspect`, `volume`, and `copy` output without screen-scraping plain text. Enables workflows like: enumerate all backup files → inspect → parse JSON → compute savings report in PowerShell.
+* **Implementation**: Add `--json` and `--csv` flags to the CLI.
+  - For JSON support, integrate the header-only JSON library `github.com/nlohmann/json` (by adding it to the project, e.g., under `contrib/nlohmann/json.hpp` or fetched via CMake CPM/FetchContent).
+  - Implement serialization logic for `InspectResult`, `VolumeResult`, and `CopyResult` using the library's `to_json` bindings.
+  
+  **`inspect` single-file schema:**
+  ```json
+  {
+    "file": "C:\\Data\\backup.vbk",
+    "volume": "C:\\",
+    "cluster_size": 4096,
+    "extents": [
+      { "vcn": 0, "lcn": 1720064, "clusters": 128, "bytes": 524288 }
+    ],
+    "total_clusters": 384,
+    "total_bytes": 1572864,
+    "fragment_count": 3
+  }
+  ```
+
+  **`inspect` multi-file schema:**
+  ```json
+  {
+    "volume": "D:\\",
+    "cluster_size": 4096,
+    "files": [ "D:\\a.vbk", "D:\\b.vib" ],
+    "shared_clusters": 8192,
+    "shared_bytes": 33554432,
+    "savings_pct": 12.5,
+    "per_file": [
+      { "file": "D:\\a.vbk", "shared_with_count": 1, "shared_bytes": 16777216 }
+    ],
+    "errors": []
+  }
+  ```
+
+  **`volume` schema:**
+  ```json
+  {
+    "volume": "D:\\",
+    "filesystem": "ReFS",
+    "cluster_size": 4096,
+    "total_clusters": 2621440,
+    "total_bytes": 10737418240,
+    "free_bytes": 4509715660,
+    "used_bytes": 6227702580
+  }
+  ```
+
+  **`copy` schema:**
+  ```json
+  {
+    "total_files": 2,
+    "cloned_files": 1,
+    "fallback_files": 1,
+    "total_bytes": 102662437,
+    "errors": []
+  }
+  ```
+* **Effort Estimate**: Low (~1–2 days). The schemas are defined, and integration of the `nlohmann/json` header is straightforward using standard C++ serialization patterns.
 
 ---
 
@@ -127,7 +179,7 @@ and deduplicate them in-place so they share the same physical storage.
   1. Open both target files with read/write access.
   2. Map both files to their physical extents via `FSCTL_GET_RETRIEVAL_POINTERS`.
   3. Identify candidate duplicate regions. Read and compare matching data chunks in-place
-     (e.g., using a hash-based sliding window or aligned block-by-block byte comparison).
+      (e.g., using a hash-based sliding window or aligned block-by-block byte comparison).
   4. For identical content blocks, issue `FSCTL_DUPLICATE_EXTENTS_TO_FILE` to replace the
      physical allocation of one block with a reference to the other, releasing the redundant
      storage.
@@ -135,3 +187,17 @@ and deduplicate them in-place so they share the same physical storage.
 * **Effort Estimate**: Medium (~4–5 days). Requires safe, transactional chunk verification
   to prevent data corruption if files are modified, and robust handling of cluster alignment
   boundary constraints.
+
+---
+
+### Cross-Volume Copy target-side Dedup
+
+Extend cross-volume copy deduplication to reference existing matching blocks in other files already residing on the destination ReFS volume.
+
+* **Objective**: Avoid writing duplicate blocks when copying files onto a ReFS volume if those blocks are already physically stored in existing files on that volume.
+* **Implementation**:
+  1. Build a block-level index of target files on the destination volume (e.g., by querying their extents and matching content/size details or maintaining a block fingerprint database of destination files).
+  2. During cross-volume copy to a ReFS destination: check if the source block's content is already present in an existing file on the target volume.
+  3. If a match is found: instead of copying the block physically from the source volume, issue `FSCTL_DUPLICATE_EXTENTS_TO_FILE` on the destination volume using the existing target file's block as the source.
+  4. Requires a mechanism to verify that target block content exactly matches (e.g., verifying file hashes, modifying timestamps, or size match checks).
+* **Effort Estimate**: High (~1 week). Building and querying a lookup index of target volume blocks safely and efficiently, while guaranteeing data integrity, is a significant engineering task.

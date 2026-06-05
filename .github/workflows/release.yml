@@ -1,0 +1,37 @@
+name: Create Release & Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^v', ''
+          cmake --preset release -DRETOOL_VERSION=$version
+
+      - name: Build retool
+        shell: pwsh
+        run: |
+          cmake --build build/release --config Release
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} build/release/Release/retool.exe --title "${{ github.ref_name }}" --generate-notes

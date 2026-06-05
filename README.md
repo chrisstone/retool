@@ -8,6 +8,9 @@
 
 `retool` exposes ReFS block-level internals that Windows does not surface through normal file APIs. It lets you inspect how files are laid out on disk, measure actual deduplication savings, and copy files in a way that preserves block sharing — keeping your ReFS deduplication intact rather than breaking it with a conventional copy.
 
+> [!WARNING]
+> **Administrator privileges are required** to run `retool`. All queries and block operations use low-level filesystem ioctls that require full administrative rights. Run the utility from an elevated Command Prompt or PowerShell window.
+
 ## Requirements
 
 - **Windows 10 / Windows Server 2016** or later (ReFS v3.x)
@@ -39,8 +42,6 @@ retool inspect -i <filelist.txt> [options]
 |------|-------------|
 | `-i <file>` | Read file paths from a newline-delimited input file |
 | `-o <file>` | Write output to a file instead of stdout |
-| `--json` | Emit structured JSON output |
-| `-v` | Verbose mode — print additional diagnostic detail |
 | `--strict` | Abort on first error (default: best-effort with error summary) |
 
 ---
@@ -63,7 +64,6 @@ retool copy <source-dir> <dest-dir> [options]
 |------|-------------|
 | `-r` | Recursive directory copy |
 | `--strict` | Abort on first error (default: best-effort, errors reported at end) |
-| `-v` | Verbose mode |
 | `--dry-run` | Simulate the operation without writing any data |
 
 ---
@@ -111,8 +111,8 @@ retool inspect C:\Data\backup.vbk
 # Compare block sharing between multiple backup files
 retool inspect C:\Data\backup.vbk C:\Data\backup-inc.vib
 
-# Read file list from a file, write JSON results
-retool inspect -i files.txt -o results.json --json
+# Read file list from a file, write results to a text file
+retool inspect -i files.txt -o results.txt
 
 # Copy a directory preserving dedup (same volume)
 retool copy D:\Backups\2024 D:\Backups\2024-clone -r

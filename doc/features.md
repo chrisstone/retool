@@ -94,12 +94,11 @@ Per-file sharing:
 
 ### Purpose
 
-Copy one or more files (or a full directory tree) while preserving ReFS block sharing using `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. When source and destination are on different volumes, fall back to a standard copy with a warning.
+Copy one or more files (or a full directory tree) while preserving ReFS block sharing using `FSCTL_DUPLICATE_EXTENTS_TO_FILE` or target-volume deduplication.
 
 ### Same-Volume Clone (Primary Path)
 
-**Win32 API Sequence:**
-
+When source and destination paths reside on the same volume:
 1. `CreateFileW` on source — `GENERIC_READ | FILE_SHARE_READ`, `FILE_FLAG_BACKUP_SEMANTICS`.
 2. `CreateFileW` on destination — `GENERIC_READ | GENERIC_WRITE`, `CREATE_ALWAYS`, `FILE_FLAG_BACKUP_SEMANTICS`.
 3. Query source extents via `FSCTL_GET_RETRIEVAL_POINTERS` to enumerate all extents.
@@ -107,21 +106,38 @@ Copy one or more files (or a full directory tree) while preserving ReFS block sh
 5. Set the destination file size via `SetEndOfFile` to match the source.
 6. Copy file timestamps and basic attributes using `GetFileInformationByHandleEx` / `SetFileInformationByHandle`.
 
-**Volume same-check:** Compare the volume root path (from `GetVolumePathNameW`) of both source and destination before attempting clone. If they differ, log a warning and fall back to standard copy.
+### Cross-Volume Copy
 
-**`FSCTL_DUPLICATE_EXTENTS_TO_FILE` notes:**
-- `DUPLICATE_EXTENTS_DATA` structure fields: `FileHandle` (source), `SourceFileOffset`, `TargetFileOffset`, `ByteCount` — all must be cluster-aligned.
-- The destination file must be pre-created; the ioctl does not create files.
-- Requires ReFS volume and both files on the same volume. Will fail on NTFS.
+When source and destination paths reside on different volumes:
 
-### Cross-Volume Fallback
+1. **Verify Destination Filesystem**:
+   Use `GetVolumePathNameW` and `GetVolumeInformationW` on the destination path to query the filesystem type.
 
-Use `CopyFileExW` with `COPY_FILE_ALLOW_DECRYPTED_DESTINATION` for simplicity and correctness. Log a single warning:
+2. **Non-ReFS Destination (Fallback)**:
+   If the destination filesystem is not ReFS (e.g., NTFS or FAT32), block cloning cannot be used on the destination. Fall back to standard copy via `CopyFileExW` with `COPY_FILE_ALLOW_DECRYPTED_DESTINATION` and print a warning:
+   ```
+   WARNING: Destination volume is non-ReFS. Falling back to standard copy.
+   ```
 
-```
-WARNING: source and destination are on different volumes.
-         Block cloning is not available. Falling back to standard copy.
-```
+3. **ReFS Destination (Preserve Sharing)**:
+   If the destination filesystem is ReFS, we can preserve deduplication of the copied files by mapping identical blocks on the source and cloning them *on the target volume* after they are initially copied.
+   
+   **Win32 API Sequence**:
+   - Call `inspect` logic on all files to be copied to identify matching source LCNs.
+   - Maintain a tracker of source LCNs that have already been copied to the destination: `lcn_map[source_lcn] = {dest_file_path, dest_file_offset}`.
+   - For each file being copied:
+     - Open source and destination files.
+     - For each extent of the source file:
+       - If it is sparse (`lcn == (LONGLONG)-1`), skip writing/cloning (let target file growth handle it).
+       - For each cluster in the extent:
+         - If the cluster's source `lcn` is NOT in `lcn_map` (first time seeing this block):
+           - Copy the cluster data (typically 4 KB or 64 KB) directly from source to destination file.
+           - Record the copied destination address: `lcn_map[lcn] = {dest_file_path, dest_file_offset}`.
+         - If the cluster's source `lcn` IS in `lcn_map` (duplicate block found):
+           - Retrieve the already written target block location `{prev_dest_file, prev_dest_offset}`.
+           - Open the `prev_dest_file` with read access.
+           - Call `DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)` on the current destination file, passing the handle of `prev_dest_file`, source offset `prev_dest_offset`, target offset `current_dest_offset`, and block length.
+           - This makes the destination files share blocks on the destination volume!
 
 ### Directory Copy
 
@@ -143,7 +159,6 @@ WARNING: source and destination are on different volumes.
 |------|-------------|
 | `-r` | Recursive directory copy |
 | `--strict` | Abort on first per-file error |
-| `-v` | Verbose: print each file as it is processed |
 | `--dry-run` | Simulate without writing |
 
 ---
@@ -194,64 +209,23 @@ retool <command> [options] [arguments]
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Emit JSON output (applies to `inspect` and `volume`) |
-| `-v`, `--verbose` | Verbose output |
 | `--strict` | Abort on first error (where applicable) |
 | `-o <file>` | Redirect output to a file |
 
 ### Argument Parsing
 
 Implement a minimal argument parser in `src/util/Arg.cpp`. Use `CommandLineToArgvW` to obtain the wide-character argument array. No third-party CLI library. Rules:
-- Short flags: single `-` + single character (e.g., `-v`, `-r`, `-i`).
-- Long flags: double `--` + word (e.g., `--json`, `--strict`, `--dry-run`).
+- Short flags: single `-` + single character (e.g., `-r`, `-i`).
+- Long flags: double `--` + word (e.g., `--strict`, `--dry-run`).
 - Unknown flags: print a clear error and exit with code 1.
 
 ---
 
 ## Output Format
 
-### Plain Text (Default)
+### Plain Text
 
 Human-readable, column-aligned. Use `wprintf` throughout for Unicode safety. Widths should adapt to the largest values in the result set.
-
-### JSON (`--json`)
-
-Structured JSON written to stdout (or `-o` file). Encoding: UTF-8.
-
-**`inspect` single-file schema:**
-
-```json
-{
-  "file": "C:\\Data\\backup.vbk",
-  "volume": "C:\\",
-  "cluster_size": 4096,
-  "extents": [
-    { "vcn": 0, "lcn": 1720064, "clusters": 128, "bytes": 524288 }
-  ],
-  "total_clusters": 384,
-  "total_bytes": 1572864,
-  "fragment_count": 3
-}
-```
-
-**`inspect` multi-file schema:**
-
-```json
-{
-  "volume": "D:\\",
-  "cluster_size": 4096,
-  "files": [ "D:\\a.vbk", "D:\\b.vib" ],
-  "shared_clusters": 8192,
-  "shared_bytes": 33554432,
-  "savings_pct": 12.5,
-  "per_file": [
-    { "file": "D:\\a.vbk", "shared_with": 1, "shared_bytes": 16777216 }
-  ],
-  "errors": []
-}
-```
-
-Use a minimal JSON serializer hand-written in `src/util/Json.cpp`. No external JSON library.
 
 ---
 
