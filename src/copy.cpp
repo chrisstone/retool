@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <expected>
-#include <iostream>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -9,6 +8,7 @@
 #include <windows.h>
 
 #include "copy.h"
+#include "output.h"
 #include "util.h"
 
 namespace copy {
@@ -139,6 +139,7 @@ struct CopyContext {
     DWORD dest_cluster_size = 0;        ///< Destination volume cluster size in bytes.
 
     std::unique_ptr<ICopyStrategy> strategy;  ///< Selected copy strategy.
+    output::IOutput* out = nullptr;           ///< Non-owning pointer to the output interface.
 
     // -- Populated during Phase 2: Operation --
     /// Map: source LCN -> {dest_file_path, dest_offset_in_bytes}
@@ -467,12 +468,11 @@ std::expected<bool, std::wstring> clone_extent_from_dest(
     DWORD dup_returned = 0;
     if (!DeviceIoControl(dest_handle, FSCTL_DUPLICATE_EXTENTS_TO_FILE, &dup_data, sizeof(dup_data), NULL, 0, &dup_returned, NULL)) {
         DWORD err = GetLastError();
-        std::wcout << L"ERROR: FSCTL_DUPLICATE_EXTENTS_TO_FILE failed on target volume. SourceOffset="
-                   << dup_data.SourceFileOffset.QuadPart
-                   << L", TargetOffset=" << dup_data.TargetFileOffset.QuadPart
-                   << L", ByteCount=" << dup_data.ByteCount.QuadPart
-                   << L", err=" << err << std::endl;
-        return std::unexpected(L"FSCTL_DUPLICATE_EXTENTS_TO_FILE failed on target volume: " + util::get_win32_error_message(err));
+        return std::unexpected(L"FSCTL_DUPLICATE_EXTENTS_TO_FILE failed on target volume (SourceOffset="
+            + std::to_wstring(dup_data.SourceFileOffset.QuadPart)
+            + L", TargetOffset=" + std::to_wstring(dup_data.TargetFileOffset.QuadPart)
+            + L", ByteCount=" + std::to_wstring(dup_data.ByteCount.QuadPart)
+            + L"): " + util::get_win32_error_message(err));
     }
     return true;
 }
@@ -514,13 +514,12 @@ std::expected<bool, std::wstring> copy_bytes_physical(
         DWORD read = 0;
         if (!ReadFile(src_handle, io_buffer.data(), to_read, &read, NULL) || read == 0) {
             DWORD err = GetLastError();
-            std::wcout << L"ERROR: ReadFile EOF/failure. to_read=" << to_read
-                       << L", read=" << read
-                       << L", copied=" << copied
-                       << L", byte_count=" << byte_count
-                       << L", src_offset=" << src_offset
-                       << L", err=" << err << std::endl;
-            return std::unexpected(L"ReadFile failed on source: " + util::get_win32_error_message(err));
+            return std::unexpected(L"ReadFile failed on source (to_read="
+                + std::to_wstring(to_read) + L", read=" + std::to_wstring(read)
+                + L", copied=" + std::to_wstring(copied)
+                + L", byte_count=" + std::to_wstring(byte_count)
+                + L", src_offset=" + std::to_wstring(src_offset)
+                + L"): " + util::get_win32_error_message(err));
         }
 
         DWORD written = 0;
@@ -580,18 +579,18 @@ struct FallbackCopyStrategy : ICopyStrategy {
         CopyContext& context
     ) override {
         if (args.dry_run) {
-            std::wcout << L"[DRY-RUN] Would copy with standard fallback: " << src << L" -> " << dest << std::endl;
+            context.out->status(L"[DRY-RUN] Would copy with standard fallback: " + src + L" -> " + dest);
             context.stats.fallback_files++;
             context.stats.total_files++;
             return true;
         }
 
         if (!context.dest_is_refs) {
-            std::wcout << L"WARNING: Destination volume is non-ReFS. Falling back to standard copy for: " << src << std::endl;
+            context.out->warn(L"Destination volume is non-ReFS. Falling back to standard copy for: " + src);
         } else {
-            std::wcout << L"WARNING: Destination volume cluster size mismatch ("
-                       << context.dest_cluster_size << L" vs " << context.src_cluster_size
-                       << L"). Falling back to standard copy for: " << src << std::endl;
+            context.out->warn(L"Destination volume cluster size mismatch ("
+                + std::to_wstring(context.dest_cluster_size) + L" vs " + std::to_wstring(context.src_cluster_size)
+                + L"). Falling back to standard copy for: " + src);
         }
 
         if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, NULL, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
@@ -619,7 +618,7 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
         CopyContext& context
     ) override {
         if (args.dry_run) {
-            std::wcout << L"[DRY-RUN] Would clone (same volume): " << src << L" -> " << dest << std::endl;
+            context.out->status(L"[DRY-RUN] Would clone (same volume): " + src + L" -> " + dest);
             context.stats.cloned_files++;
             context.stats.total_files++;
             return true;
@@ -685,8 +684,8 @@ private:
         const std::wstring& original_error, CopyContext& context
     ) {
         DeleteFileW(dest.c_str());
-        std::wcout << L"WARNING: Deduplication-preserving copy failed (" << original_error
-                   << L"). Falling back to standard copy for: " << src << std::endl;
+        context.out->warn(L"Deduplication-preserving copy failed (" + original_error
+            + L"). Falling back to standard copy for: " + src);
 
         if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, NULL, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
             DWORD error = GetLastError();
@@ -713,8 +712,8 @@ struct CrossVolumeRefsCopyStrategy : ICopyStrategy {
         CopyContext& context
     ) override {
         if (args.dry_run) {
-            std::wcout << L"[DRY-RUN] Would copy preserving deduplication (cross volume ReFS): "
-                       << src << L" -> " << dest << std::endl;
+            context.out->status(L"[DRY-RUN] Would copy preserving deduplication (cross volume ReFS): "
+                + src + L" -> " + dest);
             context.stats.cloned_files++;
             context.stats.total_files++;
             return true;
@@ -912,8 +911,8 @@ private:
     ) {
         // Release handles before fallback (dest was already scoped)
         DeleteFileW(dest.c_str());
-        std::wcout << L"WARNING: Deduplication-preserving copy failed (" << original_error
-                   << L"). Falling back to standard copy for: " << src << std::endl;
+        context.out->warn(L"Deduplication-preserving copy failed (" + original_error
+            + L"). Falling back to standard copy for: " + src);
 
         if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, NULL, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
             DWORD error = GetLastError();
@@ -1076,21 +1075,21 @@ std::expected<bool, std::wstring> copy_directory_recursive(
  * @param context The fully-processed CopyContext with accumulated stats.
  * @return Exit code (0 = success, 2 = errors occurred).
  */
-int finalize_and_report(const CopyContext& context) {
+int finalize_and_report(CopyContext& context) {
     const auto& stats = context.stats;
+    auto& out = *context.out;
 
-    std::wcout << L"\n--- retool copy summary ---\n"
-               << L"Total Files:     " << stats.total_files << L"\n"
-               << L"Cloned Files:    " << stats.cloned_files << L" (preserves dedup/blocks)\n"
-               << L"Fallback Copies: " << stats.fallback_files << L" (standard copies)\n"
-               << L"Total Bytes:     " << stats.total_bytes << L" bytes" << std::endl;
+    out.begin_section(L"retool copy summary");
+    out.field(L"Total Files",     std::to_wstring(stats.total_files));
+    out.field(L"Cloned Files",    std::to_wstring(stats.cloned_files));
+    out.field(L"Fallback Copies", std::to_wstring(stats.fallback_files));
+    out.field(L"Total Bytes",     std::to_wstring(stats.total_bytes));
 
-    if (!stats.errors.empty()) {
-        std::wcout << L"\nErrors:\n";
-        for (const auto& err : stats.errors) {
-            std::wcout << L"  - " << err << L"\n";
-        }
+    for (const auto& err : stats.errors) {
+        out.error(err);
     }
+
+    out.end_section();
 
     return stats.errors.empty() ? 0 : 2;
 }
@@ -1110,10 +1109,12 @@ int finalize_and_report(const CopyContext& context) {
  * @param args CLI arguments containing positional source and destination paths.
  * @return Exit code on success, or error string on failure.
  */
-std::expected<int, std::wstring> execute_copy(const util::CliArg& args) {
+std::expected<int, std::wstring> execute_copy(const util::CliArg& args, output::IOutput& out) {
     // Phase 1: Inspection
     auto context = inspect_and_prepare(args);
     if (!context) return std::unexpected(context.error());
+
+    context->out = &out;
 
     // Phase 2: Operation
     if (context->is_directory) {

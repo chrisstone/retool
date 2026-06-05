@@ -1,10 +1,12 @@
 #include <expected>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <string_view>
 
 #include "copy.h"
 #include "inspect.h"
+#include "output.h"
 #include "util.h"
 #include "version.h"
 #include "volume.h"
@@ -24,6 +26,10 @@ void print_general_help() {
                << L"  volume (vol)  Show volume-level information and stats\n"
                << L"  help (h)      Show this help information\n"
                << L"  version       Show version information\n\n"
+               << L"Global Options:\n"
+               << L"  --json        Output in JSON format\n"
+               << L"  -q            Suppress all output (quiet mode)\n"
+               << L"  -o <file>     Redirect output to a file\n\n"
                << L"Use 'retool help <command>' for command-specific options." << std::endl;
 }
 
@@ -38,15 +44,24 @@ void print_command_help(const std::wstring& cmd) {
                    << L"Options:\n"
                    << L"  -i <file>     Read file paths from a newline-delimited file\n"
                    << L"  -o <file>     Redirect output to a file\n"
+                   << L"  --json        Output in JSON format\n"
+                   << L"  -q            Suppress all output\n"
                    << L"  --strict      Abort on first error (default: best-effort)" << std::endl;
     } else if (cmd == L"copy" || cmd == L"cp") {
         std::wcout << L"Usage: retool copy <src> <dest> [options]\n\n"
                    << L"Options:\n"
                    << L"  -r            Recursive directory copy\n"
+                   << L"  -o <file>     Redirect output to a file\n"
+                   << L"  --json        Output in JSON format\n"
+                   << L"  -q            Suppress all output\n"
                    << L"  --strict      Abort on first error (default: best-effort)\n"
                    << L"  --dry-run     Simulate the copy operation without writing data" << std::endl;
     } else if (cmd == L"volume" || cmd == L"vol") {
-        std::wcout << L"Usage: retool volume <drive-letter or path>" << std::endl;
+        std::wcout << L"Usage: retool volume <drive-letter or path> [options]\n\n"
+                   << L"Options:\n"
+                   << L"  -o <file>     Redirect output to a file\n"
+                   << L"  --json        Output in JSON format\n"
+                   << L"  -q            Suppress all output" << std::endl;
     } else {
         print_general_help();
     }
@@ -112,19 +127,32 @@ int wmain(int argc, wchar_t* argv[]) {
                    << L"         Low-level ReFS commands and ioctls will likely fail.\n" << std::endl;
     }
 
+    // Construct the appropriate output interface
+    std::unique_ptr<output::IOutput> out;
+    if (args.quiet) {
+        out = std::make_unique<output::NoOutput>();
+    } else if (args.json) {
+        out = std::make_unique<output::JsonOutput>(args.output_file);
+    } else {
+        out = std::make_unique<output::CliOutput>(args.output_file);
+    }
+
     // Dispatch subcommands
     std::expected<int, std::wstring> run_res;
     if (args.command == L"inspect" || args.command == L"i") {
-        run_res = inspect::execute_inspect(args);
+        run_res = inspect::execute_inspect(args, *out);
     } else if (args.command == L"copy" || args.command == L"cp") {
-        run_res = copy::execute_copy(args);
+        run_res = copy::execute_copy(args, *out);
     } else if (args.command == L"volume" || args.command == L"vol") {
-        run_res = volume::execute_volume(args);
+        run_res = volume::execute_volume(args, *out);
     } else {
         std::wcerr << L"ERROR: Unknown command '" << args.command << L"'.\n" << std::endl;
         print_general_help();
         return 1;
     }
+
+    // Finalize output (JSON serializes here)
+    out->flush();
 
     if (!run_res) {
         std::wcerr << L"ERROR: " << run_res.error() << std::endl;

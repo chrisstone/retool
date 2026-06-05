@@ -1,10 +1,11 @@
 #include <expected>
 #include <iomanip>
-#include <iostream>
+#include <sstream>
 #include <string>
 
 #include <windows.h>
 
+#include "output.h"
 #include "util.h"
 #include "volume.h"
 
@@ -12,19 +13,21 @@ namespace volume {
 
 /**
  * @brief Executes the volume subcommand.
- * 
- * Resolves the volume path name, queries filesystem information, and prints statistics.
- * 
+ *
+ * Resolves the volume path name, queries filesystem information, and outputs statistics
+ * via the provided IOutput interface.
+ *
  * @param args CLI arguments containing positional drive/volume path.
+ * @param out  Output interface for formatted results.
  * @return std::expected<int, std::wstring> Exit code on success, or error string on failure.
  */
-std::expected<int, std::wstring> execute_volume(const util::CliArg& args) {
+std::expected<int, std::wstring> execute_volume(const util::CliArg& args, output::IOutput& out) {
     if (args.positional.empty()) {
         return std::unexpected(L"Error: Missing volume path argument. Usage: retool volume <drive-letter or path>");
     }
 
     std::wstring input_path = args.positional[0];
-    
+
     // Resolve volume root path
     wchar_t volume_root[MAX_PATH];
     if (!GetVolumePathNameW(input_path.c_str(), volume_root, MAX_PATH)) {
@@ -74,24 +77,30 @@ std::expected<int, std::wstring> execute_volume(const util::CliArg& args) {
     ULONGLONG used_space = total_space > free_space ? (total_space - free_space) : 0;
     ULONGLONG total_clusters = cluster_size > 0 ? (total_space / cluster_size) : 0;
 
-    // Plain text output
-    std::wcout << L"Volume:        " << volume_root << L"\n"
-               << L"File System:   " << fs_name_str << L"\n";
-    
+    // Output via IOutput
+    out.field(L"Volume",         std::wstring(volume_root));
+    out.field(L"File System",    fs_name_str);
+
     if (fs_name_str != L"ReFS") {
-        std::wcout << L"WARNING:       This is not a ReFS filesystem. Some features (cloning) will not work.\n";
+        out.warn(L"This is not a ReFS filesystem. Some features (cloning) will not work.");
     }
 
+    out.field(L"Cluster Size",   std::to_wstring(cluster_size) + L" bytes");
+    out.field(L"Total Clusters", std::to_wstring(total_clusters));
+
+    // Format human-readable sizes
     double total_gb = static_cast<double>(total_space) / (1024.0 * 1024.0 * 1024.0);
     double free_gb = static_cast<double>(free_space) / (1024.0 * 1024.0 * 1024.0);
     double used_gb = static_cast<double>(used_space) / (1024.0 * 1024.0 * 1024.0);
 
-    std::wcout << L"Cluster Size:  " << cluster_size << L" bytes\n"
-               << L"Total Clusters: " << total_clusters << L"\n"
-               << std::fixed << std::setprecision(2)
-               << L"Total Space:   " << total_gb << L" GB (" << total_space << L" bytes)\n"
-               << L"Free Space:    " << free_gb << L" GB (" << free_space << L" bytes)\n"
-               << L"Used Space:    " << used_gb << L" GB (" << used_space << L" bytes)" << std::endl;
+    std::wostringstream total_ss, free_ss, used_ss;
+    total_ss << std::fixed << std::setprecision(2) << total_gb << L" GB (" << total_space << L" bytes)";
+    free_ss << std::fixed << std::setprecision(2) << free_gb << L" GB (" << free_space << L" bytes)";
+    used_ss << std::fixed << std::setprecision(2) << used_gb << L" GB (" << used_space << L" bytes)";
+
+    out.field(L"Total Space",    total_ss.str());
+    out.field(L"Free Space",     free_ss.str());
+    out.field(L"Used Space",     used_ss.str());
 
     return 0;
 }

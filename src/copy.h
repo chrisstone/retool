@@ -8,6 +8,7 @@
 #include <expected>
 #include <string>
 
+#include "output.h"
 #include "util.h"
 
 namespace copy {
@@ -20,8 +21,9 @@ namespace copy {
  * deduplication mapping when copying to a separate ReFS volume, preserving block allocation sharing.
  * 
  * @param args The parsed CLI arguments containing path, dry-run, recursive, and strict flags.
+ * @param out  The output interface for formatted results and progress.
  * @return std::expected<int, std::wstring> Exit code on success, or an error message on failure.
  */
-std::expected<int, std::wstring> execute_copy(const util::CliArg& args);
+std::expected<int, std::wstring> execute_copy(const util::CliArg& args, output::IOutput& out);
 
 } // namespace copy

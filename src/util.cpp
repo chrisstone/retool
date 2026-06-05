@@ -43,6 +43,10 @@ std::expected<CliArg, std::wstring> parse_arguments(int argc, wchar_t* argv[]) {
             args.strict = true;
         } else if (arg == L"--dry-run") {
             args.dry_run = true;
+        } else if (arg == L"--json") {
+            args.json = true;
+        } else if (arg == L"-q") {
+            args.quiet = true;
         } else if (arg == L"-r") {
             args.recursive = true;
         } else if (arg == L"-i") {
