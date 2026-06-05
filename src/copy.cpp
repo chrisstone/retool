@@ -478,18 +478,26 @@ std::expected<bool, std::wstring> clone_extent_from_dest(
 }
 
 /**
- * @brief Physically copies bytes from source to destination using ReadFile/WriteFile.
+ * @brief Physically copies bytes from source to destination in 64 KB chunks.
+ *
+ * Optionally reports per-file progress via the IOutput interface.
  *
  * @param src_handle   Handle to the source file.
  * @param dest_handle  Handle to the destination file.
  * @param src_offset   Byte offset to start reading from in the source.
  * @param dest_offset  Byte offset to start writing to in the destination.
- * @param byte_count   Number of bytes to copy.
+ * @param byte_count   Total bytes to copy in this call.
+ * @param out          Optional output interface for progress reporting.
+ * @param filename     Display filename for progress (required if out is set).
+ * @param file_offset  Cumulative bytes already transferred for this file.
+ * @param file_total   Total file size in bytes.
  * @return true on success, or error message on failure.
  */
 std::expected<bool, std::wstring> copy_bytes_physical(
     HANDLE src_handle, HANDLE dest_handle,
-    ULONGLONG src_offset, ULONGLONG dest_offset, ULONGLONG byte_count
+    ULONGLONG src_offset, ULONGLONG dest_offset, ULONGLONG byte_count,
+    output::IOutput* out = nullptr, const std::wstring& filename = L"",
+    ULONGLONG file_offset = 0, ULONGLONG file_total = 0
 ) {
     // Seek source
     LARGE_INTEGER li_src;
@@ -528,6 +536,11 @@ std::expected<bool, std::wstring> copy_bytes_physical(
         }
 
         copied += read;
+
+        // Report progress
+        if (out && file_total > 0) {
+            out->progress(filename, file_offset + copied, file_total);
+        }
     }
 
     return true;
@@ -593,14 +606,51 @@ struct FallbackCopyStrategy : ICopyStrategy {
                 + L"). Falling back to standard copy for: " + src);
         }
 
-        if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, NULL, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
+        // Use progress callback for CopyFileExW
+        ProgressContext prog_ctx{src, context.out};
+        if (!CopyFileExW(src.c_str(), dest.c_str(), &copy_progress_callback, &prog_ctx, NULL, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
             DWORD error = GetLastError();
             return std::unexpected(L"Fallback CopyFileExW failed: " + util::get_win32_error_message(error));
+        }
+
+        // Report completion
+        if (prog_ctx.total_size > 0) {
+            context.out->progress(src, prog_ctx.total_size, prog_ctx.total_size);
         }
 
         context.stats.fallback_files++;
         context.stats.total_files++;
         return true;
+    }
+
+private:
+    /// @brief Context passed to CopyFileExW progress callback.
+    struct ProgressContext {
+        std::wstring filename;
+        output::IOutput* out;
+        ULONGLONG total_size = 0;
+    };
+
+    /// @brief CopyFileExW progress routine that forwards to IOutput::progress.
+    static DWORD CALLBACK copy_progress_callback(
+        LARGE_INTEGER TotalFileSize,
+        LARGE_INTEGER TotalBytesTransferred,
+        LARGE_INTEGER /*StreamSize*/,
+        LARGE_INTEGER /*StreamBytesTransferred*/,
+        DWORD /*dwStreamNumber*/,
+        DWORD /*dwCallbackReason*/,
+        HANDLE /*hSourceFile*/,
+        HANDLE /*hDestinationFile*/,
+        LPVOID lpData
+    ) {
+        auto* ctx = static_cast<ProgressContext*>(lpData);
+        ctx->total_size = TotalFileSize.QuadPart;
+        if (ctx->out) {
+            ctx->out->progress(ctx->filename,
+                static_cast<ULONGLONG>(TotalBytesTransferred.QuadPart),
+                static_cast<ULONGLONG>(TotalFileSize.QuadPart));
+        }
+        return PROGRESS_CONTINUE;
     }
 };
 
@@ -649,6 +699,7 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
         if (!extents_result) return attempt_fallback(src, dest, extents_result.error(), context);
 
         // Clone each extent
+        ULONGLONG bytes_cloned = 0;
         for (const auto& ext : *extents_result) {
             if (ext.is_sparse()) continue;
 
@@ -661,6 +712,9 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
 
             auto clone_ok = clone_extent_same_volume(dest_handle.get(), src_handle.get(), src_offset, src_offset, byte_count);
             if (!clone_ok) return attempt_fallback(src, dest, clone_ok.error(), context);
+
+            bytes_cloned += byte_count;
+            context.out->progress(src, bytes_cloned, static_cast<ULONGLONG>(src_size.QuadPart));
         }
 
         // Finalize
@@ -744,12 +798,13 @@ struct CrossVolumeRefsCopyStrategy : ICopyStrategy {
         if (!extents_result) return attempt_fallback(src, dest, extents_result.error(), context);
 
         // Process each extent cluster-by-cluster
+        ULONGLONG bytes_processed = 0;
         for (const auto& ext : *extents_result) {
             if (ext.is_sparse()) continue;
 
             auto result = process_cross_volume_extent(
                 ext, src_handle.get(), dest_handle.get(),
-                src_size.QuadPart, dest, tracker, context
+                src_size.QuadPart, src, dest, tracker, context, bytes_processed
             );
             if (!result) {
                 return attempt_fallback(src, dest, result.error(), context);
@@ -776,8 +831,10 @@ private:
      */
     std::expected<bool, std::wstring> process_cross_volume_extent(
         const Extent& ext, HANDLE src_handle, HANDLE dest_handle,
-        LONGLONG src_file_size, const std::wstring& dest_path,
-        DestSizeTracker& tracker, CopyContext& context
+        LONGLONG src_file_size, const std::wstring& src_path,
+        const std::wstring& dest_path,
+        DestSizeTracker& tracker, CopyContext& context,
+        ULONGLONG& bytes_processed
     ) {
         ULONGLONG c_offset = 0;
         while (c_offset < ext.cluster_count()) {
@@ -787,19 +844,26 @@ private:
             auto map_it = context.lcn_map.find(current_lcn);
             if (map_it != context.lcn_map.end()) {
                 // Duplicate LCN: clone from previously-copied destination
+                ULONGLONG pre_offset = c_offset;
                 auto result = clone_duplicate_run(
                     ext, c_offset, map_it->second, src_offset,
                     dest_handle, tracker, context
                 );
                 if (!result) return std::unexpected(result.error());
+                bytes_processed += (c_offset - pre_offset) * context.src_cluster_size;
             } else {
                 // New LCN: physically copy from source
+                ULONGLONG pre_offset = c_offset;
                 auto result = copy_new_run(
                     ext, c_offset, src_offset, src_file_size,
-                    src_handle, dest_handle, dest_path, tracker, context
+                    src_handle, dest_handle, src_path, dest_path, tracker, context
                 );
                 if (!result) return std::unexpected(result.error());
+                bytes_processed += (c_offset - pre_offset) * context.src_cluster_size;
             }
+
+            // Report progress
+            context.out->progress(src_path, bytes_processed, static_cast<ULONGLONG>(src_file_size));
         }
         return true;
     }
@@ -862,7 +926,7 @@ private:
         const Extent& ext, ULONGLONG& c_offset,
         ULONGLONG src_offset, LONGLONG src_file_size,
         HANDLE src_handle, HANDLE dest_handle,
-        const std::wstring& dest_path,
+        const std::wstring& src_path, const std::wstring& dest_path,
         DestSizeTracker& tracker, CopyContext& context
     ) {
         // Find contiguous run of new LCNs
@@ -888,7 +952,11 @@ private:
         if (!size_ok) return std::unexpected(size_ok.error());
 
         if (bytes_to_read > 0) {
-            auto copy_ok = copy_bytes_physical(src_handle, dest_handle, src_offset, src_offset, bytes_to_read);
+            auto copy_ok = copy_bytes_physical(
+                src_handle, dest_handle, src_offset, src_offset, bytes_to_read,
+                context.out, src_path,
+                src_offset, static_cast<ULONGLONG>(src_file_size)
+            );
             if (!copy_ok) return std::unexpected(copy_ok.error());
         }
 
