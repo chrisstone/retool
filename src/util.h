@@ -14,6 +14,8 @@ struct CliArg {
     bool strict = false;
     bool dry_run = false;
     bool recursive = false;
+    bool json = false;
+    bool quiet = false;
     std::wstring input_file;
     std::wstring output_file;
 };

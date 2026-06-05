@@ -1,6 +1,7 @@
 #include <algorithm>
+#include <atomic>
 #include <expected>
-#include <iostream>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -8,10 +9,19 @@
 #include <windows.h>
 
 #include "copy.h"
+#include "output.h"
 #include "util.h"
 
 namespace copy {
 
+std::atomic<bool> g_cancel_requested{false};
+BOOL g_cancel_requested_bool = FALSE;
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+/// @brief Accumulated statistics for a copy operation.
 struct CopyStats {
     ULONGLONG total_files = 0;
     ULONGLONG cloned_files = 0;
@@ -20,9 +30,71 @@ struct CopyStats {
     std::vector<std::wstring> errors;
 };
 
+/// @brief RAII wrapper for Win32 HANDLE lifetime management.
+struct ScopedHandle {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+
+    explicit ScopedHandle(HANDLE h = INVALID_HANDLE_VALUE) : handle(h) {}
+    ~ScopedHandle() { close(); }
+
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+    ScopedHandle(ScopedHandle&& other) noexcept : handle(other.handle) {
+        other.handle = INVALID_HANDLE_VALUE;
+    }
+
+    ScopedHandle& operator=(ScopedHandle&& other) noexcept {
+        if (this != &other) {
+            close();
+            handle = other.handle;
+            other.handle = INVALID_HANDLE_VALUE;
+        }
+        return *this;
+    }
+
+    void close() {
+        if (handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+            handle = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    explicit operator bool() const { return handle != INVALID_HANDLE_VALUE; }
+    HANDLE get() const { return handle; }
+
+    HANDLE release() {
+        HANDLE h = handle;
+        handle = INVALID_HANDLE_VALUE;
+        return h;
+    }
+};
+
+/// @brief Cache for a single previously-opened destination file handle.
 struct HandleCache {
     std::wstring path;
     HANDLE handle = INVALID_HANDLE_VALUE;
+
+    HandleCache() = default;
+    ~HandleCache() { close(); }
+
+    HandleCache(const HandleCache&) = delete;
+    HandleCache& operator=(const HandleCache&) = delete;
+
+    HandleCache(HandleCache&& other) noexcept
+        : path(std::move(other.path)), handle(other.handle) {
+        other.handle = INVALID_HANDLE_VALUE;
+    }
+
+    HandleCache& operator=(HandleCache&& other) noexcept {
+        if (this != &other) {
+            close();
+            path = std::move(other.path);
+            handle = other.handle;
+            other.handle = INVALID_HANDLE_VALUE;
+        }
+        return *this;
+    }
 
     void close() {
         if (handle != INVALID_HANDLE_VALUE) {
@@ -53,23 +125,72 @@ struct HandleCache {
     }
 };
 
+// Forward declarations
+struct ICopyStrategy;
+
+/// @brief Shared state for the entire copy pipeline.
 struct CopyContext {
-    std::wstring src_volume_root;
-    std::wstring dest_volume_root;
-    bool same_volume = false;
-    bool dest_is_refs = false;
-    DWORD src_cluster_size = 0;
-    DWORD dest_cluster_size = 0;
-    // Map: source LCN -> {dest_file_path, dest_offset_in_bytes}
+    // -- Populated during Phase 1: Inspection --
+    std::wstring src_path;              ///< Resolved absolute source path.
+    std::wstring dest_path;             ///< Resolved absolute destination path.
+    bool is_directory = false;          ///< True if source is a directory.
+
+    std::wstring src_volume_root;       ///< Source volume root (e.g., L"E:\\").
+    std::wstring dest_volume_root;      ///< Destination volume root (e.g., L"F:\\").
+    bool same_volume = false;           ///< True if src and dest are on the same volume.
+    bool dest_is_refs = false;          ///< True if destination is ReFS.
+    DWORD src_cluster_size = 0;         ///< Source volume cluster size in bytes.
+    DWORD dest_cluster_size = 0;        ///< Destination volume cluster size in bytes.
+
+    std::unique_ptr<ICopyStrategy> strategy;  ///< Selected copy strategy.
+    output::IOutput* out = nullptr;           ///< Non-owning pointer to the output interface.
+
+    // -- Populated during Phase 2: Operation --
+    /// Map: source LCN -> {dest_file_path, dest_offset_in_bytes}
     std::unordered_map<LONGLONG, std::pair<std::wstring, ULONGLONG>> lcn_map;
     CopyStats stats;
     HandleCache handle_cache;
 
-    ~CopyContext() {
-        handle_cache.close();
-    }
+    CopyContext() = default;
+    ~CopyContext() { handle_cache.close(); }
+
+    CopyContext(const CopyContext&) = delete;
+    CopyContext& operator=(const CopyContext&) = delete;
+    CopyContext(CopyContext&&) = default;
+    CopyContext& operator=(CopyContext&&) = default;
 };
 
+/// @brief Abstract interface for a single-file copy operation.
+struct ICopyStrategy {
+    virtual ~ICopyStrategy() = default;
+
+    /**
+     * @brief Copy a single file from src to dest.
+     * @param src   Source file path.
+     * @param dest  Destination file path.
+     * @param args  CLI arguments.
+     * @param context  Shared copy tracking context.
+     * @return true on success, or error message on failure.
+     */
+    virtual std::expected<bool, std::wstring> copy_file(
+        const std::wstring& src,
+        const std::wstring& dest,
+        const util::CliArg& args,
+        CopyContext& context
+    ) = 0;
+};
+
+// ============================================================================
+// Pure Helper Functions
+// ============================================================================
+
+/**
+ * @brief Checks if the given volume root path is formatted with the ReFS filesystem.
+ *
+ * @param volume_root The root path of the volume (e.g. L"C:\\").
+ * @return true If the volume is ReFS.
+ * @return false If the volume is not ReFS or information could not be retrieved.
+ */
 bool is_refs_volume(const std::wstring& volume_root) {
     wchar_t fs_name[MAX_PATH] = {0};
     if (GetVolumeInformationW(volume_root.c_str(), NULL, 0, NULL, NULL, NULL, fs_name, MAX_PATH)) {
@@ -78,6 +199,12 @@ bool is_refs_volume(const std::wstring& volume_root) {
     return false;
 }
 
+/**
+ * @brief Retrieves the cluster allocation size for the given volume.
+ *
+ * @param volume_root The root path of the volume.
+ * @return DWORD The cluster size in bytes, or 0 if retrieval fails.
+ */
 DWORD get_cluster_size(const std::wstring& volume_root) {
     DWORD sectors_per_cluster = 0, bytes_per_sector = 0, free_clusters = 0, total_clusters = 0;
     if (GetDiskFreeSpaceW(volume_root.c_str(), &sectors_per_cluster, &bytes_per_sector, &free_clusters, &total_clusters)) {
@@ -86,6 +213,12 @@ DWORD get_cluster_size(const std::wstring& volume_root) {
     return 0;
 }
 
+/**
+ * @brief Converts a relative path into a fully qualified absolute path name.
+ *
+ * @param path The relative or absolute path.
+ * @return std::wstring The fully qualified absolute path.
+ */
 std::wstring get_absolute_path(const std::wstring& path) {
     wchar_t buffer[MAX_PATH];
     DWORD length = GetFullPathNameW(path.c_str(), MAX_PATH, buffer, NULL);
@@ -95,156 +228,164 @@ std::wstring get_absolute_path(const std::wstring& path) {
     return path;
 }
 
-std::expected<bool, std::wstring> copy_file_preserving_dedup(
-    const std::wstring& src,
-    const std::wstring& dest,
-    const util::CliArg& args,
-    CopyContext& context
-) {
-    if (args.dry_run) {
-        if (context.same_volume) {
-            std::wcout << L"[DRY-RUN] Would clone (same volume): " << src << L" -> " << dest << std::endl;
-            context.stats.cloned_files++;
-        } else if (context.dest_is_refs && context.src_cluster_size == context.dest_cluster_size) {
-            std::wcout << L"[DRY-RUN] Would copy preserving deduplication (cross volume ReFS): " << src << L" -> " << dest << std::endl;
-            context.stats.cloned_files++;
-        } else {
-            std::wcout << L"[DRY-RUN] Would copy with standard fallback: " << src << L" -> " << dest << std::endl;
-            context.stats.fallback_files++;
-        }
-        context.stats.total_files++;
-        return true;
-    }
+// ============================================================================
+// Decomposed I/O Helpers
+// ============================================================================
 
-    // Branch A: Fallback to standard copy (Non-ReFS target or mismatched cluster size)
-    if (!context.same_volume && (!context.dest_is_refs || context.src_cluster_size != context.dest_cluster_size)) {
-        if (!context.dest_is_refs) {
-            std::wcout << L"WARNING: Destination volume is non-ReFS. Falling back to standard copy for: " << src << std::endl;
-        } else {
-            std::wcout << L"WARNING: Destination volume cluster size mismatch (" << context.dest_cluster_size 
-                       << L" vs " << context.src_cluster_size << L"). Falling back to standard copy for: " << src << std::endl;
-        }
-        if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, NULL, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
-            DWORD error = GetLastError();
-            return std::unexpected(L"Fallback CopyFileExW failed: " + util::get_win32_error_message(error));
-        }
-        context.stats.fallback_files++;
-        context.stats.total_files++;
-        return true;
-    }
-
-    // Branch B: Same-volume block clone or Cross-volume ReFS block clone
-    HANDLE src_handle = CreateFileW(
-        src.c_str(),
+/**
+ * @brief Opens a source file for reading with backup semantics.
+ *
+ * @param path The source file path.
+ * @return ScopedHandle on success, or error message on failure.
+ */
+std::expected<ScopedHandle, std::wstring> open_source_file(const std::wstring& path) {
+    ScopedHandle h(CreateFileW(
+        path.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ,
         NULL,
         OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS,
         NULL
-    );
-    if (src_handle == INVALID_HANDLE_VALUE) {
+    ));
+    if (!h) {
         return std::unexpected(L"Failed to open source file: " + util::get_win32_error_message(GetLastError()));
     }
+    return h;
+}
 
-    HANDLE dest_handle = CreateFileW(
-        dest.c_str(),
+/**
+ * @brief Creates a destination file and sets the sparse attribute.
+ *
+ * The sparse attribute allows logical sizing (SetEndOfFile) without allocating
+ * physical disk space, preventing disk-full failures for deduplicated files.
+ *
+ * @param path The destination file path.
+ * @return ScopedHandle on success, or error message on failure.
+ */
+std::expected<ScopedHandle, std::wstring> create_dest_file(const std::wstring& path) {
+    ScopedHandle h(CreateFileW(
+        path.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL,
         CREATE_ALWAYS,
         FILE_FLAG_BACKUP_SEMANTICS,
         NULL
-    );
-    if (dest_handle == INVALID_HANDLE_VALUE) {
-        DWORD error = GetLastError();
-        CloseHandle(src_handle);
-        return std::unexpected(L"Failed to create destination file: " + util::get_win32_error_message(error));
+    ));
+    if (!h) {
+        return std::unexpected(L"Failed to create destination file: " + util::get_win32_error_message(GetLastError()));
     }
 
-    // Mark the destination file as sparse. This allows logical sizing (SetEndOfFile)
-    // to succeed without allocating physical disk space, preventing disk-full failures
-    // for files that will be deduplicated/cloned.
     FILE_SET_SPARSE_BUFFER sparse_buffer;
     sparse_buffer.SetSparse = TRUE;
     DWORD temp_returned = 0;
-    bool sparse_ok = DeviceIoControl(
-        dest_handle,
-        FSCTL_SET_SPARSE,
-        &sparse_buffer,
-        sizeof(sparse_buffer),
-        NULL, 0,
-        &temp_returned,
-        NULL
-    );
-
-    bool copy_failed = false;
-    std::wstring copy_error_msg;
-
-    if (!sparse_ok) {
-        copy_failed = true;
-        copy_error_msg = L"Failed to set sparse attribute: " + util::get_win32_error_message(GetLastError());
+    if (!DeviceIoControl(h.get(), FSCTL_SET_SPARSE, &sparse_buffer, sizeof(sparse_buffer), NULL, 0, &temp_returned, NULL)) {
+        return std::unexpected(L"Failed to set sparse attribute: " + util::get_win32_error_message(GetLastError()));
     }
 
-    LARGE_INTEGER src_size = {0};
-    if (!copy_failed) {
-        if (!GetFileSizeEx(src_handle, &src_size)) {
-            DWORD error = GetLastError();
-            CloseHandle(src_handle);
-            CloseHandle(dest_handle);
-            return std::unexpected(L"Failed to get source file size: " + util::get_win32_error_message(error));
-        }
+    return h;
+}
+
+/// @brief Tracks destination file sizing state for incremental growth.
+struct DestSizeTracker {
+    bool incremental = false;   ///< True if pre-sizing failed and we grow on demand.
+    ULONGLONG current_eof = 0;  ///< Current logical end-of-file position.
+};
+
+/**
+ * @brief Pre-sizes the destination file to the source file size.
+ *
+ * If pre-sizing fails (e.g. disk full), falls back to incremental mode where
+ * the file is grown on demand as blocks are written.
+ *
+ * @param dest_handle  Handle to the destination file.
+ * @param src_size     Source file size in bytes.
+ * @return DestSizeTracker indicating sizing mode and current EOF.
+ */
+std::expected<DestSizeTracker, std::wstring> pre_size_dest_file(HANDLE dest_handle, LONGLONG src_size) {
+    DestSizeTracker tracker;
+
+    if (src_size <= 0) {
+        return tracker;
     }
 
-    bool incremental_sizing = false;
-    ULONGLONG current_dest_eof = 0;
-
-    // Pre-size the destination file to source size so that block cloning works (cannot clone beyond EOF)
-    if (!copy_failed && src_size.QuadPart > 0) {
-        if (!SetFilePointerEx(dest_handle, src_size, NULL, FILE_BEGIN) || !SetEndOfFile(dest_handle)) {
-            // Pre-sizing failed (e.g., disk full). Fall back to incremental block-by-block sizing.
-            incremental_sizing = true;
-        } else {
-            current_dest_eof = src_size.QuadPart;
-        }
-
-        // Seek back to beginning
-        LARGE_INTEGER zero_offset;
-        zero_offset.QuadPart = 0;
-        if (!SetFilePointerEx(dest_handle, zero_offset, NULL, FILE_BEGIN)) {
-            DWORD error = GetLastError();
-            CloseHandle(src_handle);
-            CloseHandle(dest_handle);
-            return std::unexpected(L"Failed to reset destination file pointer: " + util::get_win32_error_message(error));
-        }
+    LARGE_INTEGER li;
+    li.QuadPart = src_size;
+    if (SetFilePointerEx(dest_handle, li, NULL, FILE_BEGIN) && SetEndOfFile(dest_handle)) {
+        tracker.current_eof = src_size;
+    } else {
+        tracker.incremental = true;
     }
 
-    auto ensure_dest_size = [&](ULONGLONG required_size) -> bool {
-        if (incremental_sizing && required_size > current_dest_eof) {
-            LARGE_INTEGER li;
-            li.QuadPart = required_size;
-            if (!SetFilePointerEx(dest_handle, li, NULL, FILE_BEGIN) || !SetEndOfFile(dest_handle)) {
-                return false;
-            }
-            current_dest_eof = required_size;
-        }
+    // Seek back to beginning regardless
+    LARGE_INTEGER zero;
+    zero.QuadPart = 0;
+    if (!SetFilePointerEx(dest_handle, zero, NULL, FILE_BEGIN)) {
+        return std::unexpected(L"Failed to reset destination file pointer: " + util::get_win32_error_message(GetLastError()));
+    }
+
+    return tracker;
+}
+
+/**
+ * @brief Ensures the destination file is at least the required size.
+ *
+ * Only grows the file if in incremental sizing mode and the required size
+ * exceeds the current EOF.
+ *
+ * @param dest_handle  Handle to the destination file.
+ * @param tracker      Mutable sizing tracker.
+ * @param required_size  Minimum required file size in bytes.
+ * @return true on success, or error message on failure.
+ */
+std::expected<bool, std::wstring> ensure_dest_size(HANDLE dest_handle, DestSizeTracker& tracker, ULONGLONG required_size) {
+    if (!tracker.incremental || required_size <= tracker.current_eof) {
         return true;
-    };
+    }
+
+    LARGE_INTEGER li;
+    li.QuadPart = required_size;
+    if (!SetFilePointerEx(dest_handle, li, NULL, FILE_BEGIN) || !SetEndOfFile(dest_handle)) {
+        return std::unexpected(L"Incremental sizing failed: " + util::get_win32_error_message(GetLastError()));
+    }
+    tracker.current_eof = required_size;
+    return true;
+}
+
+/// @brief A single VCN extent with its LCN mapping.
+struct Extent {
+    LONGLONG vcn = 0;       ///< Starting VCN of this extent.
+    LONGLONG next_vcn = 0;  ///< VCN of the next extent (or EOF).
+    LONGLONG lcn = 0;       ///< Starting LCN (-1 for sparse).
+
+    ULONGLONG cluster_count() const { return next_vcn - vcn; }
+    bool is_sparse() const { return lcn == (LONGLONG)-1; }
+};
+
+/**
+ * @brief Queries all retrieval pointers (extents) for a file.
+ *
+ * Iterates FSCTL_GET_RETRIEVAL_POINTERS until all extents are retrieved.
+ *
+ * @param file_handle  Handle to the file.
+ * @return Vector of extents on success, or error message on failure.
+ */
+std::expected<std::vector<Extent>, std::wstring> query_retrieval_pointers(HANDLE file_handle) {
+    std::vector<Extent> extents;
 
     STARTING_VCN_INPUT_BUFFER input = {0};
     input.StartingVcn.QuadPart = 0;
 
     const DWORD buf_size = sizeof(RETRIEVAL_POINTERS_BUFFER) + sizeof(RETRIEVAL_POINTERS_BUFFER::Extents[0]) * 16;
     std::vector<BYTE> buffer(buf_size);
-    PRETRIEVAL_POINTERS_BUFFER output = reinterpret_cast<PRETRIEVAL_POINTERS_BUFFER>(buffer.data());
+    auto output = reinterpret_cast<PRETRIEVAL_POINTERS_BUFFER>(buffer.data());
 
-    DWORD bytes_returned = 0;
     bool done = false;
-    LONGLONG current_vcn = 0;
-
-    while (!done && !copy_failed) {
+    while (!done) {
+        DWORD bytes_returned = 0;
         BOOL ok = DeviceIoControl(
-            src_handle,
+            file_handle,
             FSCTL_GET_RETRIEVAL_POINTERS,
             &input,
             sizeof(input),
@@ -256,285 +397,767 @@ std::expected<bool, std::wstring> copy_file_preserving_dedup(
 
         DWORD err = GetLastError();
         if (!ok && err != ERROR_MORE_DATA) {
-            if (err == ERROR_HANDLE_EOF) {
-                break;
-            }
-            copy_failed = true;
-            copy_error_msg = L"FSCTL_GET_RETRIEVAL_POINTERS failed: " + util::get_win32_error_message(err);
-            break;
+            if (err == ERROR_HANDLE_EOF) break;
+            return std::unexpected(L"FSCTL_GET_RETRIEVAL_POINTERS failed: " + util::get_win32_error_message(err));
         }
 
-        if (ok) {
-            done = true;
-        }
+        if (ok) done = true;
 
-        LONGLONG start_vcn = output->StartingVcn.QuadPart;
-        current_vcn = start_vcn;
-
+        LONGLONG current_vcn = output->StartingVcn.QuadPart;
         for (DWORD i = 0; i < output->ExtentCount; ++i) {
-            LONGLONG next_vcn = output->Extents[i].NextVcn.QuadPart;
-            LONGLONG lcn = output->Extents[i].Lcn.QuadPart;
-
-            ULONGLONG extent_cluster_count = next_vcn - current_vcn;
-
-            if (lcn == (LONGLONG)-1) {
-                // Sparse extent: let SetEndOfFile handle sizing
-                current_vcn = next_vcn;
-                continue;
-            }
-
-            // Process extent clusters
-            ULONGLONG c_offset = 0;
-            while (c_offset < extent_cluster_count) {
-                LONGLONG current_lcn = lcn + c_offset;
-                ULONGLONG src_offset = (current_vcn + c_offset) * context.src_cluster_size;
-
-                if (context.same_volume) {
-                    ULONGLONG required_size = src_offset + extent_cluster_count * context.src_cluster_size;
-                    if (!ensure_dest_size(required_size)) {
-                        copy_failed = true;
-                        copy_error_msg = L"Incremental sizing failed: " + util::get_win32_error_message(GetLastError());
-                        break;
-                    }
-
-                    // Direct same-volume clone
-                    DUPLICATE_EXTENTS_DATA dup_data;
-                    dup_data.FileHandle = src_handle;
-                    dup_data.SourceFileOffset.QuadPart = src_offset;
-                    dup_data.TargetFileOffset.QuadPart = src_offset;
-                    dup_data.ByteCount.QuadPart = extent_cluster_count * context.src_cluster_size;
-
-                    DWORD dup_returned = 0;
-                    BOOL dup_ok = DeviceIoControl(
-                        dest_handle,
-                        FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-                        &dup_data,
-                        sizeof(dup_data),
-                        NULL, 0,
-                        &dup_returned,
-                        NULL
-                    );
-
-                    if (!dup_ok) {
-                        copy_failed = true;
-                        copy_error_msg = L"FSCTL_DUPLICATE_EXTENTS_TO_FILE failed: " + util::get_win32_error_message(GetLastError());
-                    }
-                    // Since it cloned the whole extent, we are done with this extent
-                    break;
-                } else {
-                    // Cross-volume ReFS copy: check LCN map
-                    auto map_it = context.lcn_map.find(current_lcn);
-                    if (map_it != context.lcn_map.end()) {
-                        // duplicate LCN: find contiguous run length
-                        const auto& master = map_it->second;
-                        ULONGLONG run_clusters = 1;
-                        while (c_offset + run_clusters < extent_cluster_count) {
-                            LONGLONG next_lcn = lcn + c_offset + run_clusters;
-                            auto next_map_it = context.lcn_map.find(next_lcn);
-                            if (next_map_it == context.lcn_map.end()) {
-                                break;
-                            }
-                            const auto& next_master = next_map_it->second;
-                            if (next_master.first != master.first || 
-                                next_master.second != master.second + run_clusters * context.src_cluster_size) {
-                                break;
-                            }
-                            run_clusters++;
-                        }
-
-                        ULONGLONG required_size = src_offset + run_clusters * context.src_cluster_size;
-                        if (!ensure_dest_size(required_size)) {
-                            copy_failed = true;
-                            copy_error_msg = L"Incremental sizing failed: " + util::get_win32_error_message(GetLastError());
-                            break;
-                        }
-
-                        // Clone duplicate run from already copied destination file
-                        HANDLE prev_dest_handle = context.handle_cache.get(master.first);
-                        if (prev_dest_handle == INVALID_HANDLE_VALUE) {
-                            copy_failed = true;
-                            copy_error_msg = L"Failed to open previously copied destination file: " + master.first;
-                            break;
-                        }
-
-                        DUPLICATE_EXTENTS_DATA dup_data;
-                        dup_data.FileHandle = prev_dest_handle;
-                        dup_data.SourceFileOffset.QuadPart = master.second;
-                        dup_data.TargetFileOffset.QuadPart = src_offset;
-                        dup_data.ByteCount.QuadPart = run_clusters * context.src_cluster_size;
-
-                        DWORD dup_returned = 0;
-                        BOOL dup_ok = DeviceIoControl(
-                            dest_handle,
-                            FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-                            &dup_data,
-                            sizeof(dup_data),
-                            NULL, 0,
-                            &dup_returned,
-                            NULL
-                        );
-
-                        if (!dup_ok) {
-                            DWORD dup_err = GetLastError();
-                            std::wcout << L"ERROR: FSCTL_DUPLICATE_EXTENTS_TO_FILE failed on target volume. SourceOffset=" 
-                                       << dup_data.SourceFileOffset.QuadPart 
-                                       << L", TargetOffset=" << dup_data.TargetFileOffset.QuadPart 
-                                       << L", ByteCount=" << dup_data.ByteCount.QuadPart 
-                                       << L", err=" << dup_err << std::endl;
-                            copy_failed = true;
-                            copy_error_msg = L"FSCTL_DUPLICATE_EXTENTS_TO_FILE failed on target volume: " + util::get_win32_error_message(dup_err);
-                            break;
-                        }
-
-                        c_offset += run_clusters;
-                    } else {
-                        // New LCN: find contiguous run length
-                        ULONGLONG run_clusters = 1;
-                        while (c_offset + run_clusters < extent_cluster_count) {
-                            LONGLONG next_lcn = lcn + c_offset + run_clusters;
-                            if (context.lcn_map.contains(next_lcn)) {
-                                break;
-                            }
-                            run_clusters++;
-                        }
-
-                        ULONGLONG bytes_to_copy = run_clusters * context.src_cluster_size;
-                        ULONGLONG bytes_to_read = bytes_to_copy;
-                        if ((ULONGLONG)src_size.QuadPart > src_offset) {
-                            if (src_offset + bytes_to_read > (ULONGLONG)src_size.QuadPart) {
-                                bytes_to_read = (ULONGLONG)src_size.QuadPart - src_offset;
-                            }
-                        } else {
-                            bytes_to_read = 0;
-                        }
-
-                        ULONGLONG required_size = src_offset + bytes_to_read;
-                        if (!ensure_dest_size(required_size)) {
-                            copy_failed = true;
-                            copy_error_msg = L"Incremental sizing failed: " + util::get_win32_error_message(GetLastError());
-                            break;
-                        }
-
-                        // Seek source
-                        LARGE_INTEGER li_src;
-                        li_src.QuadPart = src_offset;
-                        if (!SetFilePointerEx(src_handle, li_src, NULL, FILE_BEGIN)) {
-                            copy_failed = true;
-                            copy_error_msg = L"SetFilePointerEx failed on source: " + util::get_win32_error_message(GetLastError());
-                            break;
-                        }
-
-                        // Seek target
-                        LARGE_INTEGER li_dest;
-                        li_dest.QuadPart = src_offset;
-                        if (!SetFilePointerEx(dest_handle, li_dest, NULL, FILE_BEGIN)) {
-                            copy_failed = true;
-                            copy_error_msg = L"SetFilePointerEx failed on destination: " + util::get_win32_error_message(GetLastError());
-                            break;
-                        }
-
-                        // Copy bytes physically
-                        std::vector<BYTE> io_buffer(64 * 1024); // 64 KB chunk copy
-                        ULONGLONG copied = 0;
-                        bool write_ok = true;
-
-                        while (copied < bytes_to_read) {
-                            DWORD to_read = static_cast<DWORD>(std::min<ULONGLONG>(io_buffer.size(), bytes_to_read - copied));
-                            DWORD read = 0;
-                            if (!ReadFile(src_handle, io_buffer.data(), to_read, &read, NULL) || read == 0) {
-                                DWORD read_err = GetLastError();
-                                std::wcout << L"ERROR: ReadFile EOF/failure. to_read=" << to_read 
-                                           << L", read=" << read 
-                                           << L", copied=" << copied 
-                                           << L", bytes_to_read=" << bytes_to_read 
-                                           << L", src_offset=" << src_offset 
-                                           << L", file_size=" << src_size.QuadPart 
-                                           << L", err=" << read_err << std::endl;
-                                copy_failed = true;
-                                copy_error_msg = L"ReadFile failed on source: " + util::get_win32_error_message(read_err);
-                                write_ok = false;
-                                break;
-                            }
-
-                            DWORD written = 0;
-                            if (!WriteFile(dest_handle, io_buffer.data(), read, &written, NULL) || written != read) {
-                                copy_failed = true;
-                                copy_error_msg = L"WriteFile failed on destination: " + util::get_win32_error_message(GetLastError());
-                                write_ok = false;
-                                break;
-                            }
-
-                            copied += read;
-                        }
-
-                        if (!write_ok) break;
-
-                        // Map LCNs to destination
-                        for (ULONGLONG k = 0; k < run_clusters; ++k) {
-                            context.lcn_map[lcn + c_offset + k] = {dest, src_offset + k * context.src_cluster_size};
-                        }
-
-                        c_offset += run_clusters;
-                    }
-                }
-            }
-
-            if (copy_failed) break;
-            current_vcn = next_vcn;
+            Extent ext;
+            ext.vcn = current_vcn;
+            ext.next_vcn = output->Extents[i].NextVcn.QuadPart;
+            ext.lcn = output->Extents[i].Lcn.QuadPart;
+            extents.push_back(ext);
+            current_vcn = ext.next_vcn;
         }
 
-        if (copy_failed) break;
-        input.StartingVcn.QuadPart = current_vcn;
+        input.StartingVcn.QuadPart = extents.empty() ? 0 : extents.back().next_vcn;
     }
 
-    if (copy_failed) {
-        CloseHandle(dest_handle);
-        DeleteFileW(dest.c_str());
+    return extents;
+}
 
-        std::wcout << L"WARNING: Deduplication-preserving copy failed (" << copy_error_msg 
-                   << L"). Falling back to standard copy for: " << src << std::endl;
+/**
+ * @brief Clones an extent from a source file to a destination file on the same volume.
+ *
+ * @param dest_handle     Handle to the destination file.
+ * @param src_handle      Handle to the source file.
+ * @param src_offset      Byte offset in the source file.
+ * @param dest_offset     Byte offset in the destination file.
+ * @param byte_count      Number of bytes to clone.
+ * @return true on success, or error message on failure.
+ */
+std::expected<bool, std::wstring> clone_extent_same_volume(
+    HANDLE dest_handle, HANDLE src_handle,
+    ULONGLONG src_offset, ULONGLONG dest_offset, ULONGLONG byte_count
+) {
+    DUPLICATE_EXTENTS_DATA dup_data;
+    dup_data.FileHandle = src_handle;
+    dup_data.SourceFileOffset.QuadPart = src_offset;
+    dup_data.TargetFileOffset.QuadPart = dest_offset;
+    dup_data.ByteCount.QuadPart = byte_count;
 
-        // Standard copy fallback
-        if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, NULL, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
-            DWORD error = GetLastError();
-            CloseHandle(src_handle);
-            return std::unexpected(L"Dedup copy failed (" + copy_error_msg + L"), and fallback copy failed: " + util::get_win32_error_message(error));
-        }
-
-        context.stats.fallback_files++;
-    } else {
-        // Truncate/extend destination file to exact size
-        LARGE_INTEGER dist_offset;
-        dist_offset.QuadPart = src_size.QuadPart;
-        if (!SetFilePointerEx(dest_handle, dist_offset, NULL, FILE_BEGIN)) {
-            DWORD error = GetLastError();
-            CloseHandle(src_handle);
-            CloseHandle(dest_handle);
-            return std::unexpected(L"Failed to set file pointer: " + util::get_win32_error_message(error));
-        }
-        if (!SetEndOfFile(dest_handle)) {
-            DWORD error = GetLastError();
-            CloseHandle(src_handle);
-            CloseHandle(dest_handle);
-            return std::unexpected(L"SetEndOfFile failed: " + util::get_win32_error_message(error));
-        }
-
-        // Copy file times/attributes
-        FILE_BASIC_INFO basic_info;
-        if (GetFileInformationByHandleEx(src_handle, FileBasicInfo, &basic_info, sizeof(basic_info))) {
-            SetFileInformationByHandle(dest_handle, FileBasicInfo, &basic_info, sizeof(basic_info));
-        }
-
-        CloseHandle(dest_handle);
-        context.stats.cloned_files++;
+    DWORD dup_returned = 0;
+    if (!DeviceIoControl(dest_handle, FSCTL_DUPLICATE_EXTENTS_TO_FILE, &dup_data, sizeof(dup_data), NULL, 0, &dup_returned, NULL)) {
+        return std::unexpected(L"FSCTL_DUPLICATE_EXTENTS_TO_FILE failed: " + util::get_win32_error_message(GetLastError()));
     }
-
-    CloseHandle(src_handle);
-    context.stats.total_files++;
-    context.stats.total_bytes += src_size.QuadPart;
     return true;
 }
 
+/**
+ * @brief Clones an extent from a previously-copied destination file to the current destination.
+ *
+ * Used in cross-volume copies to preserve deduplication by cloning blocks that
+ * already exist on the destination volume.
+ *
+ * @param dest_handle          Handle to the current destination file.
+ * @param prev_dest_handle     Handle to the previously-copied file on the same volume.
+ * @param prev_dest_offset     Byte offset in the previously-copied file.
+ * @param dest_offset          Byte offset in the current destination file.
+ * @param byte_count           Number of bytes to clone.
+ * @return true on success, or error message on failure.
+ */
+std::expected<bool, std::wstring> clone_extent_from_dest(
+    HANDLE dest_handle, HANDLE prev_dest_handle,
+    ULONGLONG prev_dest_offset, ULONGLONG dest_offset, ULONGLONG byte_count
+) {
+    DUPLICATE_EXTENTS_DATA dup_data;
+    dup_data.FileHandle = prev_dest_handle;
+    dup_data.SourceFileOffset.QuadPart = prev_dest_offset;
+    dup_data.TargetFileOffset.QuadPart = dest_offset;
+    dup_data.ByteCount.QuadPart = byte_count;
+
+    DWORD dup_returned = 0;
+    if (!DeviceIoControl(dest_handle, FSCTL_DUPLICATE_EXTENTS_TO_FILE, &dup_data, sizeof(dup_data), NULL, 0, &dup_returned, NULL)) {
+        DWORD err = GetLastError();
+        return std::unexpected(L"FSCTL_DUPLICATE_EXTENTS_TO_FILE failed on target volume (SourceOffset="
+            + std::to_wstring(dup_data.SourceFileOffset.QuadPart)
+            + L", TargetOffset=" + std::to_wstring(dup_data.TargetFileOffset.QuadPart)
+            + L", ByteCount=" + std::to_wstring(dup_data.ByteCount.QuadPart)
+            + L"): " + util::get_win32_error_message(err));
+    }
+    return true;
+}
+
+/**
+ * @brief Physically copies bytes from source to destination in 64 KB chunks.
+ *
+ * Optionally reports per-file progress via the IOutput interface.
+ *
+ * @param src_handle   Handle to the source file.
+ * @param dest_handle  Handle to the destination file.
+ * @param src_offset   Byte offset to start reading from in the source.
+ * @param dest_offset  Byte offset to start writing to in the destination.
+ * @param byte_count   Total bytes to copy in this call.
+ * @param out          Optional output interface for progress reporting.
+ * @param filename     Display filename for progress (required if out is set).
+ * @param file_offset  Cumulative bytes already transferred for this file.
+ * @param file_total   Total file size in bytes.
+ * @return true on success, or error message on failure.
+ */
+std::expected<bool, std::wstring> copy_bytes_physical(
+    HANDLE src_handle, HANDLE dest_handle,
+    ULONGLONG src_offset, ULONGLONG dest_offset, ULONGLONG byte_count,
+    output::IOutput* out = nullptr, const std::wstring& filename = L"",
+    ULONGLONG file_offset = 0, ULONGLONG file_total = 0
+) {
+    // Seek source
+    LARGE_INTEGER li_src;
+    li_src.QuadPart = src_offset;
+    if (!SetFilePointerEx(src_handle, li_src, NULL, FILE_BEGIN)) {
+        return std::unexpected(L"SetFilePointerEx failed on source: " + util::get_win32_error_message(GetLastError()));
+    }
+
+    // Seek destination
+    LARGE_INTEGER li_dest;
+    li_dest.QuadPart = dest_offset;
+    if (!SetFilePointerEx(dest_handle, li_dest, NULL, FILE_BEGIN)) {
+        return std::unexpected(L"SetFilePointerEx failed on destination: " + util::get_win32_error_message(GetLastError()));
+    }
+
+    // Copy in 4 MB chunks to optimize sequential I/O throughput
+    std::vector<BYTE> io_buffer(4 * 1024 * 1024);
+    ULONGLONG copied = 0;
+
+    while (copied < byte_count) {
+        if (g_cancel_requested) {
+            return std::unexpected(L"Copy cancelled by user.");
+        }
+        DWORD to_read = static_cast<DWORD>(std::min<ULONGLONG>(io_buffer.size(), byte_count - copied));
+        DWORD read = 0;
+        if (!ReadFile(src_handle, io_buffer.data(), to_read, &read, NULL) || read == 0) {
+            DWORD err = GetLastError();
+            return std::unexpected(L"ReadFile failed on source (to_read="
+                + std::to_wstring(to_read) + L", read=" + std::to_wstring(read)
+                + L", copied=" + std::to_wstring(copied)
+                + L", byte_count=" + std::to_wstring(byte_count)
+                + L", src_offset=" + std::to_wstring(src_offset)
+                + L"): " + util::get_win32_error_message(err));
+        }
+
+        DWORD written = 0;
+        if (!WriteFile(dest_handle, io_buffer.data(), read, &written, NULL) || written != read) {
+            return std::unexpected(L"WriteFile failed on destination: " + util::get_win32_error_message(GetLastError()));
+        }
+
+        copied += read;
+
+        // Report progress
+        if (out && file_total > 0) {
+            out->progress(filename, file_offset + copied, file_total);
+        }
+    }
+
+    return true;
+}
+
+/**
+ * @brief Sets the final destination file size and copies timestamps/attributes.
+ *
+ * @param dest_handle  Handle to the destination file.
+ * @param src_handle   Handle to the source file (for reading attributes).
+ * @param src_size     The exact file size to set on the destination.
+ * @return true on success, or error message on failure.
+ */
+std::expected<bool, std::wstring> finalize_dest_file(HANDLE dest_handle, HANDLE src_handle, LONGLONG src_size) {
+    // Truncate/extend destination to exact source size
+    LARGE_INTEGER li;
+    li.QuadPart = src_size;
+    if (!SetFilePointerEx(dest_handle, li, NULL, FILE_BEGIN)) {
+        return std::unexpected(L"Failed to set file pointer: " + util::get_win32_error_message(GetLastError()));
+    }
+    if (!SetEndOfFile(dest_handle)) {
+        return std::unexpected(L"SetEndOfFile failed: " + util::get_win32_error_message(GetLastError()));
+    }
+
+    // Copy file times and attributes
+    FILE_BASIC_INFO basic_info;
+    if (GetFileInformationByHandleEx(src_handle, FileBasicInfo, &basic_info, sizeof(basic_info))) {
+        SetFileInformationByHandle(dest_handle, FileBasicInfo, &basic_info, sizeof(basic_info));
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Copy Strategies
+// ============================================================================
+
+/**
+ * @brief Fallback strategy using standard CopyFileExW.
+ *
+ * Used when the destination is non-ReFS or cluster sizes are mismatched,
+ * making block cloning impossible.
+ */
+struct FallbackCopyStrategy : ICopyStrategy {
+    std::expected<bool, std::wstring> copy_file(
+        const std::wstring& src,
+        const std::wstring& dest,
+        const util::CliArg& args,
+        CopyContext& context
+    ) override {
+        if (args.dry_run) {
+            context.out->status(L"[DRY-RUN] Would copy with standard fallback: " + src + L" -> " + dest);
+            context.stats.fallback_files++;
+            context.stats.total_files++;
+            return true;
+        }
+
+        if (!context.dest_is_refs) {
+            context.out->warn(L"Destination volume is non-ReFS. Falling back to standard copy for: " + src);
+        } else {
+            context.out->warn(L"Destination volume cluster size mismatch ("
+                + std::to_wstring(context.dest_cluster_size) + L" vs " + std::to_wstring(context.src_cluster_size)
+                + L"). Falling back to standard copy for: " + src);
+        }
+
+        // Use progress callback for CopyFileExW
+        ProgressContext prog_ctx{src, context.out};
+        if (!CopyFileExW(src.c_str(), dest.c_str(), &copy_progress_callback, &prog_ctx, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
+            DWORD error = GetLastError();
+            return std::unexpected(L"Fallback CopyFileExW failed: " + util::get_win32_error_message(error));
+        }
+
+        // Report completion
+        if (prog_ctx.total_size > 0) {
+            context.out->progress(src, prog_ctx.total_size, prog_ctx.total_size);
+        }
+
+        context.stats.fallback_files++;
+        context.stats.total_files++;
+        return true;
+    }
+
+private:
+    /// @brief Context passed to CopyFileExW progress callback.
+    struct ProgressContext {
+        std::wstring filename;
+        output::IOutput* out;
+        ULONGLONG total_size = 0;
+    };
+
+    /// @brief CopyFileExW progress routine that forwards to IOutput::progress.
+    static DWORD CALLBACK copy_progress_callback(
+        LARGE_INTEGER TotalFileSize,
+        LARGE_INTEGER TotalBytesTransferred,
+        LARGE_INTEGER /*StreamSize*/,
+        LARGE_INTEGER /*StreamBytesTransferred*/,
+        DWORD /*dwStreamNumber*/,
+        DWORD /*dwCallbackReason*/,
+        HANDLE /*hSourceFile*/,
+        HANDLE /*hDestinationFile*/,
+        LPVOID lpData
+    ) {
+        auto* ctx = static_cast<ProgressContext*>(lpData);
+        ctx->total_size = TotalFileSize.QuadPart;
+        if (g_cancel_requested) {
+            return PROGRESS_CANCEL;
+        }
+        if (ctx->out) {
+            ctx->out->progress(ctx->filename,
+                static_cast<ULONGLONG>(TotalBytesTransferred.QuadPart),
+                static_cast<ULONGLONG>(TotalFileSize.QuadPart));
+        }
+        return PROGRESS_CONTINUE;
+    }
+};
+
+/**
+ * @brief Same-volume strategy using FSCTL_DUPLICATE_EXTENTS_TO_FILE.
+ *
+ * Clones entire extents directly from the source file handle, preserving
+ * block sharing on the same volume.
+ */
+struct SameVolumeCopyStrategy : ICopyStrategy {
+    std::expected<bool, std::wstring> copy_file(
+        const std::wstring& src,
+        const std::wstring& dest,
+        const util::CliArg& args,
+        CopyContext& context
+    ) override {
+        if (args.dry_run) {
+            context.out->status(L"[DRY-RUN] Would clone (same volume): " + src + L" -> " + dest);
+            context.stats.cloned_files++;
+            context.stats.total_files++;
+            return true;
+        }
+
+        // Open files
+        auto src_result = open_source_file(src);
+        if (!src_result) return std::unexpected(src_result.error());
+        ScopedHandle src_handle = std::move(*src_result);
+
+        auto dest_result = create_dest_file(dest);
+        if (!dest_result) return std::unexpected(dest_result.error());
+        ScopedHandle dest_handle = std::move(*dest_result);
+
+        // Get source file size
+        LARGE_INTEGER src_size = {0};
+        if (!GetFileSizeEx(src_handle.get(), &src_size)) {
+            return std::unexpected(L"Failed to get source file size: " + util::get_win32_error_message(GetLastError()));
+        }
+
+        // Pre-size destination
+        auto tracker_result = pre_size_dest_file(dest_handle.get(), src_size.QuadPart);
+        if (!tracker_result) return std::unexpected(tracker_result.error());
+        DestSizeTracker tracker = *tracker_result;
+
+        // Query extents
+        auto extents_result = query_retrieval_pointers(src_handle.get());
+        if (!extents_result) {
+            dest_handle.close();
+            src_handle.close();
+            if (g_cancel_requested) {
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            return attempt_fallback(src, dest, extents_result.error(), context);
+        }
+
+        // Clone each extent
+        ULONGLONG bytes_cloned = 0;
+        for (const auto& ext : *extents_result) {
+            if (ext.is_sparse()) continue;
+
+            if (g_cancel_requested) {
+                dest_handle.close();
+                src_handle.close();
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+
+            ULONGLONG src_offset = ext.vcn * context.src_cluster_size;
+            ULONGLONG byte_count = ext.cluster_count() * context.src_cluster_size;
+            ULONGLONG required_size = src_offset + byte_count;
+
+            auto size_ok = ensure_dest_size(dest_handle.get(), tracker, required_size);
+            if (!size_ok) {
+                dest_handle.close();
+                src_handle.close();
+                if (g_cancel_requested) {
+                    DeleteFileW(dest.c_str());
+                    return std::unexpected(L"Copy cancelled by user.");
+                }
+                return attempt_fallback(src, dest, size_ok.error(), context);
+            }
+
+            auto clone_ok = clone_extent_same_volume(dest_handle.get(), src_handle.get(), src_offset, src_offset, byte_count);
+            if (!clone_ok) {
+                dest_handle.close();
+                src_handle.close();
+                if (g_cancel_requested) {
+                    DeleteFileW(dest.c_str());
+                    return std::unexpected(L"Copy cancelled by user.");
+                }
+                return attempt_fallback(src, dest, clone_ok.error(), context);
+            }
+
+            bytes_cloned += byte_count;
+            context.out->progress(src, bytes_cloned, static_cast<ULONGLONG>(src_size.QuadPart));
+        }
+
+        // Finalize
+        auto final_ok = finalize_dest_file(dest_handle.get(), src_handle.get(), src_size.QuadPart);
+        if (!final_ok) {
+            dest_handle.close();
+            src_handle.close();
+            if (g_cancel_requested) {
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            return std::unexpected(final_ok.error());
+        }
+
+        context.stats.cloned_files++;
+        context.stats.total_files++;
+        context.stats.total_bytes += src_size.QuadPart;
+        return true;
+    }
+
+private:
+    /**
+     * @brief Attempts a standard copy fallback after a clone failure.
+     *
+     * Deletes the partially-written destination file and falls back to CopyFileExW.
+     */
+    std::expected<bool, std::wstring> attempt_fallback(
+        const std::wstring& src, const std::wstring& dest,
+        const std::wstring& original_error, CopyContext& context
+    ) {
+        DeleteFileW(dest.c_str());
+        if (g_cancel_requested) {
+            return std::unexpected(L"Copy cancelled by user.");
+        }
+        context.out->warn(L"Deduplication-preserving copy failed (" + original_error
+            + L"). Falling back to standard copy for: " + src);
+
+        if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
+            DWORD error = GetLastError();
+            return std::unexpected(L"Dedup copy failed (" + original_error + L"), and fallback copy failed: " + util::get_win32_error_message(error));
+        }
+
+        context.stats.fallback_files++;
+        context.stats.total_files++;
+        return true;
+    }
+};
+
+/**
+ * @brief Cross-volume ReFS strategy preserving deduplication via LCN mapping.
+ *
+ * For each extent: new LCNs are physically copied from source, duplicate LCNs
+ * are cloned from previously-copied destination files via handle cache.
+ */
+struct CrossVolumeRefsCopyStrategy : ICopyStrategy {
+    std::expected<bool, std::wstring> copy_file(
+        const std::wstring& src,
+        const std::wstring& dest,
+        const util::CliArg& args,
+        CopyContext& context
+    ) override {
+        if (args.dry_run) {
+            context.out->status(L"[DRY-RUN] Would copy preserving deduplication (cross volume ReFS): "
+                + src + L" -> " + dest);
+            context.stats.cloned_files++;
+            context.stats.total_files++;
+            return true;
+        }
+
+        // Open files
+        auto src_result = open_source_file(src);
+        if (!src_result) return std::unexpected(src_result.error());
+        ScopedHandle src_handle = std::move(*src_result);
+
+        auto dest_result = create_dest_file(dest);
+        if (!dest_result) return std::unexpected(dest_result.error());
+        ScopedHandle dest_handle = std::move(*dest_result);
+
+        // Get source file size
+        LARGE_INTEGER src_size = {0};
+        if (!GetFileSizeEx(src_handle.get(), &src_size)) {
+            return std::unexpected(L"Failed to get source file size: " + util::get_win32_error_message(GetLastError()));
+        }
+
+        // Pre-size destination
+        auto tracker_result = pre_size_dest_file(dest_handle.get(), src_size.QuadPart);
+        if (!tracker_result) return std::unexpected(tracker_result.error());
+        DestSizeTracker tracker = *tracker_result;
+
+        // Query extents
+        auto extents_result = query_retrieval_pointers(src_handle.get());
+        if (!extents_result) {
+            dest_handle.close();
+            src_handle.close();
+            if (g_cancel_requested) {
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            return attempt_fallback(src, dest, extents_result.error(), context);
+        }
+
+        // Process each extent cluster-by-cluster
+        ULONGLONG bytes_processed = 0;
+        for (const auto& ext : *extents_result) {
+            if (ext.is_sparse()) continue;
+
+            if (g_cancel_requested) {
+                dest_handle.close();
+                src_handle.close();
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+
+            auto result = process_cross_volume_extent(
+                ext, src_handle.get(), dest_handle.get(),
+                src_size.QuadPart, src, dest, tracker, context, bytes_processed
+            );
+            if (!result) {
+                dest_handle.close();
+                src_handle.close();
+                if (g_cancel_requested) {
+                    DeleteFileW(dest.c_str());
+                    return std::unexpected(L"Copy cancelled by user.");
+                }
+                return attempt_fallback(src, dest, result.error(), context);
+            }
+        }
+
+        // Finalize
+        auto final_ok = finalize_dest_file(dest_handle.get(), src_handle.get(), src_size.QuadPart);
+        if (!final_ok) {
+            dest_handle.close();
+            src_handle.close();
+            if (g_cancel_requested) {
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            return std::unexpected(final_ok.error());
+        }
+
+        context.stats.cloned_files++;
+        context.stats.total_files++;
+        context.stats.total_bytes += src_size.QuadPart;
+        return true;
+    }
+
+private:
+    /**
+     * @brief Processes a single extent for cross-volume copy.
+     *
+     * Iterates clusters within the extent. Duplicate LCNs are cloned from
+     * previously-copied destination files; new LCNs are physically copied
+     * from the source.
+     */
+    std::expected<bool, std::wstring> process_cross_volume_extent(
+        const Extent& ext, HANDLE src_handle, HANDLE dest_handle,
+        LONGLONG src_file_size, const std::wstring& src_path,
+        const std::wstring& dest_path,
+        DestSizeTracker& tracker, CopyContext& context,
+        ULONGLONG& bytes_processed
+    ) {
+        ULONGLONG c_offset = 0;
+        while (c_offset < ext.cluster_count()) {
+            if (g_cancel_requested) {
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            LONGLONG current_lcn = ext.lcn + c_offset;
+            ULONGLONG src_offset = (ext.vcn + c_offset) * context.src_cluster_size;
+
+            auto map_it = context.lcn_map.find(current_lcn);
+            if (map_it != context.lcn_map.end()) {
+                // Duplicate LCN: clone from previously-copied destination
+                ULONGLONG pre_offset = c_offset;
+                auto result = clone_duplicate_run(
+                    ext, c_offset, map_it->second, src_offset,
+                    dest_handle, tracker, context
+                );
+                if (!result) return std::unexpected(result.error());
+                bytes_processed += (c_offset - pre_offset) * context.src_cluster_size;
+            } else {
+                // New LCN: physically copy from source
+                ULONGLONG pre_offset = c_offset;
+                auto result = copy_new_run(
+                    ext, c_offset, src_offset, src_file_size,
+                    src_handle, dest_handle, src_path, dest_path, tracker, context
+                );
+                if (!result) return std::unexpected(result.error());
+                bytes_processed += (c_offset - pre_offset) * context.src_cluster_size;
+            }
+
+            // Report progress
+            context.out->progress(src_path, bytes_processed, static_cast<ULONGLONG>(src_file_size));
+        }
+        return true;
+    }
+
+    /**
+     * @brief Clones a contiguous run of duplicate LCNs from a previously-copied destination file.
+     *
+     * Scans forward from c_offset to find how many consecutive LCNs map to the
+     * same contiguous region, then clones the entire run in one ioctl.
+     *
+     * @param c_offset Updated in-place to advance past the cloned run.
+     */
+    std::expected<bool, std::wstring> clone_duplicate_run(
+        const Extent& ext, ULONGLONG& c_offset,
+        const std::pair<std::wstring, ULONGLONG>& master,
+        ULONGLONG src_offset, HANDLE dest_handle,
+        DestSizeTracker& tracker, CopyContext& context
+    ) {
+        // Find contiguous run length
+        ULONGLONG run_clusters = 1;
+        while (c_offset + run_clusters < ext.cluster_count()) {
+            LONGLONG next_lcn = ext.lcn + c_offset + run_clusters;
+            auto next_it = context.lcn_map.find(next_lcn);
+            if (next_it == context.lcn_map.end()) break;
+
+            const auto& next_master = next_it->second;
+            if (next_master.first != master.first ||
+                next_master.second != master.second + run_clusters * context.src_cluster_size) {
+                break;
+            }
+            run_clusters++;
+        }
+
+        ULONGLONG byte_count = run_clusters * context.src_cluster_size;
+        auto size_ok = ensure_dest_size(dest_handle, tracker, src_offset + byte_count);
+        if (!size_ok) return std::unexpected(size_ok.error());
+
+        // Get handle to the previously-copied destination file
+        HANDLE prev_dest_handle = context.handle_cache.get(master.first);
+        if (prev_dest_handle == INVALID_HANDLE_VALUE) {
+            return std::unexpected(L"Failed to open previously copied destination file: " + master.first);
+        }
+
+        auto clone_ok = clone_extent_from_dest(dest_handle, prev_dest_handle, master.second, src_offset, byte_count);
+        if (!clone_ok) return std::unexpected(clone_ok.error());
+
+        c_offset += run_clusters;
+        return true;
+    }
+
+    /**
+     * @brief Physically copies a contiguous run of new (unmapped) LCNs from source.
+     *
+     * Scans forward to find how many consecutive LCNs are new, copies the bytes,
+     * then records each LCN in the context map for future deduplication.
+     *
+     * @param c_offset Updated in-place to advance past the copied run.
+     */
+    std::expected<bool, std::wstring> copy_new_run(
+        const Extent& ext, ULONGLONG& c_offset,
+        ULONGLONG src_offset, LONGLONG src_file_size,
+        HANDLE src_handle, HANDLE dest_handle,
+        const std::wstring& src_path, const std::wstring& dest_path,
+        DestSizeTracker& tracker, CopyContext& context
+    ) {
+        // Find contiguous run of new LCNs
+        ULONGLONG run_clusters = 1;
+        while (c_offset + run_clusters < ext.cluster_count()) {
+            LONGLONG next_lcn = ext.lcn + c_offset + run_clusters;
+            if (context.lcn_map.contains(next_lcn)) break;
+            run_clusters++;
+        }
+
+        // Calculate bytes to copy (clamped to file size)
+        ULONGLONG bytes_to_copy = run_clusters * context.src_cluster_size;
+        ULONGLONG bytes_to_read = bytes_to_copy;
+        if (static_cast<ULONGLONG>(src_file_size) > src_offset) {
+            if (src_offset + bytes_to_read > static_cast<ULONGLONG>(src_file_size)) {
+                bytes_to_read = static_cast<ULONGLONG>(src_file_size) - src_offset;
+            }
+        } else {
+            bytes_to_read = 0;
+        }
+
+        auto size_ok = ensure_dest_size(dest_handle, tracker, src_offset + bytes_to_read);
+        if (!size_ok) return std::unexpected(size_ok.error());
+
+        if (bytes_to_read > 0) {
+            auto copy_ok = copy_bytes_physical(
+                src_handle, dest_handle, src_offset, src_offset, bytes_to_read,
+                context.out, src_path,
+                src_offset, static_cast<ULONGLONG>(src_file_size)
+            );
+            if (!copy_ok) return std::unexpected(copy_ok.error());
+        }
+
+        // Record LCNs in the map for future dedup
+        for (ULONGLONG k = 0; k < run_clusters; ++k) {
+            context.lcn_map[ext.lcn + c_offset + k] = {dest_path, src_offset + k * context.src_cluster_size};
+        }
+
+        c_offset += run_clusters;
+        return true;
+    }
+
+    /**
+     * @brief Attempts a standard copy fallback after a clone/copy failure.
+     */
+    std::expected<bool, std::wstring> attempt_fallback(
+        const std::wstring& src, const std::wstring& dest,
+        const std::wstring& original_error,
+        CopyContext& context
+    ) {
+        DeleteFileW(dest.c_str());
+        if (g_cancel_requested) {
+            return std::unexpected(L"Copy cancelled by user.");
+        }
+        context.out->warn(L"Deduplication-preserving copy failed (" + original_error
+            + L"). Falling back to standard copy for: " + src);
+
+        if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
+            DWORD error = GetLastError();
+            return std::unexpected(L"Dedup copy failed (" + original_error + L"), and fallback copy failed: " + util::get_win32_error_message(error));
+        }
+
+        context.stats.fallback_files++;
+        context.stats.total_files++;
+        return true;
+    }
+};
+
+// ============================================================================
+// Phase 1: Inspection — Validate & Decorate Context
+// ============================================================================
+
+/**
+ * @brief Phase 1: Validates inputs and populates the CopyContext.
+ *
+ * Resolves absolute paths, verifies source existence, queries volume
+ * information (filesystem type, cluster size), and selects the appropriate
+ * copy strategy based on volume topology.
+ *
+ * @param args  CLI arguments with positional source/dest paths.
+ * @return Fully decorated CopyContext on success, or error string.
+ */
+std::expected<CopyContext, std::wstring> inspect_and_prepare(const util::CliArg& args) {
+    if (args.positional.size() < 2) {
+        return std::unexpected(L"Error: Missing source or destination path. Usage: retool copy <src> <dest> [options]");
+    }
+
+    CopyContext context;
+    context.src_path = get_absolute_path(args.positional[0]);
+    context.dest_path = get_absolute_path(args.positional[1]);
+
+    // Validate source
+    DWORD src_attr = GetFileAttributesW(context.src_path.c_str());
+    if (src_attr == INVALID_FILE_ATTRIBUTES) {
+        return std::unexpected(L"Source path does not exist: " + context.src_path);
+    }
+
+    context.is_directory = (src_attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (context.is_directory && !args.recursive) {
+        return std::unexpected(L"Error: Source is a directory but -r (recursive) was not specified.");
+    }
+
+    // Resolve volume roots
+    wchar_t src_volume[MAX_PATH];
+    wchar_t dest_volume[MAX_PATH];
+    if (!GetVolumePathNameW(context.src_path.c_str(), src_volume, MAX_PATH)) {
+        return std::unexpected(L"Failed to get source volume root: " + util::get_win32_error_message(GetLastError()));
+    }
+    if (!GetVolumePathNameW(context.dest_path.c_str(), dest_volume, MAX_PATH)) {
+        return std::unexpected(L"Failed to get destination volume root: " + util::get_win32_error_message(GetLastError()));
+    }
+
+    context.src_volume_root = src_volume;
+    context.dest_volume_root = dest_volume;
+    context.same_volume = (wcscmp(src_volume, dest_volume) == 0);
+    context.dest_is_refs = is_refs_volume(dest_volume);
+    context.src_cluster_size = get_cluster_size(src_volume);
+    context.dest_cluster_size = get_cluster_size(dest_volume);
+
+    // Select strategy
+    if (context.same_volume) {
+        context.strategy = std::make_unique<SameVolumeCopyStrategy>();
+    } else if (context.dest_is_refs && context.src_cluster_size == context.dest_cluster_size) {
+        context.strategy = std::make_unique<CrossVolumeRefsCopyStrategy>();
+    } else {
+        context.strategy = std::make_unique<FallbackCopyStrategy>();
+    }
+
+    return std::move(context);
+}
+
+// ============================================================================
+// Phase 2: Operation — Directory Recursion
+// ============================================================================
+
+/**
+ * @brief Recursively copies a directory tree from source to destination.
+ *
+ * Replicates the directory structure and delegates file copying to the
+ * strategy selected during Phase 1. Ignores system-attributed files and folders.
+ *
+ * @param src_dir   The source directory path.
+ * @param dest_dir  The destination directory path.
+ * @param args      The command line arguments.
+ * @param context   The shared copy tracking context.
+ * @return true on success, or error message on failure.
+ */
 std::expected<bool, std::wstring> copy_directory_recursive(
     const std::wstring& src_dir,
     const std::wstring& dest_dir,
@@ -560,22 +1183,27 @@ std::expected<bool, std::wstring> copy_directory_recursive(
     }
 
     do {
-        std::wstring name = find_data.cFileName;
-        if (name == L"." || name == L"..") {
-            continue;
+        if (g_cancel_requested) {
+            FindClose(find_handle);
+            return std::unexpected(L"Copy cancelled by user.");
         }
+
+        std::wstring name = find_data.cFileName;
+        if (name == L"." || name == L"..") continue;
 
         std::wstring src_item = src_dir + L"\\" + name;
         std::wstring dest_item = dest_dir + L"\\" + name;
 
-        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) {
-            continue;
-        }
+        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) continue;
 
         if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (args.recursive) {
                 auto res = copy_directory_recursive(src_item, dest_item, args, context);
                 if (!res) {
+                    if (g_cancel_requested) {
+                        FindClose(find_handle);
+                        return std::unexpected(res.error());
+                    }
                     context.stats.errors.push_back(src_item + L": " + res.error());
                     if (args.strict) {
                         FindClose(find_handle);
@@ -584,8 +1212,12 @@ std::expected<bool, std::wstring> copy_directory_recursive(
                 }
             }
         } else {
-            auto res = copy_file_preserving_dedup(src_item, dest_item, args, context);
+            auto res = context.strategy->copy_file(src_item, dest_item, args, context);
             if (!res) {
+                if (g_cancel_requested) {
+                    FindClose(find_handle);
+                    return std::unexpected(res.error());
+                }
                 context.stats.errors.push_back(src_item + L": " + res.error());
                 if (args.strict) {
                     FindClose(find_handle);
@@ -600,76 +1232,68 @@ std::expected<bool, std::wstring> copy_directory_recursive(
     return true;
 }
 
-std::expected<int, std::wstring> run(const util::CliArg& args) {
-    if (args.positional.size() < 2) {
-        return std::unexpected(L"Error: Missing source or destination path. Usage: retool copy <src> <dest> [options]");
-    }
+// ============================================================================
+// Phase 3: Finalization — Summary & Cleanup
+// ============================================================================
 
-    // Resolve absolute paths
-    std::wstring src = get_absolute_path(args.positional[0]);
-    std::wstring dest = get_absolute_path(args.positional[1]);
-
-    DWORD src_attr = GetFileAttributesW(src.c_str());
-    if (src_attr == INVALID_FILE_ATTRIBUTES) {
-        return std::unexpected(L"Source path does not exist: " + src);
-    }
-
-    bool is_dir = (src_attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-
-    // Get volume roots
-    wchar_t src_volume[MAX_PATH];
-    wchar_t dest_volume[MAX_PATH];
-    if (!GetVolumePathNameW(src.c_str(), src_volume, MAX_PATH)) {
-        return std::unexpected(L"Failed to get source volume root: " + util::get_win32_error_message(GetLastError()));
-    }
-    if (!GetVolumePathNameW(dest.c_str(), dest_volume, MAX_PATH)) {
-        return std::unexpected(L"Failed to get destination volume root: " + util::get_win32_error_message(GetLastError()));
-    }
-
-    CopyContext context;
-    context.src_volume_root = src_volume;
-    context.dest_volume_root = dest_volume;
-    context.same_volume = (wcscmp(src_volume, dest_volume) == 0);
-    context.dest_is_refs = is_refs_volume(dest_volume);
-    context.src_cluster_size = get_cluster_size(src_volume);
-    context.dest_cluster_size = get_cluster_size(dest_volume);
-
-    if (is_dir) {
-        if (!args.recursive) {
-            return std::unexpected(L"Error: Source is a directory but -r (recursive) was not specified.");
-        }
-        auto res = copy_directory_recursive(src, dest, args, context);
-        if (!res && args.strict) {
-            return std::unexpected(res.error());
-        }
-    } else {
-        auto res = copy_file_preserving_dedup(src, dest, args, context);
-        if (!res) {
-            return std::unexpected(res.error());
-        }
-    }
-
+/**
+ * @brief Phase 3: Prints copy summary statistics and returns exit code.
+ *
+ * @param context The fully-processed CopyContext with accumulated stats.
+ * @return Exit code (0 = success, 2 = errors occurred).
+ */
+int finalize_and_report(CopyContext& context) {
     const auto& stats = context.stats;
+    auto& out = *context.out;
 
-    // Print summary stats
-    std::wcout << L"\n--- retool copy summary ---\n"
-               << L"Total Files:     " << stats.total_files << L"\n"
-               << L"Cloned Files:    " << stats.cloned_files << L" (preserves dedup/blocks)\n"
-               << L"Fallback Copies: " << stats.fallback_files << L" (standard copies)\n"
-               << L"Total Bytes:     " << stats.total_bytes << L" bytes" << std::endl;
+    out.begin_section(L"retool copy summary");
+    out.field(L"Total Files",     std::to_wstring(stats.total_files));
+    out.field(L"Cloned Files",    std::to_wstring(stats.cloned_files));
+    out.field(L"Fallback Copies", std::to_wstring(stats.fallback_files));
+    out.field(L"Total Bytes",     std::to_wstring(stats.total_bytes));
 
-    if (!stats.errors.empty()) {
-        std::wcout << L"\nErrors:\n";
-        for (const auto& err : stats.errors) {
-            std::wcout << L"  - " << err << L"\n";
-        }
+    for (const auto& err : stats.errors) {
+        out.error(err);
     }
 
-    if (!stats.errors.empty()) {
-        return 2; // Operational error exit code
+    out.end_section();
+
+    return stats.errors.empty() ? 0 : 2;
+}
+
+// ============================================================================
+// Pipeline Entry Point
+// ============================================================================
+
+/**
+ * @brief Executes the copy subcommand.
+ *
+ * Orchestrates a three-phase pipeline:
+ *   1. Inspection — validate inputs, query volumes, select strategy.
+ *   2. Operation — recursively copy files using the selected strategy.
+ *   3. Finalization — print summary statistics, return exit code.
+ *
+ * @param args CLI arguments containing positional source and destination paths.
+ * @return Exit code on success, or error string on failure.
+ */
+std::expected<int, std::wstring> execute_copy(const util::CliArg& args, output::IOutput& out) {
+    // Phase 1: Inspection
+    auto context = inspect_and_prepare(args);
+    if (!context) return std::unexpected(context.error());
+
+    context->out = &out;
+
+    // Phase 2: Operation
+    if (context->is_directory) {
+        auto result = copy_directory_recursive(context->src_path, context->dest_path, args, *context);
+        if (!result && args.strict) return std::unexpected(result.error());
+    } else {
+        auto result = context->strategy->copy_file(context->src_path, context->dest_path, args, *context);
+        if (!result) return std::unexpected(result.error());
     }
 
-    return 0;
+    // Phase 3: Finalization
+    return finalize_and_report(*context);
 }
 
 } // namespace copy

@@ -17,6 +17,14 @@ if(NOT WIN32)
     message(FATAL_ERROR "retool only supports Windows.")
 endif()
 
+# Third-party dependencies
+include(FetchContent)
+FetchContent_Declare(
+    json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+)
+FetchContent_MakeAvailable(json)
+
 # Compiler options
 if(MSVC)
     add_compile_options(
@@ -35,6 +43,8 @@ add_executable(retool
     src/inspect.h
     src/copy.cpp
     src/copy.h
+    src/output.cpp
+    src/output.h
     src/volume.cpp
     src/volume.h
     src/util.cpp
@@ -48,4 +58,5 @@ target_include_directories(retool PRIVATE
 )
 
 # Link Shlwapi for path handling if needed, and standard Win32 libraries
-target_link_libraries(retool PRIVATE Shlwapi.lib)
+target_link_libraries(retool PRIVATE Shlwapi.lib nlohmann_json::nlohmann_json)
+

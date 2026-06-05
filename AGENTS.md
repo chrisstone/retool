@@ -40,6 +40,8 @@ retool/
 │   ├── inspect.h
 │   ├── copy.cpp            # Deduplication-preserving copy (block cloning)
 │   ├── copy.h
+│   ├── output.cpp          # Polymorphic output (CLI, JSON, silent)
+│   ├── output.h
 │   ├── volume.cpp          # Volume-level statistics
 │   ├── volume.h
 │   ├── util.cpp            # Project-wide pure functions and shared helpers
@@ -57,15 +59,16 @@ retool/
 
 | Module | Responsibility |
 |-------|---------------|
-| `main.cpp` | CLI entry point, environment setup (e.g., elevation checks), command dispatching. |
-| `inspect` | Retrieval pointer queries (`FSCTL_GET_RETRIEVAL_POINTERS`), single-file extent dumps, cross-file deduplication mapping, and plain-text output serialization for inspection. |
+| `main.cpp` | CLI entry point, environment setup (e.g., elevation checks), command dispatching, outputter construction. |
+| `inspect` | Retrieval pointer queries (`FSCTL_GET_RETRIEVAL_POINTERS`), single-file extent dumps, cross-file deduplication mapping. |
 | `copy` | Directory tree recursion, block duplication (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`), fallback to standard copy, dry-run simulation. |
+| `output` | Polymorphic output abstraction (`IOutput` base): `NoOutput` (silent), `CliOutput` (console + progress bar), `JsonOutput` (nlohmann/json). |
 | `volume` | Volume information retrieval (cluster size, total clusters, free/used space). |
 | `util` | CLI argument parsing, wide/narrow string conversions, date/time formatting, memory sizing helpers. |
 
 ## Technical Constraints
 
-- **Windows SDK/DDK only.** Do not introduce any third-party libraries (Boost, etc.) without explicit user approval.
+- **Windows SDK/DDK only.** Do not introduce any third-party libraries (Boost, etc.) without explicit user approval. Approved: `nlohmann/json` (header-only, via CMake FetchContent).
 - **C++20** minimum (`std::expected`, structured bindings, ranges).
 - **Administrator privileges** are required at runtime; do not attempt to work around this.
 - **Unicode throughout.** Use `wchar_t` / `std::wstring` / `LPWSTR` for all paths and system strings.
@@ -95,3 +98,13 @@ cmake --build --preset release
 ```
 
 > Note: Test infrastructure is not yet defined. When adding tests, follow the conventions established by the first test added and document the approach here.
+
+## Production
+
+- **Branching Strategy:** Do not perform any development directly on the `main` branch. Use the `devel` branch or feature-specific branches (e.g., `feature/...`) for all development work.
+- **Commit Cadence:** Make frequent commits. Only commit changes after verifying that the code compiles successfully, passes linting (`clang-tidy`), and passes all existing tests.
+- **Standards:**
+  - **Versioning:** The project uses semantic versioning.
+  - **Commit Messages:** Follow the Conventional Commits specification.
+  - **Documentation:** Use Doxygen formatting for inline code documentation.
+- **Tags:** Version tags (e.g., `v*`) must only be created/added by the user directly. Do not automate or push version tags.
