@@ -6,7 +6,7 @@
 
 ## Overview
 
-`retool` exposes ReFS block-level internals that Windows does not surface through normal file APIs. It lets you inspect how files are laid out on disk, measure actual deduplication savings, and copy files in a way that preserves block sharing — keeping your ReFS deduplication intact rather than breaking it with a conventional copy.
+`retool` exposes ReFS block-level internals that Windows does not surface through normal file APIs. It lets you inspect how files are laid out on disk, measure actual deduplication savings, copy files in a way that preserves block sharing, and deduplicate files in-place — keeping your ReFS deduplication intact rather than breaking it with a conventional copy.
 
 > [!WARNING]
 > **Administrator privileges are required** to run `retool`. All queries and block operations use low-level filesystem ioctls that require full administrative rights. Run the utility from an elevated Command Prompt or PowerShell window.
@@ -15,27 +15,32 @@
 
 - **Windows 10 / Windows Server 2016** or later (ReFS v3.x)
 - **Administrator privileges** — required for all operations (block-level ioctls mandate elevation)
-- **ReFS-formatted volume** — NTFS volumes are not supported
+- **ReFS-formatted volume** — required for block cloning and deduplication; `inspect` works on any volume
 
 ## Features
 
-### 1. `inspect` — Block Layout & Deduplication Analysis
+### 1. `inspect` — Block Layout, Sharing Analysis & Volume Scan
 
-Inspect a file's physical block layout on a ReFS volume using ReFS-specific extent metadata queries.
+Inspect a file's physical block layout, compare sharing across multiple files, or scan an entire volume to measure deduplication potential.
 
 ```
 retool inspect <file> [options]
 retool inspect <file1> <file2> ... [options]
 retool inspect -i <filelist.txt> [options]
+retool inspect <volume-root>
 ```
 
 **Single file:** Dumps all extents (VCN → LCN mappings), showing each fragment's virtual and logical cluster numbers, size, and offset within the file.
 
 **Multiple files:** Computes shared-block statistics across the set, reporting:
-- Which file pairs share blocks
+- Which file pairs share blocks (cross-file sharing matrix)
 - Total shared data in bytes and MB
 - Estimated deduplication savings
 - Per-file fragment counts
+
+**Volume scan:** When given a volume root (e.g. `E:\`), walks all files on the volume and reports:
+- Total files scanned and clusters indexed
+- Shared block count and estimated space savings
 
 **Options:**
 | Flag | Description |
@@ -43,6 +48,8 @@ retool inspect -i <filelist.txt> [options]
 | `-i <file>` | Read file paths from a newline-delimited input file |
 | `-o <file>` | Write output to a file instead of stdout |
 | `--strict` | Abort on first error (default: best-effort with error summary) |
+| `--json` | Output results in JSON format |
+| `-q` | Suppress all output (quiet mode) |
 
 ---
 
@@ -52,25 +59,64 @@ Copy a file or directory tree while preserving ReFS block sharing using `FSCTL_D
 
 ```
 retool copy <source> <dest> [options]
-retool copy <source-dir> <dest-dir> [options]
+retool copy <source-dir> <dest-dir> -r [options]
 ```
 
-**Same-volume copies** use extent duplication — the copied file shares physical blocks with the source, consuming no additional disk space for shared content. The deduplication relationship established by ReFS integrity streams or block cloning is preserved.
+**Same-volume copies** use extent duplication — the copied file shares physical blocks with the source, consuming no additional disk space for shared content. The deduplication relationship is preserved exactly.
 
-**Cross-volume copies** automatically fall back to a standard byte-for-byte copy with a clear warning in the output.
+**Cross-volume copies** (ReFS → ReFS, matching cluster size) preserve deduplication by tracking which source logical cluster numbers (LCNs) have already been copied to the destination and issuing `FSCTL_DUPLICATE_EXTENTS_TO_FILE` for duplicate blocks, rather than copying bytes twice.
+
+**`--scan-dest`** pre-scans the destination volume before copying begins. Blocks already present on the destination (matched by SHA-256 content hash) are cloned instead of physically transferred, maximizing space savings when copying into a volume that already holds related data.
+
+For incompatible volumes (non-ReFS destination, cluster size mismatch), retool falls back to a standard copy with a clear warning.
 
 **Options:**
 | Flag | Description |
 |------|-------------|
 | `-r` | Recursive directory copy |
-| `--strict` | Abort on first error (default: best-effort, errors reported at end) |
 | `--dry-run` | Simulate the operation without writing any data |
+| `--scan-dest` | Pre-scan destination volume to seed the dedup block index |
+| `--strict` | Abort on first error (default: best-effort, errors reported at end) |
+| `--json` | Output results in JSON format |
+| `-q` | Suppress all output |
+| `-o <file>` | Redirect output to a file |
+
+> [!NOTE]
+> `--scan-dest` performs a full volume hash scan before copying begins. On large volumes this adds significant setup time but can substantially reduce the data physically written.
 
 ---
 
-### 3. `volume` — Volume-Level Block Statistics
+### 3. `dedup` — In-Place File Deduplication
 
-Display ReFS volume-level information including cluster size, total clusters, and an estimate of deduplication space savings across all files.
+Deduplicate files already resident on a ReFS volume using `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Identifies clusters with identical SHA-256 content and replaces physical duplicates with shared block references — reclaiming disk space without touching file data.
+
+```
+retool dedup <volume-root>
+retool dedup <file1> <file2>
+```
+
+**Volume-wide mode:** Scans all files on the volume, groups clusters by SHA-256 hash, and deduplicates every cluster that appears more than once.
+
+**Pair-wise mode:** Compares two explicitly named files and deduplicates only the clusters they share.
+
+Both modes support `--dry-run` to report what would be reclaimed without making any changes.
+
+**Options:**
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Report dedup savings without writing any data |
+| `--strict` | Abort on first error |
+| `--json` | Output results in JSON format |
+| `-q` | Suppress all output |
+
+> [!IMPORTANT]
+> Deduplication requires both files to reside on the same ReFS volume. The operation modifies file allocation metadata; ensure you have a current backup before running volume-wide dedup on production data.
+
+---
+
+### 4. `volume` — Volume-Level Block Statistics
+
+Display ReFS volume-level information including cluster size, total clusters, free space, and used space.
 
 ```
 retool volume <drive-letter or path>
@@ -90,46 +136,64 @@ retool volume <drive-letter or path>
 ```powershell
 git clone https://github.com/your-org/retool.git
 cd retool
-cmake --preset release
-cmake --build --preset release
+
+# Configure
+cmake --preset debug    # or: cmake --preset release
+
+# Build (use the build directory directly — build presets require VS CMake integration)
+cmake --build build/debug --config Debug
+cmake --build build/release --config Release
 ```
 
-Output binary: `build/release/retool.exe`
+Output binary: `build/release/Debug/retool.exe` (debug) or `build/release/Release/retool.exe` (release).
 
-Debug build:
-```powershell
-cmake --preset debug
-cmake --build --preset debug
-```
+---
 
 ## Usage Examples
 
 ```powershell
 # Inspect block layout of a single file
-retool inspect C:\Data\backup.vbk
+retool inspect E:\Data\backup.vbk
 
 # Compare block sharing between multiple backup files
-retool inspect C:\Data\backup.vbk C:\Data\backup-inc.vib
+retool inspect E:\Data\backup.vbk E:\Data\backup-inc.vib
 
-# Read file list from a file, write results to a text file
-retool inspect -i files.txt -o results.txt
+# Scan an entire volume for dedup potential
+retool inspect E:\
 
 # Copy a directory preserving dedup (same volume)
-retool copy D:\Backups\2024 D:\Backups\2024-clone -r
+retool copy E:\Backups\2024 E:\Backups\2024-clone -r
+
+# Copy cross-volume, pre-scanning destination for existing blocks
+retool copy E:\Backups F:\Backups -r --scan-dest
 
 # Dry-run to preview a copy operation
-retool copy D:\Backups\2024 D:\Backups\2025 -r --dry-run
+retool copy E:\Backups\2024 E:\Backups\2025 -r --dry-run
+
+# Deduplicate an entire ReFS volume in-place (dry-run first)
+retool dedup E:\ --dry-run
+retool dedup E:\
+
+# Deduplicate two specific files
+retool dedup E:\vms\base.vmdk E:\vms\clone.vmdk
 
 # Show volume statistics
-retool volume D:\
+retool volume E:\
+
+# Output any command as JSON
+retool inspect E:\Data\backup.vbk --json
+retool dedup E:\ --dry-run --json -o dedup-report.json
 ```
+
+---
 
 ## Technical Notes
 
-- Block inspection uses `FSCTL_GET_RETRIEVAL_POINTERS` and ReFS-specific extent metadata ioctls.
-- Block cloning uses `FSCTL_DUPLICATE_EXTENTS_TO_FILE` (ReFS only; requires both files on the same volume).
-- All operations require the process to run as Administrator.
-- LCN values are logical cluster numbers relative to the volume; they are directly comparable across files on the same volume to detect block sharing.
+- Block inspection uses `FSCTL_GET_RETRIEVAL_POINTERS` to query VCN → LCN extent maps for each file.
+- Block cloning uses `FSCTL_DUPLICATE_EXTENTS_TO_FILE` (ReFS only; both files must reside on the same volume).
+- SHA-256 hashing for content-based deduplication uses the Windows **CNG BCrypt API**, which automatically leverages SHA-NI processor instructions for hardware acceleration when available.
+- LCN values (logical cluster numbers) are volume-relative and directly comparable across files on the same volume — two files referencing the same LCN share that physical block.
+- All block-level operations require Administrator privileges.
 
 ## License
 
