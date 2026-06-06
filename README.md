@@ -30,13 +30,15 @@ retool inspect -i <filelist.txt> [options]
 retool inspect <volume-root>
 ```
 
-**Single file:** Dumps all extents (VCN → LCN mappings), showing each fragment's virtual and logical cluster numbers, size, and offset within the file.
+**Single file:** Dumps all extents (VCN → LCN mappings), showing each fragment's virtual and logical cluster numbers, size, and offset within the file. Add `-r` to append a fragmentation report.
 
 **Multiple files:** Computes shared-block statistics across the set, reporting:
 - Which file pairs share blocks (cross-file sharing matrix)
 - Total shared data in bytes and MB
 - Estimated deduplication savings
 - Per-file fragment counts
+
+Add `-r` to include a per-file fragmentation report after the sharing matrix.
 
 **Volume scan:** When given a volume root (e.g. `E:\`), walks all files on the volume and reports:
 - Total files scanned and clusters indexed
@@ -45,6 +47,7 @@ retool inspect <volume-root>
 **Options:**
 | Flag | Description |
 |------|-------------|
+| `-r` | Append a fragmentation report (fragment count, min/max/avg extent size, score) |
 | `-i <file>` | Read file paths from a newline-delimited input file |
 | `-o <file>` | Write output to a file instead of stdout |
 | `--strict` | Abort on first error (default: best-effort with error summary) |
@@ -145,7 +148,7 @@ cmake --build build/debug --config Debug
 cmake --build build/release --config Release
 ```
 
-Output binary: `build/release/Debug/retool.exe` (debug) or `build/release/Release/retool.exe` (release).
+Output binary: `build/debug/Debug/retool.exe` (debug) or `build/release/Release/retool.exe` (release).
 
 ---
 
@@ -155,8 +158,14 @@ Output binary: `build/release/Debug/retool.exe` (debug) or `build/release/Releas
 # Inspect block layout of a single file
 retool inspect E:\Data\backup.vbk
 
+# Inspect a file and include its fragmentation report
+retool inspect E:\Data\backup.vbk -r
+
 # Compare block sharing between multiple backup files
 retool inspect E:\Data\backup.vbk E:\Data\backup-inc.vib
+
+# Compare files and include per-file fragmentation reports
+retool inspect E:\Data\backup.vbk E:\Data\backup-inc.vib -r
 
 # Scan an entire volume for dedup potential
 retool inspect E:\
