@@ -243,6 +243,14 @@ std::string hash_sha256(BCRYPT_ALG_HANDLE alg, const BYTE* data, DWORD data_len)
     return oss.str();
 }
 
+std::string compute_sha256(const BYTE* data, DWORD data_len) {
+    BcryptAlgHandle alg;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg.handle, BCRYPT_SHA256_ALGORITHM, NULL, 0))) {
+        return {};
+    }
+    return hash_sha256(alg.handle, data, data_len);
+}
+
 // ============================================================================
 // Volume Enumeration
 // ============================================================================

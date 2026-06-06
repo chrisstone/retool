@@ -88,4 +88,17 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
  */
 std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, output::IOutput& out);
 
+/**
+ * @brief Computes a SHA-256 hex digest of a data buffer.
+ *
+ * Self-contained: opens and closes its own BCrypt algorithm provider per call.
+ * For bulk hashing (thousands of calls), prefer caching the algorithm handle
+ * externally and calling the internal hash_sha256() directly.
+ *
+ * @param data      Pointer to the data to hash.
+ * @param data_len  Length of the data in bytes.
+ * @return 64-character lowercase hex string on success, or empty string on failure.
+ */
+std::string compute_sha256(const BYTE* data, DWORD data_len);
+
 } // namespace inspect

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <expected>
+#include <list>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -71,46 +72,51 @@ struct ScopedHandle {
     }
 };
 
-/// @brief Cache for a single previously-opened destination file handle.
-struct HandleCache {
-    std::wstring path;
-    HANDLE handle = INVALID_HANDLE_VALUE;
+/// @brief LRU cache for previously-opened destination file handles.
+///
+/// Caches up to kMaxSlots open HANDLEs, evicting the least-recently-used
+/// on capacity overflow. Dramatically reduces CreateFileW/CloseHandle
+/// syscall thrashing when cross-volume dedup references many distinct files.
+struct HandleLruCache {
+    static constexpr size_t kMaxSlots = 16;
 
-    HandleCache() = default;
-    ~HandleCache() { close(); }
+    HandleLruCache() = default;
+    ~HandleLruCache() { close_all(); }
 
-    HandleCache(const HandleCache&) = delete;
-    HandleCache& operator=(const HandleCache&) = delete;
+    HandleLruCache(const HandleLruCache&) = delete;
+    HandleLruCache& operator=(const HandleLruCache&) = delete;
+    HandleLruCache(HandleLruCache&&) = default;
+    HandleLruCache& operator=(HandleLruCache&&) = default;
 
-    HandleCache(HandleCache&& other) noexcept
-        : path(std::move(other.path)), handle(other.handle) {
-        other.handle = INVALID_HANDLE_VALUE;
-    }
-
-    HandleCache& operator=(HandleCache&& other) noexcept {
-        if (this != &other) {
-            close();
-            path = std::move(other.path);
-            handle = other.handle;
-            other.handle = INVALID_HANDLE_VALUE;
+    void close_all() {
+        for (auto& [path, handle] : cache_) {
+            if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
         }
-        return *this;
-    }
-
-    void close() {
-        if (handle != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle);
-            handle = INVALID_HANDLE_VALUE;
-        }
-        path.clear();
+        cache_.clear();
+        lru_.clear();
     }
 
     HANDLE get(const std::wstring& filepath) {
-        if (path == filepath && handle != INVALID_HANDLE_VALUE) {
-            return handle;
+        auto it = cache_.find(filepath);
+        if (it != cache_.end()) {
+            // Move to front of LRU
+            lru_.remove(filepath);
+            lru_.push_front(filepath);
+            return it->second;
         }
-        close();
-        handle = CreateFileW(
+
+        // Evict if at capacity
+        if (cache_.size() >= kMaxSlots) {
+            const auto& victim = lru_.back();
+            auto v_it = cache_.find(victim);
+            if (v_it != cache_.end()) {
+                if (v_it->second != INVALID_HANDLE_VALUE) CloseHandle(v_it->second);
+                cache_.erase(v_it);
+            }
+            lru_.pop_back();
+        }
+
+        HANDLE h = CreateFileW(
             filepath.c_str(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -119,11 +125,14 @@ struct HandleCache {
             FILE_FLAG_BACKUP_SEMANTICS,
             NULL
         );
-        if (handle != INVALID_HANDLE_VALUE) {
-            path = filepath;
-        }
-        return handle;
+        cache_[filepath] = h;
+        lru_.push_front(filepath);
+        return h;
     }
+
+private:
+    std::unordered_map<std::wstring, HANDLE> cache_;
+    std::list<std::wstring> lru_;
 };
 
 // Forward declarations
@@ -147,20 +156,46 @@ struct CopyContext {
     output::IOutput* out = nullptr;           ///< Non-owning pointer to the output interface.
 
     // -- Populated during Phase 2: Operation --
-    /// Map: source LCN -> {dest_file_path, dest_offset_in_bytes}
-    std::unordered_map<LONGLONG, std::pair<std::wstring, ULONGLONG>> lcn_map;
-    /// Content hash index seeded by --scan-dest pre-scan (kWithHash); maps SHA-256 -> LCNs.
+    /// Interned destination paths: maps index -> path string. Avoids storing
+    /// a full wstring copy per lcn_map entry (saves ~5 GB at 31M entries).
+    std::vector<std::wstring> dest_path_table;
+
+    /// Map: source LCN -> {dest_path_index, dest_offset_in_bytes}
+    std::unordered_map<LONGLONG, std::pair<uint32_t, ULONGLONG>> lcn_map;
+
+    /// Destination LCN index seeded by --scan-dest pre-scan; maps dest LCN -> file+offset.
+    inspect::LcnIndex dest_lcn_index;
+
+    /// Content hash index seeded by --scan-dest pre-scan (kWithHash); maps SHA-256 -> dest LCNs.
     inspect::HashIndex hash_index;
+
+    /// Reusable I/O buffer for copy_bytes_physical (allocated once, 4 MB).
+    std::vector<BYTE> io_buffer;
+
     CopyStats stats;
-    HandleCache handle_cache;
+    HandleLruCache handle_cache;
 
     CopyContext() = default;
-    ~CopyContext() { handle_cache.close(); }
+    ~CopyContext() { handle_cache.close_all(); }
 
     CopyContext(const CopyContext&) = delete;
     CopyContext& operator=(const CopyContext&) = delete;
     CopyContext(CopyContext&&) = default;
     CopyContext& operator=(CopyContext&&) = default;
+
+    /// @brief Looks up or inserts a destination path, returning its interned index.
+    uint32_t intern_path(const std::wstring& path) {
+        for (uint32_t i = 0; i < static_cast<uint32_t>(dest_path_table.size()); ++i) {
+            if (dest_path_table[i] == path) return i;
+        }
+        dest_path_table.push_back(path);
+        return static_cast<uint32_t>(dest_path_table.size() - 1);
+    }
+
+    /// @brief Resolves an interned path index back to the path string.
+    const std::wstring& resolve_path(uint32_t index) const {
+        return dest_path_table[index];
+    }
 };
 
 /// @brief Abstract interface for a single-file copy operation.
@@ -223,10 +258,14 @@ DWORD get_cluster_size(const std::wstring& volume_root) {
  * @return std::wstring The fully qualified absolute path.
  */
 std::wstring get_absolute_path(const std::wstring& path) {
-    wchar_t buffer[MAX_PATH];
-    DWORD length = GetFullPathNameW(path.c_str(), MAX_PATH, buffer, NULL);
-    if (length > 0) {
-        return std::wstring(buffer, length);
+    // First call with 0 buffer to get required length (includes null terminator).
+    DWORD length = GetFullPathNameW(path.c_str(), 0, NULL, NULL);
+    if (length == 0) return path;
+    std::wstring buffer(length, L'\0');
+    DWORD written = GetFullPathNameW(path.c_str(), length, buffer.data(), NULL);
+    if (written > 0 && written < length) {
+        buffer.resize(written);
+        return buffer;
     }
     return path;
 }
@@ -503,6 +542,7 @@ std::expected<bool, std::wstring> clone_extent_from_dest(
 std::expected<bool, std::wstring> copy_bytes_physical(
     HANDLE src_handle, HANDLE dest_handle,
     ULONGLONG src_offset, ULONGLONG dest_offset, ULONGLONG byte_count,
+    std::vector<BYTE>& io_buffer,
     output::IOutput* out = nullptr, const std::wstring& filename = L"",
     ULONGLONG file_offset = 0, ULONGLONG file_total = 0
 ) {
@@ -520,8 +560,6 @@ std::expected<bool, std::wstring> copy_bytes_physical(
         return std::unexpected(L"SetFilePointerEx failed on destination: " + util::get_win32_error_message(GetLastError()));
     }
 
-    // Copy in 4 MB chunks to optimize sequential I/O throughput
-    std::vector<BYTE> io_buffer(4 * 1024 * 1024);
     ULONGLONG copied = 0;
 
     while (copied < byte_count) {
@@ -630,6 +668,7 @@ struct FallbackCopyStrategy : ICopyStrategy {
 
         context.stats.fallback_files++;
         context.stats.total_files++;
+        context.stats.total_bytes += prog_ctx.total_size;
         return true;
     }
 
@@ -801,6 +840,13 @@ private:
             return std::unexpected(L"Dedup copy failed (" + original_error + L"), and fallback copy failed: " + util::get_win32_error_message(error));
         }
 
+        // Query file size for stats tracking
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &fad)) {
+            ULONGLONG sz = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+            context.stats.total_bytes += sz;
+        }
+
         context.stats.fallback_files++;
         context.stats.total_files++;
         return true;
@@ -965,7 +1011,7 @@ private:
      */
     std::expected<bool, std::wstring> clone_duplicate_run(
         const Extent& ext, ULONGLONG& c_offset,
-        const std::pair<std::wstring, ULONGLONG>& master,
+        const std::pair<uint32_t, ULONGLONG>& master,
         ULONGLONG src_offset, HANDLE dest_handle,
         DestSizeTracker& tracker, CopyContext& context
     ) {
@@ -988,10 +1034,11 @@ private:
         auto size_ok = ensure_dest_size(dest_handle, tracker, src_offset + byte_count);
         if (!size_ok) return std::unexpected(size_ok.error());
 
-        // Get handle to the previously-copied destination file
-        HANDLE prev_dest_handle = context.handle_cache.get(master.first);
+        // Resolve interned path and get handle to the previously-copied destination file
+        const std::wstring& master_path = context.resolve_path(master.first);
+        HANDLE prev_dest_handle = context.handle_cache.get(master_path);
         if (prev_dest_handle == INVALID_HANDLE_VALUE) {
-            return std::unexpected(L"Failed to open previously copied destination file: " + master.first);
+            return std::unexpected(L"Failed to open previously copied destination file: " + master_path);
         }
 
         auto clone_ok = clone_extent_from_dest(dest_handle, prev_dest_handle, master.second, src_offset, byte_count);
@@ -1004,8 +1051,10 @@ private:
     /**
      * @brief Physically copies a contiguous run of new (unmapped) LCNs from source.
      *
-     * Scans forward to find how many consecutive LCNs are new, copies the bytes,
-     * then records each LCN in the context map for future deduplication.
+     * When --scan-dest was used (hash_index is populated), reads each cluster,
+     * hashes it, and checks for a content match on the destination volume.
+     * Matching clusters are cloned instead of physically written.
+     * When hash_index is empty, copies the entire run in bulk for speed.
      *
      * @param c_offset Updated in-place to advance past the copied run.
      */
@@ -1038,18 +1087,133 @@ private:
         auto size_ok = ensure_dest_size(dest_handle, tracker, src_offset + bytes_to_read);
         if (!size_ok) return std::unexpected(size_ok.error());
 
-        if (bytes_to_read > 0) {
-            auto copy_ok = copy_bytes_physical(
-                src_handle, dest_handle, src_offset, src_offset, bytes_to_read,
-                context.out, src_path,
-                src_offset, static_cast<ULONGLONG>(src_file_size)
+        // If --scan-dest populated hash_index, try per-cluster hash matching
+        if (!context.hash_index.empty() && bytes_to_read > 0) {
+            auto result = copy_new_run_with_hash_matching(
+                ext, c_offset, run_clusters, src_offset, src_file_size,
+                src_handle, dest_handle, src_path, dest_path, context
             );
-            if (!copy_ok) return std::unexpected(copy_ok.error());
+            if (!result) return std::unexpected(result.error());
+        } else {
+            // No hash index: bulk copy the entire run
+            if (bytes_to_read > 0) {
+                auto copy_ok = copy_bytes_physical(
+                    src_handle, dest_handle, src_offset, src_offset, bytes_to_read,
+                    context.io_buffer, context.out, src_path,
+                    src_offset, static_cast<ULONGLONG>(src_file_size)
+                );
+                if (!copy_ok) return std::unexpected(copy_ok.error());
+            }
+
+            // Record LCNs in the map for future dedup (using interned path index)
+            uint32_t path_idx = context.intern_path(dest_path);
+            for (ULONGLONG k = 0; k < run_clusters; ++k) {
+                context.lcn_map[ext.lcn + c_offset + k] = {path_idx, src_offset + k * context.src_cluster_size};
+            }
+
+            c_offset += run_clusters;
         }
 
-        // Record LCNs in the map for future dedup
+        return true;
+    }
+
+    /**
+     * @brief Per-cluster hash-matching copy for --scan-dest mode.
+     *
+     * Reads each cluster from the source, computes SHA-256, and checks
+     * the destination hash_index. If a match is found, the cluster is
+     * cloned from the existing destination file. Otherwise it is
+     * physically written.
+     *
+     * @param c_offset Updated in-place to advance past the processed run.
+     */
+    std::expected<bool, std::wstring> copy_new_run_with_hash_matching(
+        const Extent& ext, ULONGLONG& c_offset, ULONGLONG run_clusters,
+        ULONGLONG src_offset, LONGLONG src_file_size,
+        HANDLE src_handle, HANDLE dest_handle,
+        const std::wstring& src_path, const std::wstring& dest_path,
+        CopyContext& context
+    ) {
+        DWORD cluster_size = context.src_cluster_size;
+        uint32_t path_idx = context.intern_path(dest_path);
+
+        // Seek source to beginning of this run
+        LARGE_INTEGER li_src;
+        li_src.QuadPart = src_offset;
+        if (!SetFilePointerEx(src_handle, li_src, NULL, FILE_BEGIN)) {
+            return std::unexpected(L"SetFilePointerEx failed: " + util::get_win32_error_message(GetLastError()));
+        }
+
         for (ULONGLONG k = 0; k < run_clusters; ++k) {
-            context.lcn_map[ext.lcn + c_offset + k] = {dest_path, src_offset + k * context.src_cluster_size};
+            if (g_cancel_requested) {
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+
+            ULONGLONG cluster_offset = src_offset + k * cluster_size;
+            ULONGLONG bytes_remaining = 0;
+            if (static_cast<ULONGLONG>(src_file_size) > cluster_offset) {
+                bytes_remaining = static_cast<ULONGLONG>(src_file_size) - cluster_offset;
+            }
+            DWORD to_read = static_cast<DWORD>(std::min<ULONGLONG>(cluster_size, bytes_remaining));
+
+            if (to_read == 0) {
+                // Past EOF — record in map and skip
+                context.lcn_map[ext.lcn + c_offset + k] = {path_idx, cluster_offset};
+                continue;
+            }
+
+            // Read source cluster into io_buffer
+            DWORD bytes_read = 0;
+            if (!ReadFile(src_handle, context.io_buffer.data(), to_read, &bytes_read, NULL) || bytes_read == 0) {
+                return std::unexpected(L"ReadFile failed during hash matching: " + util::get_win32_error_message(GetLastError()));
+            }
+
+            // Hash the cluster
+            std::string digest = inspect::compute_sha256(context.io_buffer.data(), bytes_read);
+            bool cloned = false;
+
+            if (!digest.empty()) {
+                auto hash_it = context.hash_index.find(digest);
+                if (hash_it != context.hash_index.end() && !hash_it->second.empty()) {
+                    // Found a content match on the destination volume.
+                    // Resolve the first matching destination LCN to a file+offset.
+                    LONGLONG dest_lcn = hash_it->second[0];
+                    auto lcn_it = context.dest_lcn_index.find(dest_lcn);
+                    if (lcn_it != context.dest_lcn_index.end() && !lcn_it->second.empty()) {
+                        const auto& block = lcn_it->second[0];
+                        HANDLE match_handle = context.handle_cache.get(block.file_path);
+                        if (match_handle != INVALID_HANDLE_VALUE) {
+                            auto clone_ok = clone_extent_from_dest(
+                                dest_handle, match_handle,
+                                block.file_offset, cluster_offset, cluster_size
+                            );
+                            if (clone_ok) {
+                                cloned = true;
+                            }
+                            // If clone fails, fall through to physical write
+                        }
+                    }
+                }
+            }
+
+            if (!cloned) {
+                // No match or clone failed — write physically
+                LARGE_INTEGER li_dest;
+                li_dest.QuadPart = cluster_offset;
+                if (!SetFilePointerEx(dest_handle, li_dest, NULL, FILE_BEGIN)) {
+                    return std::unexpected(L"SetFilePointerEx failed on dest: " + util::get_win32_error_message(GetLastError()));
+                }
+                DWORD written = 0;
+                if (!WriteFile(dest_handle, context.io_buffer.data(), bytes_read, &written, NULL) || written != bytes_read) {
+                    return std::unexpected(L"WriteFile failed: " + util::get_win32_error_message(GetLastError()));
+                }
+            }
+
+            // Record in lcn_map for future cross-file dedup within this copy operation
+            context.lcn_map[ext.lcn + c_offset + k] = {path_idx, cluster_offset};
+
+            // Report progress
+            context.out->progress(src_path, cluster_offset + bytes_read, static_cast<ULONGLONG>(src_file_size));
         }
 
         c_offset += run_clusters;
@@ -1074,6 +1238,13 @@ private:
         if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
             DWORD error = GetLastError();
             return std::unexpected(L"Dedup copy failed (" + original_error + L"), and fallback copy failed: " + util::get_win32_error_message(error));
+        }
+
+        // Query file size for stats tracking
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &fad)) {
+            ULONGLONG sz = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+            context.stats.total_bytes += sz;
         }
 
         context.stats.fallback_files++;
@@ -1133,6 +1304,9 @@ std::expected<CopyContext, std::wstring> inspect_and_prepare(const util::CliArg&
     context.src_cluster_size = get_cluster_size(src_volume);
     context.dest_cluster_size = get_cluster_size(dest_volume);
 
+    // Allocate reusable I/O buffer (4 MB)
+    context.io_buffer.resize(4 * 1024 * 1024);
+
     // Select strategy
     if (context.same_volume) {
         context.strategy = std::make_unique<SameVolumeCopyStrategy>();
@@ -1163,17 +1337,18 @@ std::expected<bool, std::wstring> seed_from_dest_scan(CopyContext& context) {
         context.dest_volume_root, inspect::ScanMode::kWithHash, *context.out);
     if (!scan) return std::unexpected(scan.error());
 
-    // Seed lcn_map: for each LCN with exactly one entry, record it as a clone source.
-    for (const auto& [lcn, entries] : scan->lcn_index) {
-        if (entries.empty()) continue;
-        // Use the first entry as the canonical clone source for this LCN.
-        context.lcn_map[lcn] = {entries[0].file_path, entries[0].file_offset};
-    }
-
+    // Store the destination LcnIndex so hash matches can be resolved to
+    // destination file+offset for cloning.
+    context.dest_lcn_index = std::move(scan->lcn_index);
     context.hash_index = std::move(scan->hash_index);
 
+    ULONGLONG hash_groups = 0;
+    for (const auto& [digest, lcns] : context.hash_index) {
+        if (lcns.size() >= 1) hash_groups++;
+    }
+
     context.out->status(L"[seed_from_dest_scan] Done. " +
-                        std::to_wstring(context.lcn_map.size()) + L" clusters seeded.");
+                        std::to_wstring(hash_groups) + L" unique hashes indexed from destination.");
     return true;
 }
 
