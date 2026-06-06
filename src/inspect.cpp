@@ -81,12 +81,17 @@ std::expected<std::vector<std::wstring>, std::wstring> read_file_list(const std:
 
     std::vector<std::wstring> paths;
     std::string line;
+    bool first_line = true;
     while (std::getline(file, line)) {
-        if (line.size() >= 3 &&
-            static_cast<unsigned char>(line[0]) == 0xEF &&
-            static_cast<unsigned char>(line[1]) == 0xBB &&
-            static_cast<unsigned char>(line[2]) == 0xBF) {
-            line = line.substr(3);
+        // Strip UTF-8 BOM only from the first line of the file
+        if (first_line) {
+            first_line = false;
+            if (line.size() >= 3 &&
+                static_cast<unsigned char>(line[0]) == 0xEF &&
+                static_cast<unsigned char>(line[1]) == 0xBB &&
+                static_cast<unsigned char>(line[2]) == 0xBF) {
+                line = line.substr(3);
+            }
         }
 
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
@@ -333,7 +338,9 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
         }
     }
 
-    // Phase C: Inspect each file, build index
+    // Phase C: Inspect each file, build index.
+    // Each file is opened once: extents are queried and (optionally) cluster data
+    // is hashed through the same handle, avoiding redundant CreateFileW/CloseHandle.
     const ULONGLONG kProgressInterval = 500;
     std::vector<BYTE> read_buffer;
 
@@ -341,13 +348,74 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
         read_buffer.resize(result.cluster_size);
     }
 
-    for (const auto& path : file_paths) {
-        auto file_result = inspect_file(path);
+    const DWORD rp_buf_size = sizeof(RETRIEVAL_POINTERS_BUFFER) +
+                              sizeof(RETRIEVAL_POINTERS_BUFFER::Extents[0]) * 16;
+    std::vector<BYTE> rp_buffer(rp_buf_size);
 
-        if (!file_result.error.empty()) {
-            result.errors.push_back(path + L": " + file_result.error);
+    for (const auto& path : file_paths) {
+        // Open the file once for both extent query and optional hashing
+        HANDLE file_handle = CreateFileW(
+            path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL
+        );
+        if (file_handle == INVALID_HANDLE_VALUE) {
+            result.errors.push_back(path + L": " + util::get_win32_error_message(GetLastError()));
             continue;
         }
+
+        // Get file size
+        LARGE_INTEGER fs_size;
+        if (!GetFileSizeEx(file_handle, &fs_size)) {
+            result.errors.push_back(path + L": GetFileSizeEx failed: " +
+                                    util::get_win32_error_message(GetLastError()));
+            CloseHandle(file_handle);
+            continue;
+        }
+        ULONGLONG file_size = fs_size.QuadPart;
+
+        // Query retrieval pointers (extents)
+        auto rp_out = reinterpret_cast<PRETRIEVAL_POINTERS_BUFFER>(rp_buffer.data());
+        STARTING_VCN_INPUT_BUFFER input = {0};
+        input.StartingVcn.QuadPart = 0;
+
+        std::vector<VcnExtent> extents;
+        bool done = false;
+        LONGLONG current_vcn = 0;
+
+        while (!done) {
+            DWORD bytes_returned = 0;
+            BOOL ok = DeviceIoControl(
+                file_handle, FSCTL_GET_RETRIEVAL_POINTERS,
+                &input, sizeof(input), rp_out, rp_buf_size,
+                &bytes_returned, NULL
+            );
+
+            DWORD err = GetLastError();
+            if (!ok && err != ERROR_MORE_DATA) {
+                if (err == ERROR_HANDLE_EOF) break;
+                result.errors.push_back(path + L": FSCTL_GET_RETRIEVAL_POINTERS: " +
+                                        util::get_win32_error_message(err));
+                break;
+            }
+            if (ok) done = true;
+
+            current_vcn = rp_out->StartingVcn.QuadPart;
+            for (DWORD i = 0; i < rp_out->ExtentCount; ++i) {
+                VcnExtent ext;
+                ext.start_vcn    = current_vcn;
+                ext.next_vcn     = rp_out->Extents[i].NextVcn.QuadPart;
+                ext.lcn          = rp_out->Extents[i].Lcn.QuadPart;
+                ext.cluster_count = ext.next_vcn - ext.start_vcn;
+                extents.push_back(ext);
+                current_vcn = ext.next_vcn;
+            }
+            input.StartingVcn.QuadPart = current_vcn;
+        }
+
+        // Intern the file path
+        uint32_t file_idx = static_cast<uint32_t>(result.file_table.size());
+        result.file_table.push_back(path);
 
         result.files_scanned++;
 
@@ -357,22 +425,8 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
                               std::to_wstring(result.files_scanned) + L" files...");
         }
 
-        // Handle to read cluster data (only needed in kWithHash mode)
-        HANDLE file_handle = INVALID_HANDLE_VALUE;
-        if (mode == ScanMode::kWithHash) {
-            file_handle = CreateFileW(
-                path.c_str(), GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL
-            );
-            if (file_handle == INVALID_HANDLE_VALUE) {
-                result.errors.push_back(path + L": Failed to open for hashing: " +
-                                        util::get_win32_error_message(GetLastError()));
-                continue;
-            }
-        }
-
-        for (const auto& ext : file_result.extents) {
+        // Build index entries and optionally hash each cluster
+        for (const auto& ext : extents) {
             if (ext.lcn == (LONGLONG)-1) continue; // Skip sparse
 
             for (ULONGLONG c = 0; c < ext.cluster_count; ++c) {
@@ -380,14 +434,14 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
                 ULONGLONG   file_offset = (ext.start_vcn + c) * result.cluster_size;
 
                 BlockEntry entry;
-                entry.file_path   = path;
+                entry.file_index  = file_idx;
                 entry.file_offset = file_offset;
 
                 result.lcn_index[lcn].push_back(entry);
                 result.clusters_indexed++;
 
-                // Hash this cluster if requested
-                if (mode == ScanMode::kWithHash && file_handle != INVALID_HANDLE_VALUE) {
+                // Hash this cluster if requested (reuses the already-open handle)
+                if (mode == ScanMode::kWithHash) {
                     LARGE_INTEGER li;
                     li.QuadPart = static_cast<LONGLONG>(file_offset);
                     if (!SetFilePointerEx(file_handle, li, NULL, FILE_BEGIN)) continue;
@@ -395,8 +449,8 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
                     DWORD bytes_read = 0;
                     DWORD to_read = static_cast<DWORD>(
                         std::min<ULONGLONG>(result.cluster_size,
-                            file_result.file_size > file_offset
-                                ? file_result.file_size - file_offset
+                            file_size > file_offset
+                                ? file_size - file_offset
                                 : 0));
 
                     if (to_read == 0) continue;
@@ -411,9 +465,7 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
             }
         }
 
-        if (file_handle != INVALID_HANDLE_VALUE) {
-            CloseHandle(file_handle);
-        }
+        CloseHandle(file_handle);
     }
 
     status_out.status(L"[build_lcn_index] Complete: " +
@@ -595,24 +647,12 @@ void output_multi_file(
     out.field(L"Cluster Size",   std::to_wstring(common_cluster_size) + L" bytes");
     out.field(L"Files Analyzed", std::to_wstring(results.size()));
 
-    {
-        std::wostringstream ss;
-        ss << std::fixed << std::setprecision(2) << total_file_bytes / (1024.0 * 1024.0)
-           << L" MB (" << total_file_bytes << L" bytes)";
-        out.field(L"Total Sizes", ss.str());
-    }
-    {
-        std::wostringstream ss;
-        ss << std::fixed << std::setprecision(2) << shared_bytes / (1024.0 * 1024.0)
-           << L" MB (" << shared_bytes << L" bytes)";
-        out.field(L"Shared Blocks", ss.str());
-    }
-    {
-        std::wostringstream ss;
-        ss << std::fixed << std::setprecision(2) << saved_bytes / (1024.0 * 1024.0)
-           << L" MB (" << saved_bytes << L" bytes)";
-        out.field(L"Saved Space", ss.str());
-    }
+    out.field(L"Total Sizes", util::format_size(total_file_bytes) +
+              L" (" + std::to_wstring(total_file_bytes) + L" bytes)");
+    out.field(L"Shared Blocks", util::format_size(shared_bytes) +
+              L" (" + std::to_wstring(shared_bytes) + L" bytes)");
+    out.field(L"Saved Space", util::format_size(saved_bytes) +
+              L" (" + std::to_wstring(saved_bytes) + L" bytes)");
     {
         std::wostringstream ss;
         ss << std::fixed << std::setprecision(2) << savings_pct << L"%";
@@ -651,10 +691,7 @@ void output_multi_file(
             if (i == j) {
                 row.push_back(L"-");
             } else {
-                std::wostringstream ss;
-                ss << std::fixed << std::setprecision(1)
-                   << (shared_matrix[i][j] * common_cluster_size) / (1024.0 * 1024.0);
-                row.push_back(ss.str());
+                row.push_back(util::format_size(shared_matrix[i][j] * common_cluster_size));
             }
         }
         out.table_row(row);
@@ -695,18 +732,9 @@ void output_scan_report(const ScanResult& scan, output::IOutput& out) {
     out.field(L"Cluster Size",     std::to_wstring(scan.cluster_size) + L" bytes");
     out.field(L"Files Scanned",    std::to_wstring(scan.files_scanned));
     out.field(L"Clusters Indexed", std::to_wstring(scan.clusters_indexed));
-    {
-        std::wostringstream ss;
-        ss << std::fixed << std::setprecision(2) << shared_bytes / (1024.0 * 1024.0)
-           << L" MB (" << shared_clusters << L" clusters)";
-        out.field(L"Shared Blocks", ss.str());
-    }
-    {
-        std::wostringstream ss;
-        ss << std::fixed << std::setprecision(2) << saved_bytes / (1024.0 * 1024.0)
-           << L" MB saved";
-        out.field(L"Dedup Savings", ss.str());
-    }
+    out.field(L"Shared Blocks", util::format_size(shared_bytes) +
+              L" (" + std::to_wstring(shared_clusters) + L" clusters)");
+    out.field(L"Dedup Savings", util::format_size(saved_bytes) + L" saved");
     {
         std::wostringstream ss;
         ss << std::fixed << std::setprecision(2) << savings_pct << L"%";
@@ -737,7 +765,13 @@ void output_scan_report(const ScanResult& scan, output::IOutput& out) {
  * @brief Returns true if the given path looks like a volume root (e.g. "E:\").
  */
 bool is_volume_root(const std::wstring& path) {
-    if (path.size() == 3 && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) {
+    // Drive letter: "E:\" or "E:/"
+    if (path.size() >= 2 && path[1] == L':') {
+        if (path.size() == 2) return true; // "E:" without trailing slash
+        if (path.size() == 3 && (path[2] == L'\\' || path[2] == L'/')) return true;
+    }
+    // Volume GUID path: "\\?\Volume{...}\"
+    if (path.size() >= 11 && path.substr(0, 11) == L"\\\\?\\Volume") {
         return true;
     }
     return false;

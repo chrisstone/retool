@@ -27,8 +27,8 @@ enum class ScanMode {
 
 /// @brief A record associating a physical cluster (LCN) with a file and byte offset.
 struct BlockEntry {
-    std::wstring file_path;   ///< Absolute path of the owning file.
-    ULONGLONG    file_offset; ///< Byte offset of this cluster within the file.
+    uint32_t  file_index;    ///< Index into ScanResult::file_table.
+    ULONGLONG file_offset;   ///< Byte offset of this cluster within the file.
 };
 
 /// @brief Maps each LCN to the list of files that physically share that cluster.
@@ -48,6 +48,14 @@ struct ScanResult {
     ULONGLONG files_scanned = 0;   ///< Total files successfully enumerated.
     ULONGLONG clusters_indexed = 0;///< Total clusters entered into the index.
     std::vector<std::wstring> errors; ///< Non-fatal per-file errors encountered.
+
+    /// @brief Interned file paths table. BlockEntry::file_index indexes into this.
+    std::vector<std::wstring> file_table;
+
+    /// @brief Resolves a file_index to its path string.
+    const std::wstring& resolve_path(uint32_t index) const {
+        return file_table[index];
+    }
 };
 
 // ============================================================================

@@ -124,9 +124,9 @@ struct VolumeWideDedupStrategy : IDedupStrategy {
                 const auto& dup_entry = dup_it->second[0];
 
                 DedupCandidate cand;
-                cand.canonical_path   = canonical_entry.file_path;
+                cand.canonical_path   = scan.resolve_path(canonical_entry.file_index);
                 cand.canonical_offset = canonical_entry.file_offset;
-                cand.duplicate_path   = dup_entry.file_path;
+                cand.duplicate_path   = scan.resolve_path(dup_entry.file_index);
                 cand.duplicate_offset = dup_entry.file_offset;
                 cand.cluster_size     = context.cluster_size;
                 candidates.push_back(std::move(cand));
@@ -156,7 +156,7 @@ struct PairwiseDedupStrategy : IDedupStrategy {
         std::unordered_map<std::wstring, std::vector<std::pair<LONGLONG, ULONGLONG>>> file_lcns;
         for (const auto& [lcn, entries] : scan.lcn_index) {
             for (const auto& entry : entries) {
-                file_lcns[entry.file_path].emplace_back(lcn, entry.file_offset);
+                file_lcns[scan.resolve_path(entry.file_index)].emplace_back(lcn, entry.file_offset);
             }
         }
 
@@ -188,18 +188,18 @@ struct PairwiseDedupStrategy : IDedupStrategy {
             const inspect::BlockEntry* from = nullptr;
             const inspect::BlockEntry* to   = nullptr;
 
-            if (entry0.file_path == path_a && entry1.file_path == path_b) {
+            if (scan.resolve_path(entry0.file_index) == path_a && scan.resolve_path(entry1.file_index) == path_b) {
                 from = &entry0; to = &entry1;
-            } else if (entry0.file_path == path_b && entry1.file_path == path_a) {
+            } else if (scan.resolve_path(entry0.file_index) == path_b && scan.resolve_path(entry1.file_index) == path_a) {
                 from = &entry1; to = &entry0;
             } else {
                 continue; // Both LCNs in the same file — skip
             }
 
             DedupCandidate cand;
-            cand.canonical_path   = from->file_path;
+            cand.canonical_path   = scan.resolve_path(from->file_index);
             cand.canonical_offset = from->file_offset;
-            cand.duplicate_path   = to->file_path;
+            cand.duplicate_path   = scan.resolve_path(to->file_index);
             cand.duplicate_offset = to->file_offset;
             cand.cluster_size     = context.cluster_size;
             candidates.push_back(std::move(cand));
@@ -283,7 +283,12 @@ std::expected<bool, std::wstring> inspect_and_prepare(
 
     // Determine mode: volume-wide vs pair-wise
     auto is_vol_root = [](const std::wstring& p) {
-        return p.size() == 3 && p[1] == L':' && (p[2] == L'\\' || p[2] == L'/');
+        if (p.size() >= 2 && p[1] == L':') {
+            if (p.size() == 2) return true;
+            if (p.size() == 3 && (p[2] == L'\\' || p[2] == L'/')) return true;
+        }
+        if (p.size() >= 11 && p.substr(0, 11) == L"\\\\?\\Volume") return true;
+        return false;
     };
 
     if (args.positional.size() == 1 && is_vol_root(first_arg)) {
@@ -339,8 +344,9 @@ std::expected<bool, std::wstring> inspect_and_prepare(
         bool found1 = false, found2 = false;
         for (const auto& [lcn, entries] : scan->lcn_index) {
             for (const auto& e : entries) {
-                if (e.file_path == p1) found1 = true;
-                if (e.file_path == p2) found2 = true;
+                const auto& ep = scan->resolve_path(e.file_index);
+                if (ep == p1) found1 = true;
+                if (ep == p2) found2 = true;
             }
             if (found1 && found2) break;
         }

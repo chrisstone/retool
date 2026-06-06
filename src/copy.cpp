@@ -166,6 +166,9 @@ struct CopyContext {
     /// Destination LCN index seeded by --scan-dest pre-scan; maps dest LCN -> file+offset.
     inspect::LcnIndex dest_lcn_index;
 
+    /// Interned file paths from the destination scan (resolves BlockEntry::file_index).
+    std::vector<std::wstring> dest_scan_file_table;
+
     /// Content hash index seeded by --scan-dest pre-scan (kWithHash); maps SHA-256 -> dest LCNs.
     inspect::HashIndex hash_index;
 
@@ -1181,7 +1184,8 @@ private:
                     auto lcn_it = context.dest_lcn_index.find(dest_lcn);
                     if (lcn_it != context.dest_lcn_index.end() && !lcn_it->second.empty()) {
                         const auto& block = lcn_it->second[0];
-                        HANDLE match_handle = context.handle_cache.get(block.file_path);
+                        const std::wstring& block_path = context.dest_scan_file_table[block.file_index];
+                        HANDLE match_handle = context.handle_cache.get(block_path);
                         if (match_handle != INVALID_HANDLE_VALUE) {
                             auto clone_ok = clone_extent_from_dest(
                                 dest_handle, match_handle,
@@ -1337,9 +1341,10 @@ std::expected<bool, std::wstring> seed_from_dest_scan(CopyContext& context) {
         context.dest_volume_root, inspect::ScanMode::kWithHash, *context.out);
     if (!scan) return std::unexpected(scan.error());
 
-    // Store the destination LcnIndex so hash matches can be resolved to
-    // destination file+offset for cloning.
+    // Store the destination LcnIndex and file_table so hash matches can be
+    // resolved to destination file+offset for cloning.
     context.dest_lcn_index = std::move(scan->lcn_index);
+    context.dest_scan_file_table = std::move(scan->file_table);
     context.hash_index = std::move(scan->hash_index);
 
     ULONGLONG hash_groups = 0;
