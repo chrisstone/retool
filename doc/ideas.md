@@ -4,7 +4,7 @@
 * [FSCTL_QUERY_EXTENT_METADATA Integration](#fsctl_query_extent_metadata-integration) ❌ Abandoned
 * [File List Input from stdin (Pipe Mode)](#file-list-input-from-stdin-pipe-mode)
 * [Volume-Wide Deduplication Scan](#volume-wide-deduplication-scan) ✅ Implemented
-* [Fragmentation Report](#fragmentation-report)
+* [Fragmentation Report](#fragmentation-report) ✅ Implemented
 * [In-Place File Deduplication](#in-place-file-deduplication) ✅ Implemented
 * [Cross-Volume Copy target-side Dedup](#cross-volume-copy-target-side-dedup) ✅ Implemented
 
@@ -83,19 +83,25 @@ deduplication savings — a "full dedup audit" report.
 
 ### Fragmentation Report
 
+> **Status: ✅ Implemented** — available via `retool inspect <file> -r` or
+> `retool inspect <file1> <file2> -r` (appends a report per file).
+
 Report the fragmentation level of a file or set of files — extent count, average extent
 size, and a fragmentation score.
 
 * **Objective**: Complement dedup analysis with a practical file health report. A file
   with thousands of small extents on ReFS performs worse at read time even if dedup is
   intact.
-* **Implementation**: Leverage the existing `FSCTL_GET_RETRIEVAL_POINTERS` enumeration
-  already used by `inspect`. Compute: `fragment_count`, `min/max/avg_extent_size`,
-  `fragmentation_score = fragment_count / ideal_fragment_count` (where ideal = 1 for a
-  fully contiguous file). Surface as an additional section in `inspect` output, or as a
-  dedicated `retool frag <file>` subcommand.
-* **Effort Estimate**: Low (~half day). The extent enumeration code is already implemented
-  as part of `inspect`; this is purely an additional calculation and output section.
+* **Implementation**: Leverages the existing `FSCTL_GET_RETRIEVAL_POINTERS` enumeration
+  already used by `inspect`. The `-r` flag triggers `compute_frag_stat()` on each
+  inspected file's `VcnExtent` list, computing `fragment_count`, `min/max/avg_extent_clusters`.
+  `output_frag_report()` then emits a `Fragmentation Report` section per file. Sparse
+  extents are excluded from all counts. Score thresholds: 1 = optimal, ≤4 = good,
+  ≤16 = moderate, >16 = high. `util::format_size()` was added to produce human-readable
+  byte strings (KB/MB/GB/TB) used throughout the report.
+* **Notes**: `-r` is deliberately chosen over `-f` (`-f` is reserved for `--force`
+  semantics). In `copy` context, `-r` still means recursive; in `inspect` context it means
+  report. The shared `args.recursive` field in `CliArg` carries the flag for both.
 
 ---
 

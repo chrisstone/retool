@@ -39,4 +39,7 @@ std::string to_string(const std::wstring& wstr);
 // Utility to format Win32 error code as a message string
 std::wstring get_win32_error_message(DWORD error_code);
 
+// Utility to format a byte count as a human-readable size string (e.g. "4.00 MB")
+std::wstring format_size(ULONGLONG bytes);
+
 } // namespace util

@@ -1,4 +1,5 @@
 #include <expected>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -142,6 +143,30 @@ std::wstring get_win32_error_message(DWORD error_code) {
     }
 
     return L"Unknown Win32 Error (" + std::to_wstring(error_code) + L")";
+}
+
+std::wstring format_size(ULONGLONG bytes) {
+    constexpr ULONGLONG kKB = 1024ULL;
+    constexpr ULONGLONG kMB = 1024ULL * 1024ULL;
+    constexpr ULONGLONG kGB = 1024ULL * 1024ULL * 1024ULL;
+    constexpr ULONGLONG kTB = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+
+    std::wostringstream ss;
+    ss << std::fixed << std::setprecision(2);
+
+    if (bytes >= kTB) {
+        ss << static_cast<double>(bytes) / static_cast<double>(kTB) << L" TB";
+    } else if (bytes >= kGB) {
+        ss << static_cast<double>(bytes) / static_cast<double>(kGB) << L" GB";
+    } else if (bytes >= kMB) {
+        ss << static_cast<double>(bytes) / static_cast<double>(kMB) << L" MB";
+    } else if (bytes >= kKB) {
+        ss << static_cast<double>(bytes) / static_cast<double>(kKB) << L" KB";
+    } else {
+        ss << bytes << L" bytes";
+    }
+
+    return ss.str();
 }
 
 } // namespace util

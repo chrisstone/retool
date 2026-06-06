@@ -137,11 +137,42 @@ Content Groups:   8841       (kWithHash only)
 
 | Flag | Description |
 |------|-------------|
+| `-r` | Append a fragmentation report for each file (fragment count, min/max/avg extent, score) |
 | `-i <file>` | Read file paths from a newline-delimited input file |
 | `-o <file>` | Write output to a file instead of stdout |
 | `--strict` | Abort on first error (default: best-effort with error summary) |
 | `--json` | Output results in JSON format |
 | `-q` | Suppress all output |
+
+### Fragmentation Report (`-r`)
+
+When `-r` is passed, a **Fragmentation Report** section is appended after the standard extent
+table (single-file mode) or once per file (multi-file mode). Sparse extents are excluded from
+all counts.
+
+**`compute_frag_stat(const FileInspectResult&) → FragStat`:**
+
+Iterates the file's `VcnExtent` list and accumulates:
+- `fragment_count` — number of non-sparse extents
+- `total_clusters` — sum of all non-sparse extent cluster counts
+- `min/max_extent_clusters` — smallest and largest non-sparse extent
+- `avg_extent_clusters` — mean extent size (`total_clusters / fragment_count`)
+
+**`output_frag_report()` emitted fields:**
+
+| Field | Description |
+|-------|-------------|
+| File | File path |
+| Fragments | Number of non-sparse extents (1 = perfectly contiguous) |
+| Frag Score | Fragment count with qualitative label: 1 = optimal, ≤4 = good, ≤16 = moderate, >16 = high |
+| Smallest Extent | Min extent size in clusters and human-readable bytes |
+| Largest Extent | Max extent size in clusters and human-readable bytes |
+| Avg Extent | Mean extent size in clusters and human-readable bytes |
+
+Byte formatting uses `util::format_size(ULONGLONG bytes)` — renders as KB/MB/GB/TB with 2 decimal places.
+
+> [!NOTE]
+> `-r` deliberately avoids `-f` (reserved for future `--force` semantics). In `copy` context, `-r` retains its meaning as recursive; in `inspect`, it means fragmentation report. Both map to `CliArg::recursive`.
 
 ---
 

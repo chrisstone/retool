@@ -2,9 +2,9 @@
  * @file inspect.cpp
  * @brief Block layout inspection, volume scan engine, and cross-file sharing analysis.
  *
- * Provides three modes of operation:
- *  - Single-file: dump VCN/LCN extent map.
- *  - Multi-file: cross-file block sharing report.
+ * Provides four modes of operation:
+ *  - Single-file: dump VCN/LCN extent map, optionally with fragmentation report (-r).
+ *  - Multi-file: cross-file block sharing report, optionally with per-file frag stats (-r).
  *  - Volume scan: full LCN index with optional SHA-256 content hashing.
  */
 
@@ -50,6 +50,15 @@ struct FileInspectResult {
     ULONGLONG    file_size    = 0;
     std::vector<VcnExtent> extents;
     std::wstring error;
+};
+
+/// @brief Fragmentation statistics computed from a file's extent list.
+struct FragStat {
+    ULONGLONG fragment_count      = 0; ///< Number of non-sparse extents.
+    ULONGLONG total_clusters      = 0; ///< Total non-sparse clusters.
+    ULONGLONG min_extent_clusters = 0; ///< Smallest non-sparse extent (clusters).
+    ULONGLONG max_extent_clusters = 0; ///< Largest non-sparse extent (clusters).
+    double    avg_extent_clusters = 0; ///< Mean extent size (clusters).
 };
 
 // ============================================================================
@@ -444,6 +453,84 @@ void output_single_file(const FileInspectResult& res, output::IOutput& out) {
 }
 
 /**
+ * @brief Computes fragmentation statistics from a file's extent list.
+ *
+ * Only non-sparse extents contribute to the counts. Returns a zeroed
+ * FragStat for files with no allocated extents.
+ *
+ * @param res The inspect result for a single file.
+ * @return FragStat populated with fragment count, min/max/avg extent size.
+ */
+FragStat compute_frag_stat(const FileInspectResult& res) {
+    FragStat stat;
+
+    for (const auto& ext : res.extents) {
+        if (ext.lcn == (LONGLONG)-1) continue; // Skip sparse
+
+        stat.fragment_count++;
+        stat.total_clusters += ext.cluster_count;
+
+        if (stat.fragment_count == 1) {
+            stat.min_extent_clusters = ext.cluster_count;
+            stat.max_extent_clusters = ext.cluster_count;
+        } else {
+            if (ext.cluster_count < stat.min_extent_clusters)
+                stat.min_extent_clusters = ext.cluster_count;
+            if (ext.cluster_count > stat.max_extent_clusters)
+                stat.max_extent_clusters = ext.cluster_count;
+        }
+    }
+
+    if (stat.fragment_count > 0) {
+        stat.avg_extent_clusters = static_cast<double>(stat.total_clusters) /
+                                   static_cast<double>(stat.fragment_count);
+    }
+
+    return stat;
+}
+
+/**
+ * @brief Outputs a fragmentation report section for a single file.
+ *
+ * The score is simply the fragment count: 1 = perfectly contiguous,
+ * higher values indicate increasing fragmentation.
+ *
+ * @param res   The inspect result for a single file.
+ * @param stat  Pre-computed fragmentation statistics.
+ * @param out   The output interface.
+ */
+void output_frag_report(const FileInspectResult& res, const FragStat& stat, output::IOutput& out) {
+    out.begin_section(L"Fragmentation Report");
+    out.field(L"File",             res.path);
+    out.field(L"Fragments",        std::to_wstring(stat.fragment_count));
+    out.field(L"Frag Score",       std::to_wstring(stat.fragment_count) +
+                                       (stat.fragment_count == 1 ? L" (optimal)" :
+                                        stat.fragment_count <= 4  ? L" (good)" :
+                                        stat.fragment_count <= 16 ? L" (moderate)" :
+                                                                    L" (high)"));
+    {
+        std::wostringstream ss;
+        ULONGLONG bytes = stat.min_extent_clusters * res.cluster_size;
+        ss << stat.min_extent_clusters << L" clusters (" << util::format_size(bytes) << L")";
+        out.field(L"Smallest Extent", ss.str());
+    }
+    {
+        std::wostringstream ss;
+        ULONGLONG bytes = stat.max_extent_clusters * res.cluster_size;
+        ss << stat.max_extent_clusters << L" clusters (" << util::format_size(bytes) << L")";
+        out.field(L"Largest Extent", ss.str());
+    }
+    {
+        std::wostringstream ss;
+        ULONGLONG avg_bytes = static_cast<ULONGLONG>(stat.avg_extent_clusters * res.cluster_size);
+        ss << std::fixed << std::setprecision(1) << stat.avg_extent_clusters
+           << L" clusters (" << util::format_size(avg_bytes) << L")";
+        out.field(L"Avg Extent",     ss.str());
+    }
+    out.end_section();
+}
+
+/**
  * @brief Outputs the multi-file inspect report via IOutput.
  */
 void output_multi_file(
@@ -695,8 +782,19 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
         const auto& res = results[0];
         if (!res.error.empty()) return std::unexpected(res.error);
         output_single_file(res, out);
+        if (args.recursive) {
+            auto stat = compute_frag_stat(res);
+            output_frag_report(res, stat, out);
+        }
     } else {
         output_multi_file(results, errors, out);
+        if (args.recursive) {
+            for (const auto& res : results) {
+                if (!res.error.empty()) continue;
+                auto stat = compute_frag_stat(res);
+                output_frag_report(res, stat, out);
+            }
+        }
     }
 
     return 0;
