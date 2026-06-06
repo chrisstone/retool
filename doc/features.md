@@ -1,14 +1,15 @@
 # doc/features.md — retool Feature Specifications
 
-This document provides technical detail for each feature in the retool 1.0 scope. It is intended to guide agent implementation and design decisions. For user-facing documentation see [README.md](../README.md).
+This document provides technical detail for each feature implemented in retool. It is intended to guide agent implementation and design decisions. For user-facing documentation see [README.md](../README.md).
 
 ---
 
 ## Index
 
-* [Feature 1: inspect — Block Layout & Deduplication Analysis](#feature-1-inspect--block-layout--deduplication-analysis)
+* [Feature 1: inspect — Block Layout, Sharing Analysis & Volume Scan](#feature-1-inspect--block-layout-sharing-analysis--volume-scan)
 * [Feature 2: copy — Deduplication-Preserving File Copy](#feature-2-copy--deduplication-preserving-file-copy)
-* [Feature 3: volume — Volume-Level Block Statistics](#feature-3-volume--volume-level-block-statistics)
+* [Feature 3: dedup — In-Place File Deduplication](#feature-3-dedup--in-place-file-deduplication)
+* [Feature 4: volume — Volume-Level Block Statistics](#feature-4-volume--volume-level-block-statistics)
 * [CLI Design](#cli-design)
 * [Output Format](#output-format)
 * [Error Handling & Privilege Model](#error-handling--privilege-model)
@@ -16,15 +17,15 @@ This document provides technical detail for each feature in the retool 1.0 scope
 
 ---
 
-## Feature 1: `inspect` — Block Layout & Deduplication Analysis
+## Feature 1: `inspect` — Block Layout, Sharing Analysis & Volume Scan
 
 ### Purpose
 
-Report the physical block layout of one or more files on a ReFS volume. When multiple files are provided, compute cross-file block sharing to measure deduplication savings.
+Report the physical block layout of one or more files on a ReFS volume. When multiple files are provided, compute cross-file block sharing to measure deduplication savings. When given a volume root, perform a full-volume scan and report aggregate deduplication potential.
 
 ### Single-File Mode
 
-Invoked when exactly one file path is supplied.
+Invoked when exactly one file path is supplied (and it is not a volume root).
 
 **Goal:** Enumerate every extent (fragment) of the file and print each VCN→LCN mapping with size and cumulative offset.
 
@@ -32,10 +33,8 @@ Invoked when exactly one file path is supplied.
 
 1. `CreateFileW` — open the file with `FILE_FLAG_BACKUP_SEMANTICS | GENERIC_READ | FILE_SHARE_READ | FILE_SHARE_WRITE`. Requires Administrator.
 2. `GetVolumePathNameW` — extract the volume root from the file path.
-3. `GetDiskFreeSpaceW` + `GetDiskFreeSpaceExW` — obtain cluster size and total cluster count. Note: `GetDiskFreeSpace` returns 32-bit cluster count which overflows above ~16 TB at 4 KB clusters; use `GetDiskFreeSpaceEx` for total bytes and divide.
+3. `GetDiskFreeSpaceW` — obtain cluster size.
 4. Loop: `DeviceIoControl(FSCTL_GET_RETRIEVAL_POINTERS)` — iteratively query extents. Pass `STARTING_VCN_INPUT_BUFFER` starting at VCN 0; on each call the last `NextVcn` becomes the next starting VCN. Stop when the call returns `true` (all extents fit) or `ERROR_HANDLE_EOF` (sparse/small file).
-
-**Key Note from blockstat:** Querying multiple extents per call (`ExtentCount > 1`) produces unreliable results on some ReFS configurations. Query one extent per call and loop.
 
 **Output per extent:**
 
@@ -46,40 +45,86 @@ Extent #  VCN          LCN          Clusters    Bytes        Cumulative
 ...
 ```
 
-**ReFS Extent Metadata (Optional / Advanced):**
-
-`FSCTL_QUERY_EXTENT_METADATA` is an undocumented ReFS-specific ioctl that can return additional metadata per extent (e.g., integrity stream info, reference count). If available and structurally stable, use it to report block reference counts directly. This must be wrapped in a best-effort path that gracefully degrades to VCN/LCN-only output if it fails.
-
 ### Multi-File Mode
 
 Invoked when two or more file paths are supplied (directly on CLI or via `-i <filelist>`).
 
-**Goal:** For each unique LCN present in more than one file, count how many files share it. Compute total bytes saved by deduplication.
+**Goal:** For each unique LCN present in more than one file, count how many files share it. Report cross-file sharing as a matrix and compute aggregate savings.
 
-**Algorithm (matching blockstat's approach):**
+**Algorithm:**
 
-1. Determine total cluster count of the volume; allocate a `uint16_t refmap[total_clusters]` — one counter per cluster on the volume.
-2. For each file: enumerate all extents via `FSCTL_GET_RETRIEVAL_POINTERS`. For each LCN in each extent, increment `refmap[lcn]`.
-3. After all files are processed: scan `refmap`. Any cluster with count ≥ 2 is shared. Shared clusters × cluster size = bytes saved.
-4. Produce per-file share ratios and a total-savings summary.
-
-**Memory considerations:** At 4 KB cluster size, a 10 TB volume has ~2.5 billion clusters. `uint16_t` refmap = ~5 GB — not feasible for very large volumes. Strategy:
-- Default: `uint16_t` (supports up to 65,535 references per cluster; covers all realistic dedup cases).
-- If refmap allocation fails, fall back to a hash-map approach (`std::unordered_map<LONGLONG, uint16_t>`) keyed on LCN, populated only for clusters that appear in at least one input file. This is sparser but correct.
-- Document memory implications clearly in output and help text.
+1. Enumerate all extents for each file via `FSCTL_GET_RETRIEVAL_POINTERS`.
+2. Build an `unordered_map<LONGLONG, vector<size_t>> lcn_to_files` — LCN → list of file indices that contain it.
+3. Scan the map: clusters with two or more file references are shared. Compute shared bytes and savings percentage.
+4. Build a per-file sharing matrix for tabular output.
 
 **Output (multi-file):**
 
 ```
-Files analyzed: 5
-Total extents:  1,204
-Shared clusters: 8,192 (32 MB)
-Dedup savings:   32 MB (12.5% of total)
+Volume:        E:\
+Cluster Size:  65536 bytes
+Files Analyzed: 3
+Total Sizes:   10.23 MB (10726400 bytes)
+Shared Blocks: 4.00 MB (4194304 bytes)
+Saved Space:   4.00 MB (4194304 bytes)
+Dedup Savings: 39.08%
 
-Per-file sharing:
-  file1.vbk  -> 4 files share  16 MB
-  file2.vib  -> 3 files share  8 MB
-  ...
+[Sharing matrix table: each cell shows MB shared between file pair Fx and Fy]
+```
+
+### Volume Scan Mode
+
+Invoked when a single argument is a volume root (e.g. `E:\`).
+
+**Goal:** Walk every file on the volume, build a full LCN index, and report aggregate deduplication savings. Optionally hash every cluster to enable content-based matching.
+
+**Implementation — `inspect::build_lcn_index()`:**
+
+1. `enumerate_files_recursive()` — walks the volume tree with `FindFirstFileW` / `FindNextFileW`. Skips `FILE_ATTRIBUTE_SYSTEM` files and `FILE_ATTRIBUTE_REPARSE_POINT` junctions.
+2. For each file, calls `inspect_file()` to obtain all extents via `FSCTL_GET_RETRIEVAL_POINTERS`.
+3. Populates `LcnIndex` (`unordered_map<LONGLONG, vector<BlockEntry>>`): maps each LCN to the file(s) and byte offsets that reference it.
+4. In `kWithHash` mode: additionally reads each cluster and computes a SHA-256 digest via the Windows CNG BCrypt API (`BCryptOpenAlgorithmProvider(BCRYPT_SHA256_ALGORITHM)`, `BCryptCreateHash`, `BCryptHashData`, `BCryptFinishHash`). The hardware SHA-NI instruction set is used automatically when available. Populates `HashIndex` (`unordered_map<string, vector<LONGLONG>>`): SHA-256 hex digest → list of LCNs with identical content.
+5. Reports progress via `IOutput::status()` every 500 files.
+
+**Scan modes (`ScanMode` enum):**
+
+| Mode | Description |
+|------|-------------|
+| `kLcnOnly` | Build LCN→file map without reading disk data (fast; reports structurally shared clusters only) |
+| `kWithHash` | Also SHA-256 hash every cluster; enables content-based dedup matching across unrelated files |
+
+**Public types exported from `inspect.h`:**
+
+```cpp
+struct BlockEntry { std::wstring file_path; ULONGLONG file_offset; };
+using LcnIndex  = std::unordered_map<LONGLONG, std::vector<BlockEntry>>;
+using HashIndex = std::unordered_map<std::string, std::vector<LONGLONG>>;
+
+struct ScanResult {
+    LcnIndex  lcn_index;
+    HashIndex hash_index;       // kWithHash only
+    DWORD     cluster_size;
+    std::wstring volume_root;
+    ULONGLONG files_scanned;
+    ULONGLONG clusters_indexed;
+    std::vector<std::wstring> errors;
+};
+
+std::expected<ScanResult, std::wstring> build_lcn_index(
+    const std::wstring& volume_root, ScanMode mode, output::IOutput& status_out);
+```
+
+**Output (volume scan):**
+
+```
+Volume:           E:\
+Cluster Size:     65536 bytes
+Files Scanned:    14382
+Clusters Indexed: 892104
+Shared Blocks:    1.23 GB (19847 clusters)
+Dedup Savings:    512 MB saved
+Savings %:        14.23%
+Content Groups:   8841       (kWithHash only)
 ```
 
 ### Input File (`-i <file>`)
@@ -87,6 +132,16 @@ Per-file sharing:
 - One absolute path per line (UTF-8 or UTF-16 LE with BOM).
 - Blank lines and lines starting with `#` are ignored.
 - Paths are validated before processing begins; invalid paths are reported and skipped (default best-effort) or abort (with `--strict`).
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `-i <file>` | Read file paths from a newline-delimited input file |
+| `-o <file>` | Write output to a file instead of stdout |
+| `--strict` | Abort on first error (default: best-effort with error summary) |
+| `--json` | Output results in JSON format |
+| `-q` | Suppress all output |
 
 ---
 
@@ -96,74 +151,162 @@ Per-file sharing:
 
 Copy one or more files (or a full directory tree) while preserving ReFS block sharing using `FSCTL_DUPLICATE_EXTENTS_TO_FILE` or target-volume deduplication.
 
-### Same-Volume Clone (Primary Path)
+### Pipeline Architecture
 
-When source and destination paths reside on the same volume:
+`execute_copy` is a three-phase pipeline:
+
+1. **Inspection** (`inspect_and_prepare`) — resolve paths, query volume topology, select strategy.
+2. **Operation** (`copy_directory_recursive` / `ICopyStrategy::copy_file`) — perform the copy.
+3. **Finalization** (`finalize_and_report`) — emit summary statistics.
+
+### Strategy Selection
+
+| Condition | Strategy |
+|-----------|----------|
+| Same volume | `SameVolumeCopyStrategy` — pure `FSCTL_DUPLICATE_EXTENTS_TO_FILE` |
+| Different volumes, dest is ReFS, cluster sizes match | `CrossVolumeRefsCopyStrategy` — LCN-mapped dedup-preserving copy |
+| Otherwise | `FallbackCopyStrategy` — standard `CopyFileExW` |
+
+### Same-Volume Clone (`SameVolumeCopyStrategy`)
+
 1. `CreateFileW` on source — `GENERIC_READ | FILE_SHARE_READ`, `FILE_FLAG_BACKUP_SEMANTICS`.
-2. `CreateFileW` on destination — `GENERIC_READ | GENERIC_WRITE`, `CREATE_ALWAYS`, `FILE_FLAG_BACKUP_SEMANTICS`.
-3. Query source extents via `FSCTL_GET_RETRIEVAL_POINTERS` to enumerate all extents.
-4. For each extent: call `DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)` passing the source file handle, source offset, destination offset, and length in bytes.
-5. Set the destination file size via `SetEndOfFile` to match the source.
-6. Copy file timestamps and basic attributes using `GetFileInformationByHandleEx` / `SetFileInformationByHandle`.
+2. `CreateFileW` on destination — `GENERIC_READ | GENERIC_WRITE`, `CREATE_ALWAYS`, `FILE_FLAG_BACKUP_SEMANTICS`. Mark sparse via `FSCTL_SET_SPARSE`.
+3. Pre-size destination with `SetEndOfFile` (falls back to incremental sizing on disk-full).
+4. Query source extents via `FSCTL_GET_RETRIEVAL_POINTERS`.
+5. For each non-sparse extent: `DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)`.
+6. Finalize size and copy timestamps/attributes via `SetFileInformationByHandle(FileBasicInfo)`.
 
-### Cross-Volume Copy
+### Cross-Volume Copy (`CrossVolumeRefsCopyStrategy`)
 
-When source and destination paths reside on different volumes:
+Maintains `CopyContext::lcn_map` — a mapping from source LCN to `{dest_file_path, dest_byte_offset}` tracking every cluster already written to the destination.
 
-1. **Verify Destination Filesystem**:
-   Use `GetVolumePathNameW` and `GetVolumeInformationW` on the destination path to query the filesystem type.
+For each extent of each source file, processes clusters in runs:
 
-2. **Non-ReFS Destination (Fallback)**:
-   If the destination filesystem is not ReFS (e.g., NTFS or FAT32), block cloning cannot be used on the destination. Fall back to standard copy via `CopyFileExW` with `COPY_FILE_ALLOW_DECRYPTED_DESTINATION` and print a warning:
-   ```
-   WARNING: Destination volume is non-ReFS. Falling back to standard copy.
-   ```
+- **Duplicate LCN run** (`clone_duplicate_run`): the source LCN is already in `lcn_map` — issue `FSCTL_DUPLICATE_EXTENTS_TO_FILE` using the previously-copied destination block. Scans forward to find the longest contiguous run that maps to contiguous destination offsets, cloning in a single ioctl call.
+- **New LCN run** (`copy_new_run`): LCN not seen before — physically copy bytes from source to destination in 4 MB chunks (`copy_bytes_physical`), then record every LCN in the run in `lcn_map`.
 
-3. **ReFS Destination (Preserve Sharing)**:
-   If the destination filesystem is ReFS, we can preserve deduplication of the copied files by mapping identical blocks on the source and cloning them *on the target volume* after they are initially copied.
-   
-   **Win32 API Sequence**:
-   - Call `inspect` logic on all files to be copied to identify matching source LCNs.
-   - Maintain a tracker of source LCNs that have already been copied to the destination: `lcn_map[source_lcn] = {dest_file_path, dest_file_offset}`.
-   - For each file being copied:
-     - Open source and destination files.
-     - For each extent of the source file:
-       - If it is sparse (`lcn == (LONGLONG)-1`), skip writing/cloning (let target file growth handle it).
-       - For each cluster in the extent:
-         - If the cluster's source `lcn` is NOT in `lcn_map` (first time seeing this block):
-           - Copy the cluster data (typically 4 KB or 64 KB) directly from source to destination file.
-           - Record the copied destination address: `lcn_map[lcn] = {dest_file_path, dest_file_offset}`.
-         - If the cluster's source `lcn` IS in `lcn_map` (duplicate block found):
-           - Retrieve the already written target block location `{prev_dest_file, prev_dest_offset}`.
-           - Open the `prev_dest_file` with read access.
-           - Call `DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)` on the current destination file, passing the handle of `prev_dest_file`, source offset `prev_dest_offset`, target offset `current_dest_offset`, and block length.
-           - This makes the destination files share blocks on the destination volume!
+Progress is reported per-cluster run via `IOutput::progress()`.
+
+### Destination Pre-Scan (`--scan-dest`)
+
+When `--scan-dest` is passed and the strategy is `CrossVolumeRefsCopyStrategy`, an additional **Phase 1b** runs before any file is copied:
+
+1. Calls `inspect::build_lcn_index(dest_volume_root, kWithHash, out)`.
+2. Seeds `CopyContext::lcn_map` from the resulting `LcnIndex` — each destination LCN is recorded as a pre-existing clone source.
+3. Stores the `HashIndex` in `CopyContext::hash_index` for future content-based matching.
+
+This allows blocks already physically present on the destination (from a prior copy or dedup operation) to be cloned rather than re-transferred.
+
+> **Performance note:** `--scan-dest` reads every cluster on the destination volume to compute SHA-256 hashes. On large volumes this adds significant setup time. Use when the destination already holds substantial overlapping data.
+
+### Fallback Copy (`FallbackCopyStrategy`)
+
+Uses `CopyFileExW` with a progress callback forwarded to `IOutput::progress()`. Issued when the destination is non-ReFS or cluster sizes differ.
 
 ### Directory Copy
 
-- Walk source directory recursively with `FindFirstFileW` / `FindNextFileW`.
+- Walk source with `FindFirstFileW` / `FindNextFileW`.
 - Mirror directory structure at destination using `CreateDirectoryW`.
-- For each file: attempt same-volume clone; fall back to standard copy per the above logic.
-- Default: best-effort — on error, record the failure and continue. Report all errors in a summary at the end.
-- `--strict`: abort on first error.
+- Skip `FILE_ATTRIBUTE_SYSTEM` entries.
+- Best-effort by default — errors recorded in `CopyStats::errors`, reported in finalization. `--strict` aborts on first error.
 
-### Dry-Run Mode (`--dry-run`)
+### Cancellation
 
-- Walk source and compute what would be copied.
-- Print each file that would be created, the copy method that would be used (clone vs. fallback), and the expected bytes.
-- No files or directories are created.
+A global `std::atomic<bool> copy::g_cancel_requested` is checked at every copy-loop iteration and extent boundary. A `ConsoleCtrlHandler` sets it on `Ctrl+C`. Partial destination files are deleted on cancellation.
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
 | `-r` | Recursive directory copy |
-| `--strict` | Abort on first per-file error |
 | `--dry-run` | Simulate without writing |
+| `--scan-dest` | Pre-scan destination volume to seed the dedup block index |
+| `--strict` | Abort on first error |
+| `--json` | Output results in JSON format |
+| `-q` | Suppress all output |
+| `-o <file>` | Redirect output to a file |
 
 ---
 
-## Feature 3: `volume` — Volume-Level Block Statistics
+## Feature 3: `dedup` — In-Place File Deduplication
+
+### Purpose
+
+Deduplicate files already resident on a ReFS volume in-place using `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Identifies clusters with identical SHA-256 content and replaces physical duplicates with shared block references — reclaiming disk space without modifying file content.
+
+### Pipeline Architecture
+
+`execute_dedup` is a three-phase pipeline:
+
+1. **Inspection** (`inspect_and_prepare`) — validate arguments, verify ReFS, run `build_lcn_index(kWithHash)`, select strategy.
+2. **Operation** (`execute_operation`) — apply `FSCTL_DUPLICATE_EXTENTS_TO_FILE` to each candidate cluster.
+3. **Finalization** (`finalize_and_report`) — emit summary statistics.
+
+### Modes and Strategy Selection
+
+| Invocation | Strategy | Description |
+|-----------|----------|-------------|
+| `retool dedup <volume-root>` | `VolumeWideDedupStrategy` | Deduplicates all hash-matched clusters across the entire volume |
+| `retool dedup <file1> <file2>` | `PairwiseDedupStrategy` | Deduplicates matching clusters between exactly two named files |
+
+### Volume-Wide Deduplication (`VolumeWideDedupStrategy`)
+
+1. Receives the `ScanResult` from `build_lcn_index(kWithHash)`.
+2. Iterates `HashIndex` — for each SHA-256 digest with two or more LCNs:
+   - Designates `lcns[0]` as the canonical (master) cluster.
+   - For each subsequent LCN in the group: produces a `DedupCandidate` with `canonical_path/offset` and `duplicate_path/offset`.
+3. Returns the full candidate list for Phase 2 execution.
+
+### Pair-Wise Deduplication (`PairwiseDedupStrategy`)
+
+1. Partitions the `LcnIndex` by file — identifies exactly two distinct file paths.
+2. Iterates `HashIndex` — for each digest where one LCN belongs to file A and one to file B: produces a `DedupCandidate` pointing from file A (canonical) to file B (duplicate).
+3. Skips hashes where both LCNs belong to the same file.
+
+### Operation — Cluster-Level Dedup
+
+For each `DedupCandidate`:
+
+1. Opens the canonical file read-only and the duplicate file read/write (handles cached across candidates to avoid per-cluster `CreateFileW` overhead).
+2. Issues `DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)` with `ByteCount = cluster_size`.
+3. Respects `g_cancel_requested` for cooperative Ctrl+C cancellation.
+4. In `--dry-run` mode: increments stats counters without issuing the ioctl.
+
+### DedupCandidate Structure
+
+```cpp
+struct DedupCandidate {
+    std::wstring canonical_path;    // File that owns the canonical cluster
+    ULONGLONG    canonical_offset;  // Byte offset within canonical_path
+    std::wstring duplicate_path;    // File to receive the clone
+    ULONGLONG    duplicate_offset;  // Byte offset within duplicate_path
+    ULONGLONG    cluster_size;      // Bytes in this cluster
+};
+```
+
+### Output (summary)
+
+```
+Files Processed:  142
+Clusters Deduped: 8192
+Space Reclaimed:  512.00 MB (536870912 bytes)
+```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Report savings without writing |
+| `--strict` | Abort on first error |
+| `--json` | Output results in JSON format |
+| `-q` | Suppress all output |
+
+> [!IMPORTANT]
+> Both files must reside on the same ReFS volume. The operation modifies file allocation metadata; ensure backups exist before running volume-wide dedup on production data.
+
+---
+
+## Feature 4: `volume` — Volume-Level Block Statistics
 
 ### Purpose
 
@@ -172,13 +315,13 @@ Show ReFS volume metadata and a high-level summary of cluster usage.
 ### Output
 
 ```
-Volume:        D:\
-File System:   ReFS
-Cluster Size:  4096 bytes
+Volume:         E:\
+File System:    ReFS
+Cluster Size:   65536 bytes
 Total Clusters: 2,621,440
-Total Space:   10.0 GB
-Free Space:    4.2 GB
-Used Space:    5.8 GB
+Total Space:    10.0 GB
+Free Space:     4.2 GB
+Used Space:     5.8 GB
 ```
 
 ### Win32 APIs
@@ -199,8 +342,9 @@ retool <command> [options] [arguments]
 
 | Command | Alias | Description |
 |---------|-------|-------------|
-| `inspect` | `i` | Inspect block layout and dedup stats |
+| `inspect` | `i` | Inspect block layout, sharing analysis, or volume scan |
 | `copy` | `cp` | Copy files preserving deduplication |
+| `dedup` | `dd` | Deduplicate files in-place on a ReFS volume |
 | `volume` | `vol` | Show volume information |
 | `help` | `h`, `?` | Show usage |
 | `version` | | Print version string |
@@ -209,23 +353,38 @@ retool <command> [options] [arguments]
 
 | Flag | Description |
 |------|-------------|
-| `--strict` | Abort on first error (where applicable) |
+| `--json` | Output in JSON format (uses nlohmann/json) |
+| `-q` | Suppress all output (quiet/silent mode) |
 | `-o <file>` | Redirect output to a file |
 
 ### Argument Parsing
 
-Implement a minimal argument parser in `src/util/Arg.cpp`. Use `CommandLineToArgvW` to obtain the wide-character argument array. No third-party CLI library. Rules:
-- Short flags: single `-` + single character (e.g., `-r`, `-i`).
-- Long flags: double `--` + word (e.g., `--strict`, `--dry-run`).
+Implemented in `src/util.cpp` (`util::parse_arguments`). Uses the wide-character `argv[]` array from `wmain`. No third-party CLI library. Rules:
+- Short flags: single `-` + single character (e.g., `-r`, `-i`, `-q`).
+- Long flags: double `--` + word (e.g., `--strict`, `--dry-run`, `--scan-dest`).
 - Unknown flags: print a clear error and exit with code 1.
 
 ---
 
 ## Output Format
 
-### Plain Text
+### Plain Text (CLI)
 
-Human-readable, column-aligned. Use `wprintf` throughout for Unicode safety. Widths should adapt to the largest values in the result set.
+Human-readable, column-aligned. Rendered via `output::CliOutput`:
+- `status()` — single-line informational messages.
+- `field(name, value)` — key/value pairs.
+- `begin_table(columns)` / `table_row(values)` / `end_table()` — tabular output with auto-sized columns.
+- `begin_section(title)` / `end_section()` — groups related output.
+- `progress(filename, bytes_done, bytes_total)` — in-place progress bar overwriting the current line.
+- `warn()` / `error()` — prefixed warning and error messages.
+
+### JSON
+
+`output::JsonOutput` buffers all structured output into a `nlohmann::json` document and serializes it on `flush()` (called at program exit). Progress calls are ignored.
+
+### Silent
+
+`output::NoOutput` discards all output. All virtual methods are no-ops.
 
 ---
 
@@ -234,7 +393,7 @@ Human-readable, column-aligned. Use `wprintf` throughout for Unicode safety. Wid
 ### Privilege Check
 
 At startup, before any operation:
-1. Call `OpenProcessToken` + `GetTokenInformation(TokenElevation)` to verify the process is elevated.
+1. `OpenProcessToken` + `GetTokenInformation(TokenElevation)` — verify the process is elevated.
 2. If not elevated, print a clear error and exit with code 1:
    ```
    ERROR: retool requires Administrator privileges.
@@ -243,9 +402,9 @@ At startup, before any operation:
 
 ### Error Reporting
 
-- All errors include the Win32 error code and message (via `FormatMessageW`).
-- Default (best-effort): errors are collected in an `errors` list and printed as a block after the main output.
-- `--strict`: any error immediately prints and exits with code 2.
+- All errors include the Win32 error code and message via `FormatMessageW` (wrapped in `util::get_win32_error_message`).
+- Default (best-effort): errors collected and reported in finalization summary.
+- `--strict`: any error immediately exits with code 2.
 - Exit codes:
   - `0` — success
   - `1` — usage / privilege error
@@ -255,13 +414,21 @@ At startup, before any operation:
 
 ## Data Model
 
-Key structs in `src/model/`:
+Key types as implemented:
 
-| Struct | File | Description |
-|--------|------|-------------|
-| `VolumeInfo` | `VolumeInfo.h` | Cluster size, total clusters, volume path |
-| `VcnExtent` | `VcnExtent.h` | Single VCN→LCN extent (vcn, lcn, cluster count) |
-| `InspectResult` | `InspectResult.h` | All extents for one file + volume info + errors |
-| `CompareResult` | `CompareResult.h` | Multi-file compare output: share map, savings, errors |
-| `CopyResult` | `CopyResult.h` | Per-file copy outcome (cloned, fallback, skipped, error) |
-| `CliArg` | `CliArg.h` | Parsed command-line arguments |
+| Type | Location | Description |
+|------|----------|-------------|
+| `util::CliArg` | `src/util.h` | Parsed command-line arguments (command, positional, flags) |
+| `inspect::ScanMode` | `src/inspect.h` | Enum: `kLcnOnly` or `kWithHash` |
+| `inspect::BlockEntry` | `src/inspect.h` | File path + byte offset for one cluster reference |
+| `inspect::LcnIndex` | `src/inspect.h` | `unordered_map<LONGLONG, vector<BlockEntry>>` — LCN→file map |
+| `inspect::HashIndex` | `src/inspect.h` | `unordered_map<string, vector<LONGLONG>>` — SHA-256→LCN map |
+| `inspect::ScanResult` | `src/inspect.h` | Output of `build_lcn_index`: indexes, stats, errors |
+| `copy::CopyContext` | `src/copy.cpp` | Pipeline state: paths, volumes, strategy, lcn_map, hash_index, stats |
+| `copy::ICopyStrategy` | `src/copy.cpp` | Abstract interface: `copy_file(src, dest, args, context)` |
+| `copy::CopyStats` | `src/copy.cpp` | Accumulated totals: files, bytes, cloned, fallback, errors |
+| `dedup::DedupContext` | `src/dedup.cpp` | Pipeline state: volume, scan, strategy, candidates, stats |
+| `dedup::IDedupStrategy` | `src/dedup.cpp` | Abstract interface: `build_candidates(scan, context)` |
+| `dedup::DedupCandidate` | `src/dedup.cpp` | One cluster-level dedup operation: canonical+duplicate path/offset |
+| `dedup::DedupStats` | `src/dedup.cpp` | Accumulated totals: files, clusters, bytes, errors |
+| `output::IOutput` | `src/output.h` | Abstract output interface: status, field, table, progress, warn, error |
