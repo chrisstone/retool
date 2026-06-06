@@ -1,7 +1,6 @@
 # doc/ideas.md — retool Feature Backlog
 
-* [Structured Output (JSON/CSV)](#structured-output-jsoncss)
-* [Reverse LCN Map](#reverse-lcn-map-cross-volume-block-sharing-lookup)
+* [Reverse LCN Map](#reverse-lcn-map-volume-wide-block-sharing-lookup)
 * [FSCTL_QUERY_EXTENT_METADATA Integration](#fsctl_query_extent_metadata-integration)
 * [File List Input from stdin (Pipe Mode)](#file-list-input-from-stdin-pipe-mode)
 * [Volume-Wide Deduplication Scan](#volume-wide-deduplication-scan)
@@ -11,74 +10,7 @@
 
 ---
 
-### Structured Output (JSON/CSV)
-
-Offer machine-readable output formats for integration with PowerShell scripts, monitoring tools, and report pipelines.
-
-* **Objective**: Allow programmatic consumption of `inspect`, `volume`, and `copy` output without screen-scraping plain text. Enables workflows like: enumerate all backup files → inspect → parse JSON → compute savings report in PowerShell.
-* **Implementation**: Add `--json` and `--csv` flags to the CLI.
-  - For JSON support, integrate the header-only JSON library `github.com/nlohmann/json` (by adding it to the project, e.g., under `contrib/nlohmann/json.hpp` or fetched via CMake CPM/FetchContent).
-  - Implement serialization logic for `InspectResult`, `VolumeResult`, and `CopyResult` using the library's `to_json` bindings.
-  
-  **`inspect` single-file schema:**
-  ```json
-  {
-    "file": "C:\\Data\\backup.vbk",
-    "volume": "C:\\",
-    "cluster_size": 4096,
-    "extents": [
-      { "vcn": 0, "lcn": 1720064, "clusters": 128, "bytes": 524288 }
-    ],
-    "total_clusters": 384,
-    "total_bytes": 1572864,
-    "fragment_count": 3
-  }
-  ```
-
-  **`inspect` multi-file schema:**
-  ```json
-  {
-    "volume": "D:\\",
-    "cluster_size": 4096,
-    "files": [ "D:\\a.vbk", "D:\\b.vib" ],
-    "shared_clusters": 8192,
-    "shared_bytes": 33554432,
-    "savings_pct": 12.5,
-    "per_file": [
-      { "file": "D:\\a.vbk", "shared_with_count": 1, "shared_bytes": 16777216 }
-    ],
-    "errors": []
-  }
-  ```
-
-  **`volume` schema:**
-  ```json
-  {
-    "volume": "D:\\",
-    "filesystem": "ReFS",
-    "cluster_size": 4096,
-    "total_clusters": 2621440,
-    "total_bytes": 10737418240,
-    "free_bytes": 4509715660,
-    "used_bytes": 6227702580
-  }
-  ```
-
-  **`copy` schema:**
-  ```json
-  {
-    "total_files": 2,
-    "cloned_files": 1,
-    "fallback_files": 1,
-    "total_bytes": 102662437,
-    "errors": []
-  }
-  ```
-* **Effort Estimate**: Low (~1–2 days). The schemas are defined, and integration of the `nlohmann/json` header is straightforward using standard C++ serialization patterns.
-
----
-
-### Reverse LCN Map: Cross-Volume Block-Sharing Lookup
+### Reverse LCN Map: Volume-Wide Block-Sharing Lookup
 
 Enable `retool inspect` to report which *other* files on the volume share blocks with a
 target file, without the caller supplying all candidate files up front.

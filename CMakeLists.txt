@@ -43,6 +43,8 @@ add_executable(retool
     src/inspect.h
     src/copy.cpp
     src/copy.h
+    src/dedup.cpp
+    src/dedup.h
     src/output.cpp
     src/output.h
     src/volume.cpp

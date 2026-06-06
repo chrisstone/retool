@@ -11,11 +11,12 @@ namespace util {
 struct CliArg {
     std::wstring command;
     std::vector<std::wstring> positional;
-    bool strict = false;
-    bool dry_run = false;
-    bool recursive = false;
-    bool json = false;
-    bool quiet = false;
+    bool strict      = false;
+    bool dry_run     = false;
+    bool recursive   = false;
+    bool json        = false;
+    bool quiet       = false;
+    bool scan_dest   = false;   ///< Pre-scan destination volume to seed dedup index (--scan-dest).
     std::wstring input_file;
     std::wstring output_file;
 };

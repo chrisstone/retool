@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include "copy.h"
+#include "inspect.h"
 #include "output.h"
 #include "util.h"
 
@@ -148,6 +149,8 @@ struct CopyContext {
     // -- Populated during Phase 2: Operation --
     /// Map: source LCN -> {dest_file_path, dest_offset_in_bytes}
     std::unordered_map<LONGLONG, std::pair<std::wstring, ULONGLONG>> lcn_map;
+    /// Content hash index seeded by --scan-dest pre-scan (kWithHash); maps SHA-256 -> LCNs.
+    inspect::HashIndex hash_index;
     CopyStats stats;
     HandleCache handle_cache;
 
@@ -1142,6 +1145,38 @@ std::expected<CopyContext, std::wstring> inspect_and_prepare(const util::CliArg&
     return std::move(context);
 }
 
+/**
+ * @brief Pre-scans the destination volume and seeds the LCN/hash indexes.
+ *
+ * Called when --scan-dest is set and the strategy is CrossVolumeRefsCopyStrategy.
+ * Populates context.lcn_map and context.hash_index so that blocks already present
+ * on the destination can be cloned instead of physically copied.
+ *
+ * @param context The CopyContext with dest_volume_root and out set.
+ * @return true on success, or error string on failure.
+ */
+std::expected<bool, std::wstring> seed_from_dest_scan(CopyContext& context) {
+    context.out->status(L"[seed_from_dest_scan] Pre-scanning destination volume " +
+                        context.dest_volume_root + L" for deduplication...");
+
+    auto scan = inspect::build_lcn_index(
+        context.dest_volume_root, inspect::ScanMode::kWithHash, *context.out);
+    if (!scan) return std::unexpected(scan.error());
+
+    // Seed lcn_map: for each LCN with exactly one entry, record it as a clone source.
+    for (const auto& [lcn, entries] : scan->lcn_index) {
+        if (entries.empty()) continue;
+        // Use the first entry as the canonical clone source for this LCN.
+        context.lcn_map[lcn] = {entries[0].file_path, entries[0].file_offset};
+    }
+
+    context.hash_index = std::move(scan->hash_index);
+
+    context.out->status(L"[seed_from_dest_scan] Done. " +
+                        std::to_wstring(context.lcn_map.size()) + L" clusters seeded.");
+    return true;
+}
+
 // ============================================================================
 // Phase 2: Operation — Directory Recursion
 // ============================================================================
@@ -1282,6 +1317,15 @@ std::expected<int, std::wstring> execute_copy(const util::CliArg& args, output::
     if (!context) return std::unexpected(context.error());
 
     context->out = &out;
+
+    // Phase 1b: Optionally pre-scan destination to seed deduplication indexes
+    if (args.scan_dest && !context->same_volume && context->dest_is_refs) {
+        auto seed_ok = seed_from_dest_scan(*context);
+        if (!seed_ok) {
+            context->out->warn(L"Destination pre-scan failed: " + seed_ok.error() +
+                               L". Continuing without scan-dest seeding.");
+        }
+    }
 
     // Phase 2: Operation
     if (context->is_directory) {

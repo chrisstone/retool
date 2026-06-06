@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include "copy.h"
+#include "dedup.h"
 #include "inspect.h"
 #include "output.h"
 #include "util.h"
@@ -25,6 +26,7 @@ void print_general_help() {
                << L"Commands:\n"
                << L"  inspect (i)   Inspect block layout and deduplication stats\n"
                << L"  copy (cp)     Copy files preserving deduplication\n"
+               << L"  dedup (dd)    Deduplicate files in-place on a ReFS volume\n"
                << L"  volume (vol)  Show volume-level information and stats\n"
                << L"  help (h)      Show this help information\n"
                << L"  version       Show version information\n\n"
@@ -57,7 +59,19 @@ void print_command_help(const std::wstring& cmd) {
                    << L"  --json        Output in JSON format\n"
                    << L"  -q            Suppress all output\n"
                    << L"  --strict      Abort on first error (default: best-effort)\n"
-                   << L"  --dry-run     Simulate the copy operation without writing data" << std::endl;
+                   << L"  --dry-run     Simulate the copy operation without writing data\n"
+                   << L"  --scan-dest   Pre-scan destination volume to seed dedup index" << std::endl;
+    } else if (cmd == L"dedup" || cmd == L"dd") {
+        std::wcout << L"Usage: retool dedup <volume-root> [options]\n"
+                   << L"       retool dedup <file1> <file2> [options]\n\n"
+                   << L"Modes:\n"
+                   << L"  <volume-root>       Volume-wide deduplication scan (e.g. E:\\\\)\n"
+                   << L"  <file1> <file2>     Pair-wise deduplication of two files\n\n"
+                   << L"Options:\n"
+                   << L"  --dry-run     Simulate without writing\n"
+                   << L"  --strict      Abort on first error\n"
+                   << L"  --json        Output in JSON format\n"
+                   << L"  -q            Suppress all output" << std::endl;
     } else if (cmd == L"volume" || cmd == L"vol") {
         std::wcout << L"Usage: retool volume <drive-letter or path> [options]\n\n"
                    << L"Options:\n"
@@ -152,9 +166,10 @@ int wmain(int argc, wchar_t* argv[]) {
         out = std::make_unique<output::CliOutput>(args.output_file);
     }
 
-    // Register console control handler for long-running copy command
-    const bool is_copy = (args.command == L"copy" || args.command == L"cp");
-    if (is_copy) {
+    // Register console control handler for long-running copy/dedup commands
+    const bool is_copy  = (args.command == L"copy"  || args.command == L"cp");
+    const bool is_dedup = (args.command == L"dedup" || args.command == L"dd");
+    if (is_copy || is_dedup) {
         SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
     }
 
@@ -164,18 +179,20 @@ int wmain(int argc, wchar_t* argv[]) {
         run_res = inspect::execute_inspect(args, *out);
     } else if (args.command == L"copy" || args.command == L"cp") {
         run_res = copy::execute_copy(args, *out);
+    } else if (args.command == L"dedup" || args.command == L"dd") {
+        run_res = dedup::execute_dedup(args, *out);
     } else if (args.command == L"volume" || args.command == L"vol") {
         run_res = volume::execute_volume(args, *out);
     } else {
         std::wcerr << L"ERROR: Unknown command '" << args.command << L"'.\n" << std::endl;
         print_general_help();
-        if (is_copy) {
+        if (is_copy || is_dedup) {
             SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
         }
         return 1;
     }
 
-    if (is_copy) {
+    if (is_copy || is_dedup) {
         SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
     }
 

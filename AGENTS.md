@@ -36,10 +36,12 @@ The following skills are active for this project. **Read the referenced SKILL.md
 retool/
 ├── src/
 │   ├── main.cpp            # Entry point and CLI parsing
-│   ├── inspect.cpp         # Block layout inspection & dedup analysis
+│   ├── inspect.cpp         # Block layout inspection, volume scan engine & dedup analysis
 │   ├── inspect.h
 │   ├── copy.cpp            # Deduplication-preserving copy (block cloning)
 │   ├── copy.h
+│   ├── dedup.cpp           # In-place file deduplication (pair-wise and volume-wide)
+│   ├── dedup.h
 │   ├── output.cpp          # Polymorphic output (CLI, JSON, silent)
 │   ├── output.h
 │   ├── volume.cpp          # Volume-level statistics
@@ -60,8 +62,9 @@ retool/
 | Module | Responsibility |
 |-------|---------------|
 | `main.cpp` | CLI entry point, environment setup (e.g., elevation checks), command dispatching, outputter construction. |
-| `inspect` | Retrieval pointer queries (`FSCTL_GET_RETRIEVAL_POINTERS`), single-file extent dumps, cross-file deduplication mapping. |
-| `copy` | Directory tree recursion, block duplication (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`), fallback to standard copy, dry-run simulation. |
+| `inspect` | Retrieval pointer queries (`FSCTL_GET_RETRIEVAL_POINTERS`), single-file extent dumps, cross-file deduplication mapping, volume-wide LCN scan engine with optional SHA-256 hashing via Windows CNG. |
+| `copy` | Directory tree recursion, block duplication (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`), fallback to standard copy, dry-run simulation, optional destination pre-scan (`--scan-dest`). |
+| `dedup` | In-place deduplication: volume-wide (`VolumeWideDedupStrategy`) and pair-wise (`PairwiseDedupStrategy`) modes; uses `inspect::build_lcn_index` with `kWithHash` and issues `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. |
 | `output` | Polymorphic output abstraction (`IOutput` base): `NoOutput` (silent), `CliOutput` (console + progress bar), `JsonOutput` (nlohmann/json). |
 | `volume` | Volume information retrieval (cluster size, total clusters, free/used space). |
 | `util` | CLI argument parsing, wide/narrow string conversions, date/time formatting, memory sizing helpers. |
