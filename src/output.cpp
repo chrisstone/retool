@@ -49,12 +49,12 @@ void CliOutput::clear_progress_line() {
         // Clear the progress line on console (progress always goes to console)
         HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD written = 0;
-        // Overwrite with spaces and return to start
-        char blank[82];
-        std::memset(blank, ' ', 80);
+        // Overwrite with exactly as many spaces as the last line, then CR
+        size_t clear_len = last_line_len_ > 0 ? last_line_len_ : 80;
+        std::string blank(clear_len + 2, ' ');
         blank[0] = '\r';
-        blank[81] = '\r';
-        WriteConsoleA(console, blank, 82, &written, NULL);
+        blank[clear_len + 1] = '\r';
+        WriteConsoleA(console, blank.c_str(), static_cast<DWORD>(blank.size()), &written, NULL);
         progress_active_ = false;
         last_line_len_ = 0;
         last_progress_file_.clear();
@@ -266,10 +266,11 @@ JsonOutput::JsonOutput(const std::wstring& output_file)
 }
 
 nlohmann::ordered_json& JsonOutput::current() {
-    if (!section_stack_.empty()) {
-        return *section_stack_.back();
+    nlohmann::ordered_json* node = &root_;
+    for (const auto& key : section_keys_) {
+        node = &(*node)[key];
     }
-    return root_;
+    return *node;
 }
 
 void JsonOutput::status(const std::wstring& message) {
@@ -313,12 +314,12 @@ void JsonOutput::field(const std::wstring& name, const std::wstring& value) {
 void JsonOutput::begin_section(const std::wstring& name) {
     std::string key = to_narrow(name);
     current()[key] = nlohmann::ordered_json::object();
-    section_stack_.push_back(&current()[key]);
+    section_keys_.push_back(key);
 }
 
 void JsonOutput::end_section() {
-    if (!section_stack_.empty()) {
-        section_stack_.pop_back();
+    if (!section_keys_.empty()) {
+        section_keys_.pop_back();
     }
 }
 

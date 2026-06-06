@@ -168,7 +168,7 @@ struct JsonOutput : IOutput {
 
 private:
     nlohmann::ordered_json root_;                                ///< Top-level JSON object.
-    std::vector<nlohmann::ordered_json*> section_stack_;         ///< Stack of active sections.
+    std::vector<std::string> section_keys_;                       ///< Key path for nested sections.
     std::vector<std::wstring> table_columns_;                    ///< Current table column headers.
     std::string current_table_key_;                              ///< JSON key for the current table array.
     std::wstring output_file_;                                   ///< Optional output file path.

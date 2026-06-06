@@ -495,12 +495,8 @@ int finalize_and_report(const DedupContext& context, bool dry_run) {
     out.begin_section(section_name);
     out.field(L"Files Processed",    std::to_wstring(stats.files_processed));
     out.field(L"Clusters Deduped",   std::to_wstring(stats.clusters_deduped));
-    {
-        std::wostringstream ss;
-        double mb = stats.bytes_reclaimed / (1024.0 * 1024.0);
-        ss << std::fixed << std::setprecision(2) << mb << L" MB (" << stats.bytes_reclaimed << L" bytes)";
-        out.field(L"Space Reclaimed", ss.str());
-    }
+    out.field(L"Space Reclaimed", util::format_size(stats.bytes_reclaimed) +
+              L" (" + std::to_wstring(stats.bytes_reclaimed) + L" bytes)");
 
     for (const auto& err : stats.errors) {
         out.error(err);
