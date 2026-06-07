@@ -110,7 +110,7 @@ void CliOutput::end_table() {
     }
     for (const auto& row : table_rows_) {
         for (size_t c = 0; c < row.size() && c < ncols; ++c) {
-            widths[c] = std::max(widths[c], row[c].size());
+            widths[c] = (std::max)(widths[c], row[c].size());
         }
     }
 
