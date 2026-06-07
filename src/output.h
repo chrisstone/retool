@@ -140,6 +140,7 @@ private:
     bool progress_active_ = false;                                         ///< True if a progress line is on screen.
     size_t last_line_len_ = 0;                                             ///< Length of the last rendered progress line.
     std::vector<std::wstring> table_columns_;                              ///< Current table column headers.
+    std::vector<std::vector<std::wstring>> table_rows_;                    ///< Buffered rows; flushed by end_table.
 };
 
 /**

@@ -1013,13 +1013,15 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
         out.status(L"Inspecting " + std::to_wstring(target_paths.size()) + L" files...");
     }
 
-    for (const auto& path : target_paths) {
-        // Per-file status in multi-file mode
-        if (target_paths.size() > 1) {
-            std::wstring name = path;
-            size_t last_sep = name.find_last_of(L"\\/ ");
-            if (last_sep != std::wstring::npos) name = name.substr(last_sep + 1);
-            out.status(L"  \u2192 " + name);
+    const ULONGLONG total_files = static_cast<ULONGLONG>(target_paths.size());
+
+    for (ULONGLONG f_idx = 0; f_idx < total_files; ++f_idx) {
+        const std::wstring& path = target_paths[static_cast<size_t>(f_idx)];
+
+        // Drive the progress bar for multi-file mode.
+        // "scanning" is the fixed label shown in the progress display.
+        if (total_files > 1) {
+            out.progress(L"scanning", f_idx, total_files);
         }
 
         auto res = inspect_file(path);
@@ -1030,7 +1032,12 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
                                        L". Error: " + res.error);
             }
         }
-        results.push_back(res);
+        results.push_back(std::move(res));
+    }
+
+    // Complete the progress bar (clears the line before output begins)
+    if (total_files > 1) {
+        out.progress(L"scanning", total_files, total_files);
     }
 
     if (results.size() == 1) {

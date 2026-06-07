@@ -91,25 +91,57 @@ void CliOutput::end_section() {
 
 void CliOutput::begin_table(const std::vector<std::wstring>& columns) {
     table_columns_ = columns;
-    for (const auto& col : columns) {
-        out() << std::left << std::setw(15) << col;
-    }
-    out() << L"\n";
+    table_rows_.clear();
 }
 
 void CliOutput::table_row(const std::vector<std::wstring>& values) {
-    for (size_t i = 0; i < values.size(); ++i) {
-        if (i == values.size() - 1) {
-            out() << values[i];
-        } else {
-            out() << std::left << std::setw(15) << values[i];
-        }
-    }
-    out() << L"\n";
+    table_rows_.push_back(values);
 }
 
 void CliOutput::end_table() {
+    if (table_columns_.empty()) return;
+
+    const size_t ncols = table_columns_.size();
+
+    // ── Compute column widths: max of header and each row's cell ─────────────
+    std::vector<size_t> widths(ncols, 0);
+    for (size_t c = 0; c < ncols; ++c) {
+        widths[c] = table_columns_[c].size();
+    }
+    for (const auto& row : table_rows_) {
+        for (size_t c = 0; c < row.size() && c < ncols; ++c) {
+            widths[c] = std::max(widths[c], row[c].size());
+        }
+    }
+
+    // ── Print header ─────────────────────────────────────────────────────────
+    for (size_t c = 0; c < ncols; ++c) {
+        bool last = (c == ncols - 1);
+        out() << std::left << std::setw(last ? 0 : static_cast<int>(widths[c] + 2))
+              << table_columns_[c];
+    }
+    out() << L"\n";
+
+    // ── Print divider (one dash-run per column) ───────────────────────────────
+    for (size_t c = 0; c < ncols; ++c) {
+        bool last = (c == ncols - 1);
+        std::wstring div(widths[c], L'-');
+        out() << std::left << std::setw(last ? 0 : static_cast<int>(widths[c] + 2)) << div;
+    }
+    out() << L"\n";
+
+    // ── Print rows ───────────────────────────────────────────────────────────
+    for (const auto& row : table_rows_) {
+        for (size_t c = 0; c < ncols; ++c) {
+            bool last = (c == ncols - 1);
+            const std::wstring& cell = (c < row.size()) ? row[c] : L"";
+            out() << std::left << std::setw(last ? 0 : static_cast<int>(widths[c] + 2)) << cell;
+        }
+        out() << L"\n";
+    }
+
     table_columns_.clear();
+    table_rows_.clear();
 }
 
 /**
