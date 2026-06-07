@@ -1,4 +1,6 @@
 #include <expected>
+#include <fcntl.h>
+#include <io.h>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -40,7 +42,7 @@ void print_general_help() {
 
 /// @brief Prints a separator line between help blocks in 'help all' mode.
 static void print_help_separator() {
-    std::wcout << L"\n" << std::wstring(60, L'-') << L"\n\n";
+    std::wcout << L"\n------------------------------------------------------------\n\n";
 }
 
 /**
@@ -133,6 +135,11 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
  * @return int 0 on success, 1 on syntax or privilege error, 2 on operational error.
  */
 int wmain(int argc, wchar_t* argv[]) {
+    // Enable wide-character output mode so std::wcout works correctly when
+    // piped or redirected on Windows. Must be done before any wcout writes.
+    _setmode(_fileno(stdout), _O_U16TEXT);
+    _setmode(_fileno(stderr), _O_U16TEXT);
+
     // Parse arguments
     auto args_res = util::parse_arguments(argc, argv);
     if (!args_res) {
