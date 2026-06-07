@@ -104,6 +104,8 @@ void CliOutput::end_table() {
     const size_t ncols = table_columns_.size();
 
     // ── Compute column widths: max of header and each row's cell ─────────────
+    // Cap each non-last column at kMaxColWidth to prevent runaway filenames.
+    constexpr size_t kMaxColWidth = 40;
     std::vector<size_t> widths(ncols, 0);
     for (size_t c = 0; c < ncols; ++c) {
         widths[c] = table_columns_[c].size();
@@ -112,6 +114,9 @@ void CliOutput::end_table() {
         for (size_t c = 0; c < row.size() && c < ncols; ++c) {
             widths[c] = (std::max)(widths[c], row[c].size());
         }
+    }
+    for (size_t c = 0; c + 1 < ncols; ++c) {
+        widths[c] = (std::min)(widths[c], kMaxColWidth);
     }
 
     // ── Print header ─────────────────────────────────────────────────────────
@@ -130,11 +135,15 @@ void CliOutput::end_table() {
     }
     out() << L"\n";
 
-    // ── Print rows ───────────────────────────────────────────────────────────
+    // ── Print rows (truncate cells exceeding max width with ellipsis) ─────────
     for (const auto& row : table_rows_) {
         for (size_t c = 0; c < ncols; ++c) {
             bool last = (c == ncols - 1);
-            const std::wstring& cell = (c < row.size()) ? row[c] : L"";
+            const std::wstring& raw = (c < row.size()) ? row[c] : L"";
+            std::wstring cell = raw;
+            if (!last && cell.size() > kMaxColWidth) {
+                cell = cell.substr(0, kMaxColWidth - 3) + L"...";
+            }
             out() << std::left << std::setw(last ? 0 : static_cast<int>(widths[c] + 2)) << cell;
         }
         out() << L"\n";
@@ -306,8 +315,8 @@ nlohmann::ordered_json& JsonOutput::current() {
     return *node;
 }
 
-void JsonOutput::status(const std::wstring& message) {
-    current()["messages"].push_back(to_narrow(message));
+void JsonOutput::status(const std::wstring&) {
+    // Status messages (progress lines, phase labels) are not included in JSON output.
 }
 
 void JsonOutput::warn(const std::wstring& message) {
@@ -318,30 +327,101 @@ void JsonOutput::error(const std::wstring& message) {
     current()["errors"].push_back(to_narrow(message));
 }
 
+/**
+ * @brief Normalise a narrow string value for JSON storage.
+ *
+ * Applied rules (in priority order):
+ *  1. "human_label (N bytes)"   → integer N  (display-formatted size with raw bytes)
+ *  2. "N bytes"                 → integer N  (plain bytes string)
+ *  3. "human_label (N clusters)"→ integer N  (cluster count in parens)
+ *  4. "N clusters (human_size)" → integer N  (cluster count as first token)
+ *  5. Drive root "X:\"          → string "X:" (strip trailing path separator)
+ *  6. Pure integer              → integer
+ *  7. Pure double               → double
+ *  8. Anything else             → string as-is
+ */
+static nlohmann::ordered_json normalise_json_value(const std::string& val) {
+    // ── Pattern: "human_label (N bytes)" ─────────────────────────────────────
+    const std::string bytes_suffix = " bytes)";
+    if (val.size() > bytes_suffix.size() &&
+        val.compare(val.size() - bytes_suffix.size(), bytes_suffix.size(), bytes_suffix) == 0) {
+        size_t open = val.rfind('(', val.size() - bytes_suffix.size());
+        if (open != std::string::npos) {
+            std::string num = val.substr(open + 1, val.size() - bytes_suffix.size() - open - 1);
+            try {
+                size_t pos = 0;
+                long long bval = std::stoll(num, &pos);
+                if (pos == num.size()) return bval;
+            } catch (...) {}
+        }
+    }
+
+    // ── Pattern: "N bytes" ───────────────────────────────────────────────────
+    const std::string plain_bytes = " bytes";
+    if (val.size() > plain_bytes.size() &&
+        val.compare(val.size() - plain_bytes.size(), plain_bytes.size(), plain_bytes) == 0) {
+        std::string num = val.substr(0, val.size() - plain_bytes.size());
+        try {
+            size_t pos = 0;
+            long long bval = std::stoll(num, &pos);
+            if (pos == num.size()) return bval;
+        } catch (...) {}
+    }
+
+    // ── Pattern: "human_label (N clusters)" ──────────────────────────────────
+    const std::string clust_suffix = " clusters)";
+    if (val.size() > clust_suffix.size() &&
+        val.compare(val.size() - clust_suffix.size(), clust_suffix.size(), clust_suffix) == 0) {
+        size_t open = val.rfind('(', val.size() - clust_suffix.size());
+        if (open != std::string::npos) {
+            std::string num = val.substr(open + 1, val.size() - clust_suffix.size() - open - 1);
+            try {
+                size_t pos = 0;
+                long long cval = std::stoll(num, &pos);
+                if (pos == num.size()) return cval;
+            } catch (...) {}
+        }
+    }
+
+    // ── Pattern: "N clusters (human_size)" ───────────────────────────────────
+    // Starts with an integer followed by " clusters"
+    {
+        const std::string clust_prefix = " clusters";
+        size_t sp = val.find(clust_prefix);
+        if (sp != std::string::npos && sp > 0) {
+            std::string num = val.substr(0, sp);
+            try {
+                size_t pos = 0;
+                long long cval = std::stoll(num, &pos);
+                if (pos == num.size()) return cval;
+            } catch (...) {}
+        }
+    }
+
+    // ── Drive root: strip trailing \ or / (e.g. "A:\" → "A:") ────────────────
+    if (!val.empty() && (val.back() == '\\' || val.back() == '/')) {
+        return val.substr(0, val.size() - 1);
+    }
+
+    // ── Pure integer ─────────────────────────────────────────────────────────
+    try {
+        size_t pos = 0;
+        long long ival = std::stoll(val, &pos);
+        if (pos == val.size()) return ival;
+    } catch (...) {}
+
+    // ── Pure double ──────────────────────────────────────────────────────────
+    try {
+        size_t pos = 0;
+        double dval = std::stod(val, &pos);
+        if (pos == val.size()) return dval;
+    } catch (...) {}
+
+    return val;
+}
+
 void JsonOutput::field(const std::wstring& name, const std::wstring& value) {
-    std::string key = to_narrow(name);
-    std::string val = to_narrow(value);
-
-    // Attempt to parse value as number for cleaner JSON
-    try {
-        size_t pos = 0;
-        long long int_val = std::stoll(val, &pos);
-        if (pos == val.size()) {
-            current()[key] = int_val;
-            return;
-        }
-    } catch (...) {}
-
-    try {
-        size_t pos = 0;
-        double dbl_val = std::stod(val, &pos);
-        if (pos == val.size()) {
-            current()[key] = dbl_val;
-            return;
-        }
-    } catch (...) {}
-
-    current()[key] = val;
+    current()[to_narrow(name)] = normalise_json_value(to_narrow(value));
 }
 
 void JsonOutput::begin_section(const std::wstring& name) {
@@ -381,29 +461,8 @@ void JsonOutput::begin_table(const std::vector<std::wstring>& columns) {
 void JsonOutput::table_row(const std::vector<std::wstring>& values) {
     nlohmann::ordered_json row = nlohmann::ordered_json::object();
     for (size_t i = 0; i < values.size() && i < table_columns_.size(); ++i) {
-        std::string key = to_narrow(table_columns_[i]);
-        std::string val = to_narrow(values[i]);
-
-        // Attempt numeric parsing
-        try {
-            size_t pos = 0;
-            long long int_val = std::stoll(val, &pos);
-            if (pos == val.size()) {
-                row[key] = int_val;
-                continue;
-            }
-        } catch (...) {}
-
-        try {
-            size_t pos = 0;
-            double dbl_val = std::stod(val, &pos);
-            if (pos == val.size()) {
-                row[key] = dbl_val;
-                continue;
-            }
-        } catch (...) {}
-
-        row[key] = val;
+        row[to_narrow(table_columns_[i])] =
+            normalise_json_value(to_narrow(values[i]));
     }
     current()[current_table_key_].push_back(row);
 }

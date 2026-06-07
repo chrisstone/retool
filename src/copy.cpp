@@ -1465,7 +1465,8 @@ int finalize_and_report(CopyContext& context) {
     out.field(L"Total Files",     std::to_wstring(stats.total_files));
     out.field(L"Cloned Files",    std::to_wstring(stats.cloned_files));
     out.field(L"Fallback Copies", std::to_wstring(stats.fallback_files));
-    out.field(L"Total Bytes",     std::to_wstring(stats.total_bytes));
+    out.field(L"Total Bytes",     util::format_size(stats.total_bytes) +
+              L" (" + std::to_wstring(stats.total_bytes) + L" bytes)");
 
     for (const auto& err : stats.errors) {
         out.error(err);

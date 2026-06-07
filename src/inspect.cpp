@@ -715,7 +715,7 @@ void output_multi_file(
         size_t last_slash2 = path.find_last_of(L"\\/ ");
         std::wstring name2 = (last_slash2 != std::wstring::npos)
             ? path.substr(last_slash2 + 1) : path;
-        if (name2.size() > 24) name2 = name2.substr(0, 21) + L"...";
+        // Full filename is passed; CliOutput::end_table() truncates for display.
 
         std::unordered_set<LONGLONG> file_lcn_set;
         for (const auto& ext : res.extents) {
@@ -792,7 +792,7 @@ void output_multi_file(
             std::wstring path = results[i].path;
             size_t last_slash = path.find_last_of(L"\\/ ");
             std::wstring name = (last_slash != std::wstring::npos) ? path.substr(last_slash + 1) : path;
-            if (name.size() > 18) name = name.substr(0, 15) + L"...";
+            // Full filename is passed; CliOutput::end_table() truncates for display.
 
             std::vector<std::wstring> row;
             row.push_back(name);
@@ -843,7 +843,8 @@ void output_scan_report(const ScanResult& scan, output::IOutput& out) {
     out.field(L"Clusters Indexed", std::to_wstring(scan.clusters_indexed));
     out.field(L"Shared Blocks", util::format_size(shared_bytes) +
               L" (" + std::to_wstring(shared_clusters) + L" clusters)");
-    out.field(L"Dedup Savings", util::format_size(saved_bytes) + L" saved");
+    out.field(L"Dedup Savings", util::format_size(saved_bytes) +
+              L" (" + std::to_wstring(saved_bytes) + L" bytes)");
     {
         std::wostringstream ss;
         ss << std::fixed << std::setprecision(2) << savings_pct << L"%";
