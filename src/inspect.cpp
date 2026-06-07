@@ -678,33 +678,21 @@ void output_multi_file(
         ? (static_cast<double>(saved_bytes) / total_file_bytes) * 100.0
         : 0.0;
 
-    // ── Summary header (always shown) ────────────────────────────────────────
-    out.begin_section(L"inspect multi-file report");
-    out.field(L"Volume",         common_volume);
-    out.field(L"Cluster Size",   std::to_wstring(common_cluster_size) + L" bytes");
-    out.field(L"Files Analyzed", std::to_wstring(results.size()));
-    out.field(L"Total Size",     util::format_size(total_file_bytes) +
-              L" (" + std::to_wstring(total_file_bytes) + L" bytes)");
-    out.field(L"Shared Blocks",  util::format_size(shared_bytes) +
-              L" (" + std::to_wstring(shared_bytes) + L" bytes)");
-    out.field(L"Saved Space",    util::format_size(saved_bytes) +
-              L" (" + std::to_wstring(saved_bytes) + L" bytes)");
-    {
-        std::wostringstream ss;
-        ss << std::fixed << std::setprecision(2) << savings_pct << L"%";
-        out.field(L"Dedup Savings", ss.str());
-    }
-    out.end_section();
 
-    // ── Per-file unique / shared cluster breakdown (always shown) ────────────
-    out.begin_section(L"Per-File Cluster Breakdown");
-    out.begin_table({L"File", L"Total Clusters", L"Unique Clusters",
-                     L"Shared Clusters", L"Unique Bytes", L"Shared Bytes"});
-
+    // ── Phase 2b: per-file cluster breakdown ─────────────────────────────────
+    // Collect rows locally so no output is produced while the progress bar
+    // is still running. All IOutput calls are deferred until after the bar
+    // completes at 100%.
+    struct BreakdownRow {
+        std::wstring name;
+        ULONGLONG total_c  = 0;
+        ULONGLONG unique_c = 0;
+        ULONGLONG shared_c = 0;
+    };
+    std::vector<BreakdownRow> breakdown_rows;
     ULONGLONG grand_total = 0, grand_unique = 0, grand_shared = 0;
 
     for (size_t f_idx = 0; f_idx < results.size(); ++f_idx) {
-        // Phase 2b progress: per-file cluster breakdown (second half of analyzing bar)
         out.progress(L"analyzing",
                      static_cast<ULONGLONG>(results.size() + f_idx), analyze_total);
 
@@ -741,18 +729,46 @@ void output_multi_file(
         grand_unique += unique_c;
         grand_shared += shared_c;
 
-        out.table_row({
-            name2,
-            std::to_wstring(total_c),
-            std::to_wstring(unique_c),
-            std::to_wstring(shared_c),
-            util::format_size(unique_c * common_cluster_size),
-            util::format_size(shared_c * common_cluster_size)
-        });
+        breakdown_rows.push_back({name2, total_c, unique_c, shared_c});
     }
 
-    // Complete the analyzing bar — clears the progress line before tables print
+    // ── Complete the analyzing bar ────────────────────────────────────────────
+    // This clears the progress line. All output below begins on a clean line.
     out.progress(L"analyzing", analyze_total, analyze_total);
+
+    // ── Summary header ────────────────────────────────────────────────────────
+    out.begin_section(L"inspect multi-file report");
+    out.field(L"Volume",         common_volume);
+    out.field(L"Cluster Size",   std::to_wstring(common_cluster_size) + L" bytes");
+    out.field(L"Files Analyzed", std::to_wstring(results.size()));
+    out.field(L"Total Size",     util::format_size(total_file_bytes) +
+              L" (" + std::to_wstring(total_file_bytes) + L" bytes)");
+    out.field(L"Shared Blocks",  util::format_size(shared_bytes) +
+              L" (" + std::to_wstring(shared_bytes) + L" bytes)");
+    out.field(L"Saved Space",    util::format_size(saved_bytes) +
+              L" (" + std::to_wstring(saved_bytes) + L" bytes)");
+    {
+        std::wostringstream ss;
+        ss << std::fixed << std::setprecision(2) << savings_pct << L"%";
+        out.field(L"Dedup Savings", ss.str());
+    }
+    out.end_section();
+
+    // ── Per-file unique / shared cluster breakdown ────────────────────────────
+    out.begin_section(L"Per-File Cluster Breakdown");
+    out.begin_table({L"File", L"Total Clusters", L"Unique Clusters",
+                     L"Shared Clusters", L"Unique Bytes", L"Shared Bytes"});
+
+    for (const auto& row : breakdown_rows) {
+        out.table_row({
+            row.name,
+            std::to_wstring(row.total_c),
+            std::to_wstring(row.unique_c),
+            std::to_wstring(row.shared_c),
+            util::format_size(row.unique_c * common_cluster_size),
+            util::format_size(row.shared_c * common_cluster_size)
+        });
+    }
 
     out.table_row({
         L"[TOTAL]",
