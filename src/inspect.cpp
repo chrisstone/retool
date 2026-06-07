@@ -634,7 +634,12 @@ void output_multi_file(
     DWORD     common_cluster_size = 0;
     std::wstring common_volume;
 
+    const ULONGLONG analyze_total = static_cast<ULONGLONG>(results.size()) * 2;
+
     for (size_t f_idx = 0; f_idx < results.size(); ++f_idx) {
+        // Phase 2a progress: LCN index construction (first half of analyzing bar)
+        out.progress(L"analyzing", static_cast<ULONGLONG>(f_idx), analyze_total);
+
         const auto& res = results[f_idx];
         if (!res.error.empty()) continue;
 
@@ -699,6 +704,10 @@ void output_multi_file(
     ULONGLONG grand_total = 0, grand_unique = 0, grand_shared = 0;
 
     for (size_t f_idx = 0; f_idx < results.size(); ++f_idx) {
+        // Phase 2b progress: per-file cluster breakdown (second half of analyzing bar)
+        out.progress(L"analyzing",
+                     static_cast<ULONGLONG>(results.size() + f_idx), analyze_total);
+
         const auto& res = results[f_idx];
         if (!res.error.empty()) continue;
 
@@ -741,6 +750,9 @@ void output_multi_file(
             util::format_size(shared_c * common_cluster_size)
         });
     }
+
+    // Complete the analyzing bar — clears the progress line before tables print
+    out.progress(L"analyzing", analyze_total, analyze_total);
 
     out.table_row({
         L"[TOTAL]",
@@ -1018,10 +1030,9 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
     for (ULONGLONG f_idx = 0; f_idx < total_files; ++f_idx) {
         const std::wstring& path = target_paths[static_cast<size_t>(f_idx)];
 
-        // Drive the progress bar for multi-file mode.
-        // "scanning" is the fixed label shown in the progress display.
+        // Drive the reading progress bar (extent collection phase)
         if (total_files > 1) {
-            out.progress(L"scanning", f_idx, total_files);
+            out.progress(L"reading", f_idx, total_files);
         }
 
         auto res = inspect_file(path);
@@ -1035,9 +1046,9 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
         results.push_back(std::move(res));
     }
 
-    // Complete the progress bar (clears the line before output begins)
+    // Complete the reading bar before analysis begins
     if (total_files > 1) {
-        out.progress(L"scanning", total_files, total_files);
+        out.progress(L"reading", total_files, total_files);
     }
 
     if (results.size() == 1) {
