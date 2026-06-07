@@ -26,17 +26,23 @@ Inspect a file's physical block layout, compare sharing across multiple files, o
 ```
 retool inspect <file> [options]
 retool inspect <file1> <file2> ... [options]
+retool inspect <directory> [options]
+retool inspect <glob> [options]        (e.g. E:\Data\*.vbk)
 retool inspect -i <filelist.txt> [options]
 retool inspect <volume-root>
 ```
 
-**Single file:** Dumps all extents (VCN → LCN mappings), showing each fragment's virtual and logical cluster numbers, size, and offset within the file. Add `-r` to append a fragmentation report.
+**Single file:** Shows a summary (File, Volume, Cluster Size, File Size, Fragments). Add `-e` to include the full VCN → LCN extent table. Add `-r` to append a fragmentation report.
 
-**Multiple files:** Computes shared-block statistics across the set, reporting:
+**Multiple files / directory / glob:** Computes shared-block statistics across the set, reporting:
 - Which file pairs share blocks (cross-file sharing matrix)
+- Per-file breakdown of unique vs. shared clusters and bytes
 - Total shared data in bytes and MB
 - Estimated deduplication savings
-- Per-file fragment counts
+
+A **directory** argument recursively enumerates all non-system files under it.
+A **glob pattern** (e.g. `E:\Data\*.vbk`) expands to matching files non-recursively.
+Multiple arguments (mixed files, directories, globs) are each expanded independently and merged.
 
 Add `-r` to include a per-file fragmentation report after the sharing matrix.
 
@@ -47,6 +53,7 @@ Add `-r` to include a per-file fragmentation report after the sharing matrix.
 **Options:**
 | Flag | Description |
 |------|-------------|
+| `-e` | Show VCN/LCN extent table (single-file mode only; hidden by default) |
 | `-r` | Append a fragmentation report (fragment count, min/max/avg extent size, score) |
 | `-i <file>` | Read file paths from a newline-delimited input file |
 | `-o <file>` | Write output to a file instead of stdout |

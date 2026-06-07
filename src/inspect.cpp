@@ -481,13 +481,19 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
 
 /**
  * @brief Outputs the single-file inspect report via IOutput.
+ *
+ * @param res          The inspection result for the file.
+ * @param show_extents If true, emit the full VCN/LCN extent table.
+ *                     If false, emit only the summary fields.
  */
-void output_single_file(const FileInspectResult& res, output::IOutput& out) {
+void output_single_file(const FileInspectResult& res, output::IOutput& out, bool show_extents) {
     out.field(L"File",         res.path);
     out.field(L"Volume",       res.volume_root);
     out.field(L"Cluster Size", std::to_wstring(res.cluster_size) + L" bytes");
     out.field(L"File Size",    std::to_wstring(res.file_size) + L" bytes");
     out.field(L"Fragments",    std::to_wstring(res.extents.size()));
+
+    if (!show_extents) return;
 
     out.begin_table({L"Extent #", L"VCN", L"LCN", L"Clusters", L"Bytes", L"Cumulative"});
 
@@ -700,6 +706,76 @@ void output_multi_file(
     out.end_table();
     out.end_section();
 
+    // ── Per-file unique / shared cluster breakdown ───────────────────────────
+    out.begin_section(L"Per-File Cluster Breakdown");
+    out.begin_table({L"File", L"Total Clusters", L"Unique Clusters",
+                     L"Shared Clusters", L"Unique Bytes", L"Shared Bytes"});
+
+    ULONGLONG grand_total = 0, grand_unique = 0, grand_shared = 0;
+
+    for (size_t f_idx = 0; f_idx < results.size(); ++f_idx) {
+        const auto& res = results[f_idx];
+        if (!res.error.empty()) continue;
+
+        // Shorten display name
+        std::wstring path = res.path;
+        size_t last_slash2 = path.find_last_of(L"\\/");
+        std::wstring name2 = (last_slash2 != std::wstring::npos)
+            ? path.substr(last_slash2 + 1) : path;
+        if (name2.size() > 24) name2 = name2.substr(0, 21) + L"...";
+
+        // Count unique and shared clusters for this file
+        ULONGLONG total_c  = 0;
+        ULONGLONG unique_c = 0;
+        ULONGLONG shared_c = 0;
+
+        // Collect this file's LCNs into a set first (avoid double-counting
+        // within a single file's extents)
+        std::unordered_set<LONGLONG> file_lcn_set;
+        for (const auto& ext : res.extents) {
+            if (ext.lcn == (LONGLONG)-1) continue;
+            for (ULONGLONG off = 0; off < ext.cluster_count; ++off) {
+                file_lcn_set.insert(ext.lcn + static_cast<LONGLONG>(off));
+            }
+        }
+        total_c = file_lcn_set.size();
+
+        for (LONGLONG lcn : file_lcn_set) {
+            auto it = lcn_to_files.find(lcn);
+            if (it != lcn_to_files.end() && it->second.size() >= 2) {
+                ++shared_c;
+            } else {
+                ++unique_c;
+            }
+        }
+
+        grand_total  += total_c;
+        grand_unique += unique_c;
+        grand_shared += shared_c;
+
+        out.table_row({
+            name2,
+            std::to_wstring(total_c),
+            std::to_wstring(unique_c),
+            std::to_wstring(shared_c),
+            util::format_size(unique_c * common_cluster_size),
+            util::format_size(shared_c * common_cluster_size)
+        });
+    }
+
+    // Totals row
+    out.table_row({
+        L"[TOTAL]",
+        std::to_wstring(grand_total),
+        std::to_wstring(grand_unique),
+        std::to_wstring(grand_shared),
+        util::format_size(grand_unique * common_cluster_size),
+        util::format_size(grand_shared * common_cluster_size)
+    });
+
+    out.end_table();
+    out.end_section();
+
     for (const auto& err : errors) {
         out.error(err);
     }
@@ -777,34 +853,132 @@ bool is_volume_root(const std::wstring& path) {
     return false;
 }
 
+/**
+ * @brief Expands a single positional argument into a list of file paths.
+ *
+ * Handles four cases:
+ *  - Volume root (e.g. "E:\") → returned as-is in a single-element vector
+ *    (caller decides volume-scan vs. file mode).
+ *  - Plain directory (no wildcard, is a directory) → recursively enumerates
+ *    all files under it using enumerate_files_recursive.
+ *  - Glob pattern (contains '*' or '?') → expands non-recursively with
+ *    FindFirstFileW in the directory portion of the pattern.
+ *  - Ordinary file path → returned as-is in a single-element vector.
+ *
+ * @param arg    The raw positional argument string.
+ * @param errors Accumulates non-fatal error messages.
+ * @return Flat list of matching file paths.
+ */
+std::vector<std::wstring> expand_path_glob(
+    const std::wstring& arg,
+    std::vector<std::wstring>& errors
+) {
+    // Volume root: pass through unchanged so caller can handle volume scan
+    if (is_volume_root(arg)) {
+        return {arg};
+    }
+
+    bool has_wildcard = (arg.find(L'*') != std::wstring::npos ||
+                         arg.find(L'?') != std::wstring::npos);
+
+    // Plain directory (no wildcard): recursive enumeration
+    if (!has_wildcard) {
+        DWORD attrs = GetFileAttributesW(arg.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            std::wstring dir = arg;
+            if (dir.back() != L'\\' && dir.back() != L'/') dir += L'\\';
+            std::vector<std::wstring> files;
+            enumerate_files_recursive(dir, files, errors);
+            return files;
+        }
+        // Ordinary file
+        return {arg};
+    }
+
+    // Glob pattern: extract directory portion, enumerate with FindFirstFileW
+    std::wstring dir_part;
+    size_t last_sep = arg.find_last_of(L"\\/");
+    if (last_sep != std::wstring::npos) {
+        dir_part = arg.substr(0, last_sep + 1);
+    } else {
+        // No directory prefix — use current directory
+        wchar_t cwd[MAX_PATH];
+        if (GetCurrentDirectoryW(MAX_PATH, cwd)) {
+            dir_part = std::wstring(cwd) + L'\\';
+        }
+    }
+
+    std::vector<std::wstring> files;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(arg.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        if (err != ERROR_FILE_NOT_FOUND) {
+            errors.push_back(L"Glob expansion failed for '" + arg + L"': " +
+                             util::get_win32_error_message(err));
+        }
+        return files;
+    }
+    do {
+        std::wstring name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM)    continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        files.push_back(dir_part + name);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return files;
+}
+
 // ============================================================================
 // Entry Point
 // ============================================================================
 
 std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, output::IOutput& out) {
-    std::vector<std::wstring> target_paths = args.positional;
+    // ── Collect raw targets from positional args and optional -i file list ───
+    std::vector<std::wstring> raw_targets = args.positional;
 
     if (!args.input_file.empty()) {
         auto file_list_res = read_file_list(args.input_file);
         if (!file_list_res) return std::unexpected(file_list_res.error());
-        target_paths.insert(target_paths.end(), file_list_res->begin(), file_list_res->end());
+        raw_targets.insert(raw_targets.end(),
+                           file_list_res->begin(), file_list_res->end());
+    }
+
+    if (raw_targets.empty()) {
+        return std::unexpected(L"Error: No target files, directory, or volume specified for inspection.");
+    }
+
+    // ── Expand directories and glob patterns ─────────────────────────────────
+    // Each raw target is resolved to one or more concrete file paths (or a
+    // volume root, which is handled specially below).
+    std::vector<std::wstring> target_paths;
+    std::vector<std::wstring> expand_errors;
+
+    for (const auto& raw : raw_targets) {
+        auto expanded = expand_path_glob(raw, expand_errors);
+        target_paths.insert(target_paths.end(), expanded.begin(), expanded.end());
+    }
+
+    for (const auto& err : expand_errors) {
+        out.warn(err);
     }
 
     if (target_paths.empty()) {
-        return std::unexpected(L"Error: No target files or volume specified for inspection.");
+        return std::unexpected(L"Error: No files matched the specified path(s).");
     }
 
-    // Volume scan mode: single argument that is a volume root
+    // ── Volume scan mode: single volume-root argument ─────────────────────────
     if (target_paths.size() == 1 && is_volume_root(target_paths[0])) {
         ScanMode mode = ScanMode::kLcnOnly;
-        // --hash flag (if we add it to CliArg in future); for now: detect via any future flag
         auto scan_res = build_lcn_index(target_paths[0], mode, out);
         if (!scan_res) return std::unexpected(scan_res.error());
         output_scan_report(*scan_res, out);
         return 0;
     }
 
-    // Single or multi-file mode
+    // ── Single or multi-file mode ─────────────────────────────────────────────
     std::vector<FileInspectResult> results;
     std::vector<std::wstring> errors;
 
@@ -823,7 +997,7 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
     if (results.size() == 1) {
         const auto& res = results[0];
         if (!res.error.empty()) return std::unexpected(res.error);
-        output_single_file(res, out);
+        output_single_file(res, out, args.show_extents);
         if (args.recursive) {
             auto stat = compute_frag_stat(res);
             output_frag_report(res, stat, out);

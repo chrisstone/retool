@@ -27,7 +27,7 @@ Report the physical block layout of one or more files on a ReFS volume. When mul
 
 Invoked when exactly one file path is supplied (and it is not a volume root).
 
-**Goal:** Enumerate every extent (fragment) of the file and print each VCN→LCN mapping with size and cumulative offset.
+**Goal:** Enumerate every extent (fragment) of the file and print a summary. Add `-e` to include the full VCN→LCN extent table. Add `-r` to append a fragmentation report.
 
 **Win32 API Sequence:**
 
@@ -36,7 +36,17 @@ Invoked when exactly one file path is supplied (and it is not a volume root).
 3. `GetDiskFreeSpaceW` — obtain cluster size.
 4. Loop: `DeviceIoControl(FSCTL_GET_RETRIEVAL_POINTERS)` — iteratively query extents. Pass `STARTING_VCN_INPUT_BUFFER` starting at VCN 0; on each call the last `NextVcn` becomes the next starting VCN. Stop when the call returns `true` (all extents fit) or `ERROR_HANDLE_EOF` (sparse/small file).
 
-**Output per extent:**
+**Default output (summary only):**
+
+```
+File:         E:\Data\backup.vbk
+Volume:       E:\
+Cluster Size: 65536 bytes
+File Size:    104857600 bytes
+Fragments:    3
+```
+
+**With `-e` (extent table appended):**
 
 ```
 Extent #  VCN          LCN          Clusters    Bytes        Cumulative
@@ -47,9 +57,9 @@ Extent #  VCN          LCN          Clusters    Bytes        Cumulative
 
 ### Multi-File Mode
 
-Invoked when two or more file paths are supplied (directly on CLI or via `-i <filelist>`).
+Invoked when two or more file paths are supplied (directly on CLI, via a directory or glob argument, or via `-i <filelist>`).
 
-**Goal:** For each unique LCN present in more than one file, count how many files share it. Report cross-file sharing as a matrix and compute aggregate savings.
+**Goal:** For each unique LCN present in more than one file, count how many files share it. Report cross-file sharing as a matrix plus a per-file unique/shared cluster breakdown, and compute aggregate savings.
 
 **Algorithm:**
 
@@ -57,6 +67,7 @@ Invoked when two or more file paths are supplied (directly on CLI or via `-i <fi
 2. Build an `unordered_map<LONGLONG, vector<size_t>> lcn_to_files` — LCN → list of file indices that contain it.
 3. Scan the map: clusters with two or more file references are shared. Compute shared bytes and savings percentage.
 4. Build a per-file sharing matrix for tabular output.
+5. Compute per-file unique vs. shared cluster counts from the same `lcn_to_files` map.
 
 **Output (multi-file):**
 
@@ -70,6 +81,13 @@ Saved Space:   4.00 MB (4194304 bytes)
 Dedup Savings: 39.08%
 
 [Sharing matrix table: each cell shows MB shared between file pair Fx and Fy]
+
+── Per-File Cluster Breakdown ──
+
+File             Total Clusters  Unique Clusters  Shared Clusters  Unique Bytes  Shared Bytes
+backup.vbk       1600            800              800              50.00 MB      50.00 MB
+backup2.vbk      1600            800              800              50.00 MB      50.00 MB
+[TOTAL]          3200            1600             1600             100.00 MB     100.00 MB
 ```
 
 ### Volume Scan Mode
@@ -127,6 +145,19 @@ Savings %:        14.23%
 Content Groups:   8841       (kWithHash only)
 ```
 
+### Input Expansion
+
+Each positional argument is resolved before mode selection by `expand_path_glob()`:
+
+| Argument type | Behaviour |
+|---------------|-----------|
+| Volume root (e.g. `E:\`) | Passed through to volume scan mode |
+| Plain file path | Used as-is |
+| Plain directory (no wildcards) | Recursively enumerates all non-system files via `enumerate_files_recursive` |
+| Glob pattern (contains `*` or `?`) | Expanded non-recursively with `FindFirstFileW` in the pattern's directory portion |
+
+Multiple arguments are each expanded independently and merged. A glob matching zero files is silently skipped (non-fatal warning emitted).
+
 ### Input File (`-i <file>`)
 
 - One absolute path per line (UTF-8 or UTF-16 LE with BOM).
@@ -137,6 +168,7 @@ Content Groups:   8841       (kWithHash only)
 
 | Flag | Description |
 |------|-------------|
+| `-e` | Show VCN/LCN extent table (single-file mode only; suppressed by default) |
 | `-r` | Append a fragmentation report for each file (fragment count, min/max/avg extent, score) |
 | `-i <file>` | Read file paths from a newline-delimited input file |
 | `-o <file>` | Write output to a file instead of stdout |

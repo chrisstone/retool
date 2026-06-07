@@ -64,6 +64,8 @@ std::expected<CliArg, std::wstring> parse_arguments(int argc, wchar_t* argv[]) {
             }
         } else if (arg == L"--scan-dest") {
             args.scan_dest = true;
+        } else if (arg == L"-e") {
+            args.show_extents = true;
         } else if (arg.starts_with(L"-")) {
             return std::unexpected(L"Error: Unknown option '" + arg + L"'.");
         } else {

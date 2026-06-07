@@ -44,9 +44,16 @@ void print_general_help() {
  */
 void print_command_help(const std::wstring& cmd) {
     if (cmd == L"inspect" || cmd == L"i") {
-        std::wcout << L"Usage: retool inspect <file1> [file2 ...] [options]\n"
+        std::wcout << L"Usage: retool inspect <file1|dir|glob> [file2 ...] [options]\n"
                    << L"       retool inspect <volume-root> [options]\n\n"
+                   << L"Inputs:\n"
+                   << L"  <file>          Single file — summary and optional extent table (-e)\n"
+                   << L"  <file1> <file2> Multiple files — cross-file block sharing report\n"
+                   << L"  <dir>           Directory — recursively enumerates all files (multi-file mode)\n"
+                   << L"  <glob>          Glob pattern e.g. E:\\Data\\*.vbk (non-recursive, multi-file mode)\n"
+                   << L"  <volume-root>   Volume scan e.g. E:\\ (full LCN index with dedup summary)\n\n"
                    << L"Options:\n"
+                   << L"  -e            Show VCN/LCN extent table (single-file mode only)\n"
                    << L"  -r            Include fragmentation report (fragment count, min/max/avg extent)\n"
                    << L"  -i <file>     Read file paths from a newline-delimited file\n"
                    << L"  -o <file>     Redirect output to a file\n"
