@@ -1,12 +1,12 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    33_copy_cross_volume_scan_dest.ps1 — Test: retool copy <src> <dest> --scan-dest
+    33_copy_cross_volume_scan_dest.ps1 — Test: retool copy <src> <dest> -d
 
 .DESCRIPTION
     Pre-populates Drive B with a copy of the test file using a regular copy.
-    Then calls 'retool copy --scan-dest' to copy a second file from Drive A to Drive B.
-    Since the content already exists on Drive B, --scan-dest should find hash matches
+    Then calls 'retool copy -d' to copy a second file from Drive A to Drive B.
+    Since the content already exists on Drive B, -d should find hash matches
     and clone blocks rather than physically writing them.
 
     Verifies:
@@ -18,14 +18,14 @@
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: copy — cross-volume with --scan-dest (content-hash matching)" -ForegroundColor White
+Write-Host "TEST: copy — cross-volume with -d (content-hash matching)" -ForegroundColor White
 
 # ── Arrange ───────────────────────────────────────────────────────────────────
 Write-Section "Arrange"
 $drvA = $env:RETOOL_DRIVE_A -replace ':',''
 $drvB = $env:RETOOL_DRIVE_B -replace ':',''
 
-# Pre-seed Drive B with a copy of the test file so --scan-dest can find it
+# Pre-seed Drive B with a copy of the test file so -d can find it
 $seedFile = "${drvB}:\scan_dest_seed.bin"
 Copy-Item $env:RETOOL_TEST_FILE $seedFile -Force
 Assert-FileExists -Path $seedFile -Description "Seed file pre-copied to Drive B"
@@ -37,9 +37,9 @@ Remove-DriveFile -Path $dest
 Assert-FileExists -Path $src -Description "Source file on Drive A"
 
 # ── Act ───────────────────────────────────────────────────────────────────────
-Write-Section "Run: retool copy <src> <dest> --scan-dest"
-$out = Invoke-Retool -Args @('copy', $src, $dest, '--scan-dest')
-& $env:RETOOL_EXE copy $src $dest --scan-dest | Out-Null
+Write-Section "Run: retool copy <src> <dest> -d"
+$out = Invoke-Retool -Args @('copy', $src, $dest, '-d')
+& $env:RETOOL_EXE copy $src $dest -d | Out-Null
 $exitCode = $LASTEXITCODE
 
 # ── Assert ────────────────────────────────────────────────────────────────────

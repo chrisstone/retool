@@ -3,6 +3,7 @@
  * @brief Implementations of CliOutput and JsonOutput for formatted program output.
  */
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
@@ -329,7 +330,19 @@ void JsonOutput::begin_table(const std::vector<std::wstring>& columns) {
         table_columns_.push_back(col);
     }
 
-    current_table_key_ = "rows";
+    // Derive the JSON array key from the first column header.
+    // e.g. "Extent" -> "extent", "Total Clusters" -> "total_clusters"
+    if (!columns.empty()) {
+        std::string key = to_narrow(columns[0]);
+        for (char& c : key) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        std::replace(key.begin(), key.end(), ' ', '_');
+        current_table_key_ = key;
+    } else {
+        current_table_key_ = "rows";
+    }
+
     current()[current_table_key_] = nlohmann::ordered_json::array();
 }
 

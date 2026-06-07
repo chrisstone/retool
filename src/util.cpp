@@ -40,16 +40,20 @@ std::expected<CliArg, std::wstring> parse_arguments(int argc, wchar_t* argv[]) {
     for (int i = 2; i < argc; ++i) {
         std::wstring arg = argv[i];
 
-        if (arg == L"--strict") {
+        if (arg == L"-s") {
             args.strict = true;
-        } else if (arg == L"--dry-run") {
+        } else if (arg == L"-n") {
             args.dry_run = true;
-        } else if (arg == L"--json") {
+        } else if (arg == L"-j") {
             args.json = true;
         } else if (arg == L"-q") {
             args.quiet = true;
         } else if (arg == L"-r") {
             args.recursive = true;
+        } else if (arg == L"-e") {
+            args.show_extents = true;
+        } else if (arg == L"-d") {
+            args.scan_dest = true;
         } else if (arg == L"-i") {
             if (i + 1 < argc) {
                 args.input_file = argv[++i];
@@ -62,10 +66,6 @@ std::expected<CliArg, std::wstring> parse_arguments(int argc, wchar_t* argv[]) {
             } else {
                 return std::unexpected(L"Error: -o option requires a file path argument.");
             }
-        } else if (arg == L"--scan-dest") {
-            args.scan_dest = true;
-        } else if (arg == L"-e") {
-            args.show_extents = true;
         } else if (arg.starts_with(L"-")) {
             return std::unexpected(L"Error: Unknown option '" + arg + L"'.");
         } else {

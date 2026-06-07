@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    43_dedup_pairwise_dry_run.ps1 — Test: retool dedup <file1> <file2> --dry-run
+    43_dedup_pairwise_dry_run.ps1 — Test: retool dedup <file1> <file2> -n
 
 .DESCRIPTION
     Pair-wise dedup dry run — verifies no data is written and summary is reported.
@@ -24,9 +24,9 @@ Assert-FileExists -Path $fileB -Description "fileB copied"
 $freeBefore = (Get-PSDrive -Name $drv).Free
 
 # ── Act ───────────────────────────────────────────────────────────────────────
-Write-Section "Run: retool dedup <file1> <file2> --dry-run"
-$out = Invoke-Retool -Args @('dedup', $fileA, $fileB, '--dry-run')
-& $env:RETOOL_EXE dedup $fileA $fileB --dry-run | Out-Null
+Write-Section "Run: retool dedup <file1> <file2> -n"
+$out = Invoke-Retool -Args @('dedup', $fileA, $fileB, '-n')
+& $env:RETOOL_EXE dedup $fileA $fileB -n | Out-Null
 $exitCode = $LASTEXITCODE
 
 # ── Assert ────────────────────────────────────────────────────────────────────

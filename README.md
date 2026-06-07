@@ -57,8 +57,8 @@ Add `-r` to include a per-file fragmentation report after the sharing matrix.
 | `-r` | Append a fragmentation report (fragment count, min/max/avg extent size, score) |
 | `-i <file>` | Read file paths from a newline-delimited input file |
 | `-o <file>` | Write output to a file instead of stdout |
-| `--strict` | Abort on first error (default: best-effort with error summary) |
-| `--json` | Output results in JSON format |
+| `-s` | Abort on first error (default: best-effort with error summary) |
+| `-j` | Output results in JSON format |
 | `-q` | Suppress all output (quiet mode) |
 
 ---
@@ -76,7 +76,7 @@ retool copy <source-dir> <dest-dir> -r [options]
 
 **Cross-volume copies** (ReFS → ReFS, matching cluster size) preserve deduplication by tracking which source logical cluster numbers (LCNs) have already been copied to the destination and issuing `FSCTL_DUPLICATE_EXTENTS_TO_FILE` for duplicate blocks, rather than copying bytes twice.
 
-**`--scan-dest`** pre-scans the destination volume before copying begins. Blocks already present on the destination (matched by SHA-256 content hash) are cloned instead of physically transferred, maximizing space savings when copying into a volume that already holds related data.
+**`-d`** pre-scans the destination volume before copying begins. Blocks already present on the destination (matched by SHA-256 content hash) are cloned instead of physically transferred, maximizing space savings when copying into a volume that already holds related data.
 
 For incompatible volumes (non-ReFS destination, cluster size mismatch), retool falls back to a standard copy with a clear warning.
 
@@ -84,15 +84,15 @@ For incompatible volumes (non-ReFS destination, cluster size mismatch), retool f
 | Flag | Description |
 |------|-------------|
 | `-r` | Recursive directory copy |
-| `--dry-run` | Simulate the operation without writing any data |
-| `--scan-dest` | Pre-scan destination volume to seed the dedup block index |
-| `--strict` | Abort on first error (default: best-effort, errors reported at end) |
-| `--json` | Output results in JSON format |
+| `-n` | Simulate the operation without writing any data |
+| `-d` | Pre-scan destination volume to seed the dedup block index |
+| `-s` | Abort on first error (default: best-effort, errors reported at end) |
+| `-j` | Output results in JSON format |
 | `-q` | Suppress all output |
 | `-o <file>` | Redirect output to a file |
 
 > [!NOTE]
-> `--scan-dest` performs a full volume hash scan before copying begins. On large volumes this adds significant setup time but can substantially reduce the data physically written.
+> `-d` performs a full volume hash scan before copying begins. On large volumes this adds significant setup time but can substantially reduce the data physically written.
 
 ---
 
@@ -109,14 +109,14 @@ retool dedup <file1> <file2>
 
 **Pair-wise mode:** Compares two explicitly named files and deduplicates only the clusters they share.
 
-Both modes support `--dry-run` to report what would be reclaimed without making any changes.
+Both modes support `-n` to report what would be reclaimed without making any changes.
 
 **Options:**
 | Flag | Description |
 |------|-------------|
-| `--dry-run` | Report dedup savings without writing any data |
-| `--strict` | Abort on first error |
-| `--json` | Output results in JSON format |
+| `-n` | Report dedup savings without writing any data |
+| `-s` | Abort on first error |
+| `-j` | Output results in JSON format |
 | `-q` | Suppress all output |
 
 > [!IMPORTANT]

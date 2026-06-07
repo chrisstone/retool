@@ -482,40 +482,51 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
 /**
  * @brief Outputs the single-file inspect report via IOutput.
  *
+ * The output is wrapped in a named section so that JSON output produces
+ * a clean nested object rather than polluting the root.
+ *
  * @param res          The inspection result for the file.
  * @param show_extents If true, emit the full VCN/LCN extent table.
  *                     If false, emit only the summary fields.
  */
 void output_single_file(const FileInspectResult& res, output::IOutput& out, bool show_extents) {
+    // Use the bare filename as the section name for a clean JSON key.
+    std::wstring section_name = res.path;
+    size_t last_sep = section_name.find_last_of(L"\\/ ");
+    if (last_sep != std::wstring::npos) section_name = section_name.substr(last_sep + 1);
+
+    out.begin_section(section_name);
     out.field(L"File",         res.path);
     out.field(L"Volume",       res.volume_root);
     out.field(L"Cluster Size", std::to_wstring(res.cluster_size) + L" bytes");
     out.field(L"File Size",    std::to_wstring(res.file_size) + L" bytes");
     out.field(L"Fragments",    std::to_wstring(res.extents.size()));
 
-    if (!show_extents) return;
+    if (show_extents) {
+        out.begin_table({L"Extent", L"VCN", L"LCN", L"Clusters", L"Bytes", L"Cumulative"});
 
-    out.begin_table({L"Extent #", L"VCN", L"LCN", L"Clusters", L"Bytes", L"Cumulative"});
+        ULONGLONG cumulative_bytes = 0;
+        for (size_t i = 0; i < res.extents.size(); ++i) {
+            const auto& ext = res.extents[i];
+            ULONGLONG bytes = ext.cluster_count * res.cluster_size;
+            cumulative_bytes += bytes;
 
-    ULONGLONG cumulative_bytes = 0;
-    for (size_t i = 0; i < res.extents.size(); ++i) {
-        const auto& ext = res.extents[i];
-        ULONGLONG bytes = ext.cluster_count * res.cluster_size;
-        cumulative_bytes += bytes;
+            std::wstring lcn_str = ext.lcn == (LONGLONG)-1 ? L"SPARSE" : std::to_wstring(ext.lcn);
 
-        std::wstring lcn_str = ext.lcn == (LONGLONG)-1 ? L"SPARSE" : std::to_wstring(ext.lcn);
+            out.table_row({
+                std::to_wstring(i),
+                std::to_wstring(ext.start_vcn),
+                lcn_str,
+                std::to_wstring(ext.cluster_count),
+                std::to_wstring(bytes),
+                std::to_wstring(cumulative_bytes)
+            });
+        }
 
-        out.table_row({
-            std::to_wstring(i),
-            std::to_wstring(ext.start_vcn),
-            lcn_str,
-            std::to_wstring(ext.cluster_count),
-            std::to_wstring(bytes),
-            std::to_wstring(cumulative_bytes)
-        });
+        out.end_table();
     }
 
-    out.end_table();
+    out.end_section();
 }
 
 /**
@@ -598,14 +609,28 @@ void output_frag_report(const FileInspectResult& res, const FragStat& stat, outp
 
 /**
  * @brief Outputs the multi-file inspect report via IOutput.
+ *
+ * Default (show_extended = false): emits the aggregate summary fields and the
+ * per-file unique/shared cluster breakdown table only — no cross-file sharing
+ * matrix and no per-cluster correlation detail.
+ *
+ * Extended (show_extended = true, -e flag): additionally emits the cross-file
+ * sharing matrix section showing how many bytes each file pair shares.
+ *
+ * @param results       One FileInspectResult per input file.
+ * @param errors        Non-fatal error strings accumulated during inspection.
+ * @param out           The output interface.
+ * @param show_extended Whether to include the extended sharing matrix.
  */
 void output_multi_file(
     const std::vector<FileInspectResult>& results,
     const std::vector<std::wstring>& errors,
-    output::IOutput& out
+    output::IOutput& out,
+    bool show_extended
 ) {
+    // ── Build LCN → file index ────────────────────────────────────────────────
     std::unordered_map<LONGLONG, std::vector<size_t>> lcn_to_files;
-    ULONGLONG total_file_bytes   = 0;
+    ULONGLONG total_file_bytes    = 0;
     DWORD     common_cluster_size = 0;
     std::wstring common_volume;
 
@@ -648,65 +673,25 @@ void output_multi_file(
         ? (static_cast<double>(saved_bytes) / total_file_bytes) * 100.0
         : 0.0;
 
-    out.begin_section(L"retool inspect multi-file report");
+    // ── Summary header (always shown) ────────────────────────────────────────
+    out.begin_section(L"inspect multi-file report");
     out.field(L"Volume",         common_volume);
     out.field(L"Cluster Size",   std::to_wstring(common_cluster_size) + L" bytes");
     out.field(L"Files Analyzed", std::to_wstring(results.size()));
-
-    out.field(L"Total Sizes", util::format_size(total_file_bytes) +
+    out.field(L"Total Size",     util::format_size(total_file_bytes) +
               L" (" + std::to_wstring(total_file_bytes) + L" bytes)");
-    out.field(L"Shared Blocks", util::format_size(shared_bytes) +
+    out.field(L"Shared Blocks",  util::format_size(shared_bytes) +
               L" (" + std::to_wstring(shared_bytes) + L" bytes)");
-    out.field(L"Saved Space", util::format_size(saved_bytes) +
+    out.field(L"Saved Space",    util::format_size(saved_bytes) +
               L" (" + std::to_wstring(saved_bytes) + L" bytes)");
     {
         std::wostringstream ss;
         ss << std::fixed << std::setprecision(2) << savings_pct << L"%";
         out.field(L"Dedup Savings", ss.str());
     }
-
-    // Sharing matrix
-    std::vector<std::vector<ULONGLONG>> shared_matrix(
-        results.size(), std::vector<ULONGLONG>(results.size(), 0));
-    for (const auto& [lcn, files] : lcn_to_files) {
-        if (files.size() < 2) continue;
-        for (size_t i = 0; i < files.size(); ++i) {
-            for (size_t j = i + 1; j < files.size(); ++j) {
-                shared_matrix[files[i]][files[j]]++;
-                shared_matrix[files[j]][files[i]]++;
-            }
-        }
-    }
-
-    std::vector<std::wstring> columns;
-    columns.push_back(L"File");
-    for (size_t j = 0; j < results.size(); ++j) {
-        columns.push_back(L"F" + std::to_wstring(j));
-    }
-
-    out.begin_table(columns);
-    for (size_t i = 0; i < results.size(); ++i) {
-        std::wstring path = results[i].path;
-        size_t last_slash = path.find_last_of(L"\\/");
-        std::wstring name = (last_slash != std::wstring::npos) ? path.substr(last_slash + 1) : path;
-        if (name.size() > 18) name = name.substr(0, 15) + L"...";
-
-        std::vector<std::wstring> row;
-        row.push_back(name);
-        for (size_t j = 0; j < results.size(); ++j) {
-            if (i == j) {
-                row.push_back(L"-");
-            } else {
-                row.push_back(util::format_size(shared_matrix[i][j] * common_cluster_size));
-            }
-        }
-        out.table_row(row);
-    }
-
-    out.end_table();
     out.end_section();
 
-    // ── Per-file unique / shared cluster breakdown ───────────────────────────
+    // ── Per-file unique / shared cluster breakdown (always shown) ────────────
     out.begin_section(L"Per-File Cluster Breakdown");
     out.begin_table({L"File", L"Total Clusters", L"Unique Clusters",
                      L"Shared Clusters", L"Unique Bytes", L"Shared Bytes"});
@@ -717,20 +702,12 @@ void output_multi_file(
         const auto& res = results[f_idx];
         if (!res.error.empty()) continue;
 
-        // Shorten display name
         std::wstring path = res.path;
-        size_t last_slash2 = path.find_last_of(L"\\/");
+        size_t last_slash2 = path.find_last_of(L"\\/ ");
         std::wstring name2 = (last_slash2 != std::wstring::npos)
             ? path.substr(last_slash2 + 1) : path;
         if (name2.size() > 24) name2 = name2.substr(0, 21) + L"...";
 
-        // Count unique and shared clusters for this file
-        ULONGLONG total_c  = 0;
-        ULONGLONG unique_c = 0;
-        ULONGLONG shared_c = 0;
-
-        // Collect this file's LCNs into a set first (avoid double-counting
-        // within a single file's extents)
         std::unordered_set<LONGLONG> file_lcn_set;
         for (const auto& ext : res.extents) {
             if (ext.lcn == (LONGLONG)-1) continue;
@@ -738,7 +715,9 @@ void output_multi_file(
                 file_lcn_set.insert(ext.lcn + static_cast<LONGLONG>(off));
             }
         }
-        total_c = file_lcn_set.size();
+        ULONGLONG total_c  = file_lcn_set.size();
+        ULONGLONG unique_c = 0;
+        ULONGLONG shared_c = 0;
 
         for (LONGLONG lcn : file_lcn_set) {
             auto it = lcn_to_files.find(lcn);
@@ -763,7 +742,6 @@ void output_multi_file(
         });
     }
 
-    // Totals row
     out.table_row({
         L"[TOTAL]",
         std::to_wstring(grand_total),
@@ -775,6 +753,49 @@ void output_multi_file(
 
     out.end_table();
     out.end_section();
+
+    // ── Extended: sharing matrix (only with -e) ───────────────────────────────
+    if (show_extended) {
+        std::vector<std::vector<ULONGLONG>> shared_matrix(
+            results.size(), std::vector<ULONGLONG>(results.size(), 0));
+        for (const auto& [lcn, files] : lcn_to_files) {
+            if (files.size() < 2) continue;
+            for (size_t i = 0; i < files.size(); ++i) {
+                for (size_t j = i + 1; j < files.size(); ++j) {
+                    shared_matrix[files[i]][files[j]]++;
+                    shared_matrix[files[j]][files[i]]++;
+                }
+            }
+        }
+
+        std::vector<std::wstring> columns;
+        columns.push_back(L"File");
+        for (size_t j = 0; j < results.size(); ++j) {
+            columns.push_back(L"F" + std::to_wstring(j));
+        }
+
+        out.begin_section(L"Sharing Matrix");
+        out.begin_table(columns);
+        for (size_t i = 0; i < results.size(); ++i) {
+            std::wstring path = results[i].path;
+            size_t last_slash = path.find_last_of(L"\\/ ");
+            std::wstring name = (last_slash != std::wstring::npos) ? path.substr(last_slash + 1) : path;
+            if (name.size() > 18) name = name.substr(0, 15) + L"...";
+
+            std::vector<std::wstring> row;
+            row.push_back(name);
+            for (size_t j = 0; j < results.size(); ++j) {
+                if (i == j) {
+                    row.push_back(L"-");
+                } else {
+                    row.push_back(util::format_size(shared_matrix[i][j] * common_cluster_size));
+                }
+            }
+            out.table_row(row);
+        }
+        out.end_table();
+        out.end_section();
+    }
 
     for (const auto& err : errors) {
         out.error(err);
@@ -951,8 +972,6 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
     }
 
     // ── Expand directories and glob patterns ─────────────────────────────────
-    // Each raw target is resolved to one or more concrete file paths (or a
-    // volume root, which is handled specially below).
     std::vector<std::wstring> target_paths;
     std::vector<std::wstring> expand_errors;
 
@@ -982,7 +1001,27 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
     std::vector<FileInspectResult> results;
     std::vector<std::wstring> errors;
 
+    if (target_paths.size() == 1) {
+        // Single-file: emit a brief status then inspect
+        const std::wstring& path = target_paths[0];
+        std::wstring name = path;
+        size_t last_sep = name.find_last_of(L"\\/ ");
+        if (last_sep != std::wstring::npos) name = name.substr(last_sep + 1);
+        out.status(L"Inspecting: " + name);
+    } else {
+        // Multi-file: announce the count up-front, then log each file
+        out.status(L"Inspecting " + std::to_wstring(target_paths.size()) + L" files...");
+    }
+
     for (const auto& path : target_paths) {
+        // Per-file status in multi-file mode
+        if (target_paths.size() > 1) {
+            std::wstring name = path;
+            size_t last_sep = name.find_last_of(L"\\/ ");
+            if (last_sep != std::wstring::npos) name = name.substr(last_sep + 1);
+            out.status(L"  \u2192 " + name);
+        }
+
         auto res = inspect_file(path);
         if (!res.error.empty()) {
             errors.push_back(path + L": " + res.error);
@@ -1003,7 +1042,7 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
             output_frag_report(res, stat, out);
         }
     } else {
-        output_multi_file(results, errors, out);
+        output_multi_file(results, errors, out, args.show_extents);
         if (args.recursive) {
             for (const auto& res : results) {
                 if (!res.error.empty()) continue;

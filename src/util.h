@@ -11,13 +11,13 @@ namespace util {
 struct CliArg {
     std::wstring command;
     std::vector<std::wstring> positional;
-    bool strict        = false;
-    bool dry_run       = false;
-    bool recursive     = false;
-    bool json          = false;
-    bool quiet         = false;
-    bool scan_dest     = false;   ///< Pre-scan destination volume to seed dedup index (--scan-dest).
-    bool show_extents  = false;   ///< Show VCN/LCN extent table in single-file inspect output (-e).
+    bool strict        = false;   ///< Abort on first error (-s).
+    bool dry_run       = false;   ///< Simulate without writing (-n).
+    bool recursive     = false;   ///< Recursive directory operation (-r).
+    bool json          = false;   ///< JSON output mode (-j).
+    bool quiet         = false;   ///< Suppress all output (-q).
+    bool scan_dest     = false;   ///< Pre-scan destination volume to seed dedup index (-d).
+    bool show_extents  = false;   ///< Extended mode: extent table / sharing matrix (-e).
     std::wstring input_file;
     std::wstring output_file;
 };

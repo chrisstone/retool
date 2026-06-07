@@ -162,7 +162,7 @@ Multiple arguments are each expanded independently and merged. A glob matching z
 
 - One absolute path per line (UTF-8 or UTF-16 LE with BOM).
 - Blank lines and lines starting with `#` are ignored.
-- Paths are validated before processing begins; invalid paths are reported and skipped (default best-effort) or abort (with `--strict`).
+- Paths are validated before processing begins; invalid paths are reported and skipped (default best-effort) or abort (with `-s`).
 
 ### Options
 
@@ -172,8 +172,8 @@ Multiple arguments are each expanded independently and merged. A glob matching z
 | `-r` | Append a fragmentation report for each file (fragment count, min/max/avg extent, score) |
 | `-i <file>` | Read file paths from a newline-delimited input file |
 | `-o <file>` | Write output to a file instead of stdout |
-| `--strict` | Abort on first error (default: best-effort with error summary) |
-| `--json` | Output results in JSON format |
+| `-s` | Abort on first error (default: best-effort with error summary) |
+| `-j` | Output results in JSON format |
 | `-q` | Suppress all output |
 
 ### Fragmentation Report (`-r`)
@@ -250,9 +250,9 @@ For each extent of each source file, processes clusters in runs:
 
 Progress is reported per-cluster run via `IOutput::progress()`.
 
-### Destination Pre-Scan (`--scan-dest`)
+### Destination Pre-Scan (`-d`)
 
-When `--scan-dest` is passed and the strategy is `CrossVolumeRefsCopyStrategy`, an additional **Phase 1b** runs before any file is copied:
+When `-d` is passed and the strategy is `CrossVolumeRefsCopyStrategy`, an additional **Phase 1b** runs before any file is copied:
 
 1. Calls `inspect::build_lcn_index(dest_volume_root, kWithHash, out)`.
 2. Seeds `CopyContext::lcn_map` from the resulting `LcnIndex` — each destination LCN is recorded as a pre-existing clone source.
@@ -260,7 +260,7 @@ When `--scan-dest` is passed and the strategy is `CrossVolumeRefsCopyStrategy`, 
 
 This allows blocks already physically present on the destination (from a prior copy or dedup operation) to be cloned rather than re-transferred.
 
-> **Performance note:** `--scan-dest` reads every cluster on the destination volume to compute SHA-256 hashes. On large volumes this adds significant setup time. Use when the destination already holds substantial overlapping data.
+> **Performance note:** `-d` reads every cluster on the destination volume to compute SHA-256 hashes. On large volumes this adds significant setup time. Use when the destination already holds substantial overlapping data.
 
 ### Fallback Copy (`FallbackCopyStrategy`)
 
@@ -271,7 +271,7 @@ Uses `CopyFileExW` with a progress callback forwarded to `IOutput::progress()`. 
 - Walk source with `FindFirstFileW` / `FindNextFileW`.
 - Mirror directory structure at destination using `CreateDirectoryW`.
 - Skip `FILE_ATTRIBUTE_SYSTEM` entries.
-- Best-effort by default — errors recorded in `CopyStats::errors`, reported in finalization. `--strict` aborts on first error.
+- Best-effort by default — errors recorded in `CopyStats::errors`, reported in finalization. `-s` aborts on first error.
 
 ### Cancellation
 
@@ -282,10 +282,10 @@ A global `std::atomic<bool> copy::g_cancel_requested` is checked at every copy-l
 | Flag | Description |
 |------|-------------|
 | `-r` | Recursive directory copy |
-| `--dry-run` | Simulate without writing |
-| `--scan-dest` | Pre-scan destination volume to seed the dedup block index |
-| `--strict` | Abort on first error |
-| `--json` | Output results in JSON format |
+| `-n` | Simulate without writing |
+| `-d` | Pre-scan destination volume to seed the dedup block index |
+| `-s` | Abort on first error |
+| `-j` | Output results in JSON format |
 | `-q` | Suppress all output |
 | `-o <file>` | Redirect output to a file |
 
@@ -333,7 +333,7 @@ For each `DedupCandidate`:
 1. Opens the canonical file read-only and the duplicate file read/write (handles cached across candidates to avoid per-cluster `CreateFileW` overhead).
 2. Issues `DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)` with `ByteCount = cluster_size`.
 3. Respects `g_cancel_requested` for cooperative Ctrl+C cancellation.
-4. In `--dry-run` mode: increments stats counters without issuing the ioctl.
+4. In `-n` mode: increments stats counters without issuing the ioctl.
 
 ### DedupCandidate Structure
 
@@ -359,9 +359,9 @@ Space Reclaimed:  512.00 MB (536870912 bytes)
 
 | Flag | Description |
 |------|-------------|
-| `--dry-run` | Report savings without writing |
-| `--strict` | Abort on first error |
-| `--json` | Output results in JSON format |
+| `-n` | Report savings without writing |
+| `-s` | Abort on first error |
+| `-j` | Output results in JSON format |
 | `-q` | Suppress all output |
 
 > [!IMPORTANT]
@@ -416,7 +416,7 @@ retool <command> [options] [arguments]
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Output in JSON format (uses nlohmann/json) |
+| `-j` | Output in JSON format (uses nlohmann/json) |
 | `-q` | Suppress all output (quiet/silent mode) |
 | `-o <file>` | Redirect output to a file |
 
@@ -424,7 +424,7 @@ retool <command> [options] [arguments]
 
 Implemented in `src/util.cpp` (`util::parse_arguments`). Uses the wide-character `argv[]` array from `wmain`. No third-party CLI library. Rules:
 - Short flags: single `-` + single character (e.g., `-r`, `-i`, `-q`).
-- Long flags: double `--` + word (e.g., `--strict`, `--dry-run`, `--scan-dest`).
+- Long flags: double `--` + word (e.g., `-s`, `-n`, `-d`).
 - Unknown flags: print a clear error and exit with code 1.
 
 ---
@@ -467,7 +467,7 @@ At startup, before any operation:
 
 - All errors include the Win32 error code and message via `FormatMessageW` (wrapped in `util::get_win32_error_message`).
 - Default (best-effort): errors collected and reported in finalization summary.
-- `--strict`: any error immediately exits with code 2.
+- `-s`: any error immediately exits with code 2.
 - Exit codes:
   - `0` — success
   - `1` — usage / privilege error

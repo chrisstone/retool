@@ -1,12 +1,12 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    40_dedup_volume_dry_run.ps1 — Test: retool dedup <volume> --dry-run
+    40_dedup_volume_dry_run.ps1 — Test: retool dedup <volume> -n
 
 .DESCRIPTION
     Copies the test file twice to Drive A (creating two physically distinct files
     with identical content — they will have different LCNs until dedup runs).
-    Then runs 'retool dedup <volume> --dry-run'.
+    Then runs 'retool dedup <volume> -n'.
 
     KEY SCENARIO: Because Drive A is only 1 GB and ReFS overhead is significant,
     copying the file twice nearly fills the disk.  The dry-run reports potential
@@ -37,9 +37,9 @@ $freeBefore = (Get-PSDrive -Name $drv).Free
 Write-Host "    Free before dry-run: $([math]::Round($freeBefore/1MB,1)) MB" -ForegroundColor DarkGray
 
 # ── Act ───────────────────────────────────────────────────────────────────────
-Write-Section "Run: retool dedup $env:RETOOL_DRIVE_A --dry-run"
-$out = Invoke-Retool -Args @('dedup', $env:RETOOL_DRIVE_A, '--dry-run')
-& $env:RETOOL_EXE dedup $env:RETOOL_DRIVE_A --dry-run | Out-Null
+Write-Section "Run: retool dedup $env:RETOOL_DRIVE_A -n"
+$out = Invoke-Retool -Args @('dedup', $env:RETOOL_DRIVE_A, '-n')
+& $env:RETOOL_EXE dedup $env:RETOOL_DRIVE_A -n | Out-Null
 $exitCode = $LASTEXITCODE
 
 # ── Assert ────────────────────────────────────────────────────────────────────

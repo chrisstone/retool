@@ -31,45 +31,57 @@ void print_general_help() {
                << L"  help (h)      Show this help information\n"
                << L"  version       Show version information\n\n"
                << L"Global Options:\n"
-               << L"  --json        Output in JSON format\n"
+               << L"  -j            Output in JSON format\n"
                << L"  -q            Suppress all output (quiet mode)\n"
                << L"  -o <file>     Redirect output to a file\n\n"
-               << L"Use 'retool help <command>' for command-specific options." << std::endl;
+               << L"Use 'retool help <command>' for command-specific options.\n"
+               << L"Use 'retool help all' to print help for every command." << std::endl;
+}
+
+/// @brief Prints a separator line between help blocks in 'help all' mode.
+static void print_help_separator() {
+    std::wcout << L"\n" << std::wstring(60, L'-') << L"\n\n";
 }
 
 /**
  * @brief Prints command-specific usage instructions for the given command name.
- * 
- * @param cmd The command name or alias (e.g. "inspect", "copy", "volume").
+ *
+ * @param cmd The command name or alias (e.g. "inspect", "copy", "volume", "all").
  */
 void print_command_help(const std::wstring& cmd) {
+
+    // ── Global options footer appended to every command help ─────────────────
+    auto print_global = []() {
+        std::wcout << L"\nGlobal Options:\n"
+                   << L"  -j            Output in JSON format\n"
+                   << L"  -q            Suppress all output\n"
+                   << L"  -o <file>     Redirect output to a file\n";
+    };
+
     if (cmd == L"inspect" || cmd == L"i") {
-        std::wcout << L"Usage: retool inspect <file1|dir|glob> [file2 ...] [options]\n"
+        std::wcout << L"Usage: retool inspect <file|dir|glob> [file2 ...] [options]\n"
                    << L"       retool inspect <volume-root> [options]\n\n"
                    << L"Inputs:\n"
-                   << L"  <file>          Single file — summary and optional extent table (-e)\n"
-                   << L"  <file1> <file2> Multiple files — cross-file block sharing report\n"
-                   << L"  <dir>           Directory — recursively enumerates all files (multi-file mode)\n"
-                   << L"  <glob>          Glob pattern e.g. E:\\Data\\*.vbk (non-recursive, multi-file mode)\n"
-                   << L"  <volume-root>   Volume scan e.g. E:\\ (full LCN index with dedup summary)\n\n"
+                   << L"  <file>          Single file  — 5-field summary; add -e for extent table\n"
+                   << L"  <file1> <file2> Multiple files — per-file cluster sharing report\n"
+                   << L"  <dir>           Directory — recursively enumerates all files\n"
+                   << L"  <glob>          Glob pattern e.g. E:\\Data\\*.vbk (non-recursive)\n"
+                   << L"  <volume-root>   Volume scan e.g. E:\\ — full LCN index\n\n"
                    << L"Options:\n"
-                   << L"  -e            Show VCN/LCN extent table (single-file mode only)\n"
-                   << L"  -r            Include fragmentation report (fragment count, min/max/avg extent)\n"
-                   << L"  -i <file>     Read file paths from a newline-delimited file\n"
-                   << L"  -o <file>     Redirect output to a file\n"
-                   << L"  --json        Output in JSON format\n"
-                   << L"  -q            Suppress all output\n"
-                   << L"  --strict      Abort on first error (default: best-effort)" << std::endl;
+                   << L"  -e            Extended mode: extent table (single-file) or sharing\n"
+                   << L"                matrix (multi-file); per-file cluster table always shown\n"
+                   << L"  -r            Fragmentation report (fragment count, min/max/avg extent)\n"
+                   << L"  -s            Strict: abort on first error (default: best-effort)\n"
+                   << L"  -i <file>     Read file paths from a newline-delimited file\n";
+        print_global();
     } else if (cmd == L"copy" || cmd == L"cp") {
         std::wcout << L"Usage: retool copy <src> <dest> [options]\n\n"
                    << L"Options:\n"
                    << L"  -r            Recursive directory copy\n"
-                   << L"  -o <file>     Redirect output to a file\n"
-                   << L"  --json        Output in JSON format\n"
-                   << L"  -q            Suppress all output\n"
-                   << L"  --strict      Abort on first error (default: best-effort)\n"
-                   << L"  --dry-run     Simulate the copy operation without writing data\n"
-                   << L"  --scan-dest   Pre-scan destination volume to seed dedup index" << std::endl;
+                   << L"  -n            Dry run: simulate without writing\n"
+                   << L"  -d            Pre-scan destination volume to seed dedup index\n"
+                   << L"  -s            Strict: abort on first error (default: best-effort)\n";
+        print_global();
     } else if (cmd == L"dedup" || cmd == L"dd") {
         std::wcout << L"Usage: retool dedup <volume-root> [options]\n"
                    << L"       retool dedup <file1> <file2> [options]\n\n"
@@ -77,16 +89,21 @@ void print_command_help(const std::wstring& cmd) {
                    << L"  <volume-root>       Volume-wide deduplication scan (e.g. E:\\\\)\n"
                    << L"  <file1> <file2>     Pair-wise deduplication of two files\n\n"
                    << L"Options:\n"
-                   << L"  --dry-run     Simulate without writing\n"
-                   << L"  --strict      Abort on first error\n"
-                   << L"  --json        Output in JSON format\n"
-                   << L"  -q            Suppress all output" << std::endl;
+                   << L"  -n            Dry run: simulate without writing\n"
+                   << L"  -s            Strict: abort on first error\n";
+        print_global();
     } else if (cmd == L"volume" || cmd == L"vol") {
         std::wcout << L"Usage: retool volume <drive-letter or path> [options]\n\n"
-                   << L"Options:\n"
-                   << L"  -o <file>     Redirect output to a file\n"
-                   << L"  --json        Output in JSON format\n"
-                   << L"  -q            Suppress all output" << std::endl;
+                   << L"Options:\n";
+        print_global();
+    } else if (cmd == L"all") {
+        // Print every command's help separated by dividers
+        const std::wstring cmds[] = {L"inspect", L"copy", L"dedup", L"volume"};
+        for (const auto& c : cmds) {
+            print_command_help(c);
+            print_help_separator();
+        }
+        return;
     } else {
         print_general_help();
     }

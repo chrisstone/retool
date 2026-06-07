@@ -43,9 +43,9 @@ Assert-OutputContains -Output ($out -join "`n") -Substring '4096' -Description "
 
 # ── JSON output variant ───────────────────────────────────────────────────────
 Write-Section "Drive A — JSON output"
-$jsonOut = Invoke-Retool -Args @('volume', $env:RETOOL_DRIVE_A, '--json')
-& $env:RETOOL_EXE volume $env:RETOOL_DRIVE_A --json | Out-Null
-Assert-ExitCode -Expected 0 -Actual $LASTEXITCODE -Description "retool volume --json exits 0"
+$jsonOut = Invoke-Retool -Args @('volume', $env:RETOOL_DRIVE_A, '-j')
+& $env:RETOOL_EXE volume $env:RETOOL_DRIVE_A -j | Out-Null
+Assert-ExitCode -Expected 0 -Actual $LASTEXITCODE -Description "retool volume -j exits 0"
 $json = $jsonOut -join "`n" | ConvertFrom-Json -ErrorAction SilentlyContinue
 Assert-NotEmpty -Value $json -Description "JSON output parses successfully"
 
