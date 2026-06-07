@@ -194,7 +194,8 @@ int wmain(int argc, wchar_t* argv[]) {
     if (args.quiet) {
         out = std::make_unique<output::NoOutput>();
     } else if (args.json) {
-        out = std::make_unique<output::JsonOutput>(args.output_file);
+        out = std::make_unique<output::JsonOutput>(args.command, args.output_file);
+
     } else {
         out = std::make_unique<output::CliOutput>(args.output_file);
     }

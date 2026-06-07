@@ -1022,6 +1022,7 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
         ScanMode mode = ScanMode::kLcnOnly;
         auto scan_res = build_lcn_index(target_paths[0], mode, out);
         if (!scan_res) return std::unexpected(scan_res.error());
+        out.set_command(L"inspect_scan");
         output_scan_report(*scan_res, out);
         return 0;
     }
@@ -1071,12 +1072,14 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
     if (results.size() == 1) {
         const auto& res = results[0];
         if (!res.error.empty()) return std::unexpected(res.error);
+        out.set_command(L"inspect");
         output_single_file(res, out, args.show_extents);
         if (args.recursive) {
             auto stat = compute_frag_stat(res);
             output_frag_report(res, stat, out);
         }
     } else {
+        out.set_command(L"inspect_multi");
         output_multi_file(results, errors, out, args.show_extents);
         if (args.recursive) {
             for (const auto& res : results) {

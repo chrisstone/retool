@@ -72,6 +72,14 @@ struct IOutput {
 
     /// @brief Finalize output. JSON serializes here; CLI may print a trailing newline.
     virtual void flush() = 0;
+
+    /**
+     * @brief Override the command name recorded in JSON output.
+     *
+     * Called by command modules to specialise the envelope's "command" field
+     * (e.g., "inspect_multi", "inspect_scan"). Default is a no-op.
+     */
+    virtual void set_command(const std::wstring&) {}
 };
 
 // ============================================================================
@@ -95,6 +103,7 @@ struct NoOutput : IOutput {
     void end_table() override {}
     void progress(const std::wstring&, ULONGLONG, ULONGLONG) override {}
     void flush() override {}
+    void set_command(const std::wstring&) override {}
 };
 
 /**
@@ -121,6 +130,10 @@ struct CliOutput : IOutput {
     void end_table() override;
     void progress(const std::wstring& filename, ULONGLONG current, ULONGLONG total) override;
     void flush() override;
+
+    /// @brief No-op: CLI output has no command envelope.
+    void set_command(const std::wstring&) override {}
+
 
 private:
     /// @brief Renders the 20-character progress bar string from a percentage.
@@ -153,7 +166,14 @@ private:
  *                     this file instead of stdout.
  */
 struct JsonOutput : IOutput {
-    explicit JsonOutput(const std::wstring& output_file = L"");
+    /**
+     * @param command     The command name written into the JSON envelope
+     *                    (e.g., L"inspect", L"copy", L"dedup", L"volume").
+     * @param output_file Optional file path. If non-empty, JSON is written to
+     *                    this file instead of stdout.
+     */
+    explicit JsonOutput(const std::wstring& command,
+                        const std::wstring& output_file = L"");
 
     void status(const std::wstring& message) override;
     void warn(const std::wstring& message) override;
@@ -167,14 +187,21 @@ struct JsonOutput : IOutput {
     void progress(const std::wstring& filename, ULONGLONG current, ULONGLONG total) override;
     void flush() override;
 
+    /// @brief Override the command field in the JSON envelope at runtime.
+    void set_command(const std::wstring& command) override;
+
 private:
-    nlohmann::ordered_json root_;                                ///< Top-level JSON object.
-    std::vector<std::string> section_keys_;                       ///< Key path for nested sections.
+    nlohmann::ordered_json root_;                                ///< Top-level JSON envelope.
+    std::vector<std::string> section_keys_;                      ///< Key path for nested sections within data.
     std::vector<std::wstring> table_columns_;                    ///< Current table column headers.
     std::string current_table_key_;                              ///< JSON key for the current table array.
+    std::string current_section_name_;                           ///< Display name of the innermost active section.
     std::wstring output_file_;                                   ///< Optional output file path.
+    std::string command_;                                        ///< Command name for the envelope.
+    int section_depth_ = 0;                                      ///< Nesting depth of begin_section calls.
+    bool has_error_    = false;                                  ///< True if error() was called.
 
-    /// @brief Returns the currently active JSON object (section or root).
+    /// @brief Returns the currently active JSON object (data or nested sub-object).
     nlohmann::ordered_json& current();
 };
 

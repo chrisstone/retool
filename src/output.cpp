@@ -303,42 +303,135 @@ static std::string to_narrow(const std::wstring& ws) {
     return util::to_string(ws);
 }
 
-JsonOutput::JsonOutput(const std::wstring& output_file)
-    : output_file_(output_file) {
-}
+// ── Static name mappings ──────────────────────────────────────────────────────
 
-nlohmann::ordered_json& JsonOutput::current() {
-    nlohmann::ordered_json* node = &root_;
-    for (const auto& key : section_keys_) {
-        node = &(*node)[key];
+#include <unordered_map>
+
+/**
+ * @brief Maps human-readable display field/column names to camelCase JSON keys.
+ *
+ * All field names emitted by all commands are listed here.  Unknown names fall
+ * through to the auto-camelCase converter in to_json_key().
+ */
+static const std::unordered_map<std::string, std::string> kFieldNameMap = {
+    // Common
+    {"Volume",           "volume"},
+    {"Cluster Size",     "clusterSize"},
+    {"File System",      "fileSystem"},
+    // Single-file inspect
+    {"File",             "filePath"},
+    {"File Size",        "fileSizeBytes"},
+    {"Fragments",        "fragments"},
+    // Multi-file inspect summary
+    {"Files Analyzed",   "filesAnalyzed"},
+    {"Total Size",       "totalSizeBytes"},
+    {"Shared Blocks",    "sharedBlocksBytes"},
+    {"Saved Space",      "savedSpaceBytes"},
+    {"Dedup Savings",    "dedupSavingsPct"},
+    // Per-file breakdown table columns
+    {"Total Clusters",   "totalClusters"},
+    {"Unique Clusters",  "uniqueClusters"},
+    {"Shared Clusters",  "sharedClusters"},
+    {"Unique Bytes",     "uniqueBytes"},
+    {"Shared Bytes",     "sharedBytes"},
+    // Extent table columns
+    {"Extent",           "extentIndex"},
+    {"VCN",              "vcn"},
+    {"LCN",              "lcn"},
+    {"Clusters",         "clusters"},
+    {"Bytes",            "bytes"},
+    {"Cumulative",       "cumulativeBytes"},
+    // Volume command
+    {"Total Space",      "totalSpaceBytes"},
+    {"Free Space",       "freeSpaceBytes"},
+    {"Used Space",       "usedSpaceBytes"},
+    // Fragmentation report
+    {"Frag Score",       "fragScore"},
+    {"Smallest Extent",  "smallestExtentClusters"},
+    {"Largest Extent",   "largestExtentClusters"},
+    {"Avg Extent",       "avgExtentClusters"},
+    // Volume scan report
+    {"Files Scanned",    "filesScanned"},
+    {"Clusters Indexed", "clustersIndexed"},
+    {"Content Groups",   "contentGroups"},
+    {"Savings %",        "savingsPct"},
+    // Dedup
+    {"Files Processed",  "filesProcessed"},
+    {"Clusters Deduped", "clustersDeduplicated"},
+    {"Space Reclaimed",  "spaceReclaimedBytes"},
+    // Copy
+    {"Total Files",      "totalFiles"},
+    {"Cloned Files",     "clonedFiles"},
+    {"Fallback Copies",  "fallbackCopies"},
+    {"Total Bytes",      "totalBytes"},
+};
+
+/**
+ * @brief Converts a display field name to its camelCase JSON key.
+ *
+ * Looks up kFieldNameMap first; falls back to auto-camelCase conversion
+ * (space-separated title → camelCase) for names not listed.
+ */
+static std::string to_json_key(const std::string& name) {
+    auto it = kFieldNameMap.find(name);
+    if (it != kFieldNameMap.end()) return it->second;
+    // Auto-convert: "Some Field" -> "someField"
+    std::string key;
+    bool next_upper = false;
+    for (size_t i = 0; i < name.size(); ++i) {
+        char c = name[i];
+        if (c == ' ' || c == '_' || c == '-') { next_upper = true; continue; }
+        if (key.empty()) {
+            key += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        } else if (next_upper) {
+            key += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            next_upper = false;
+        } else {
+            key += c;
+        }
     }
-    return *node;
-}
-
-void JsonOutput::status(const std::wstring&) {
-    // Status messages (progress lines, phase labels) are not included in JSON output.
-}
-
-void JsonOutput::warn(const std::wstring& message) {
-    current()["warnings"].push_back(to_narrow(message));
-}
-
-void JsonOutput::error(const std::wstring& message) {
-    current()["errors"].push_back(to_narrow(message));
+    return key.empty() ? name : key;
 }
 
 /**
- * @brief Normalise a narrow string value for JSON storage.
+ * @brief Determines the JSON array key for a table given its first column
+ *        and the enclosing section name.
+ *
+ * Uses an explicit map for known tables; falls back to auto-camelCase + "s".
+ */
+static std::string get_table_array_key(const std::string& first_col,
+                                        const std::string& section_name) {
+    // Sharing matrix and per-file breakdown both have "File" as first column;
+    // distinguish by section name.
+    if (first_col == "File" &&
+        section_name.find("Sharing") != std::string::npos) {
+        return "sharingMatrix";
+    }
+    static const std::unordered_map<std::string, std::string> kArrayKeys = {
+        {"File",   "files"},
+        {"Extent", "extents"},
+    };
+    auto it = kArrayKeys.find(first_col);
+    if (it != kArrayKeys.end()) return it->second;
+    // Fallback: auto-camelCase the first column name + pluralise.
+    return to_json_key(first_col) + "s";
+}
+
+// ── Value normalisation ───────────────────────────────────────────────────────
+
+/**
+ * @brief Normalise a display string value to its most precise JSON type.
  *
  * Applied rules (in priority order):
- *  1. "human_label (N bytes)"   → integer N  (display-formatted size with raw bytes)
- *  2. "N bytes"                 → integer N  (plain bytes string)
- *  3. "human_label (N clusters)"→ integer N  (cluster count in parens)
- *  4. "N clusters (human_size)" → integer N  (cluster count as first token)
- *  5. Drive root "X:\"          → string "X:" (strip trailing path separator)
- *  6. Pure integer              → integer
- *  7. Pure double               → double
- *  8. Anything else             → string as-is
+ *  1. "human_label (N bytes)"    -> integer N
+ *  2. "N bytes"                  -> integer N
+ *  3. "human_label (N clusters)" -> integer N
+ *  4. "N clusters (...)"         -> integer or double N
+ *  5. "N%"                       -> double  N   (percentage, strip %)
+ *  6. Drive root "X:\"           -> string "X:" (strip trailing separator)
+ *  7. Pure integer               -> integer
+ *  8. Pure double                -> double
+ *  9. Anything else              -> string as-is
  */
 static nlohmann::ordered_json normalise_json_value(const std::string& val) {
     // ── Pattern: "human_label (N bytes)" ─────────────────────────────────────
@@ -348,11 +441,8 @@ static nlohmann::ordered_json normalise_json_value(const std::string& val) {
         size_t open = val.rfind('(', val.size() - bytes_suffix.size());
         if (open != std::string::npos) {
             std::string num = val.substr(open + 1, val.size() - bytes_suffix.size() - open - 1);
-            try {
-                size_t pos = 0;
-                long long bval = std::stoll(num, &pos);
-                if (pos == num.size()) return bval;
-            } catch (...) {}
+            try { size_t pos = 0; long long bval = std::stoll(num, &pos);
+                  if (pos == num.size()) return bval; } catch (...) {}
         }
     }
 
@@ -361,11 +451,8 @@ static nlohmann::ordered_json normalise_json_value(const std::string& val) {
     if (val.size() > plain_bytes.size() &&
         val.compare(val.size() - plain_bytes.size(), plain_bytes.size(), plain_bytes) == 0) {
         std::string num = val.substr(0, val.size() - plain_bytes.size());
-        try {
-            size_t pos = 0;
-            long long bval = std::stoll(num, &pos);
-            if (pos == num.size()) return bval;
-        } catch (...) {}
+        try { size_t pos = 0; long long bval = std::stoll(num, &pos);
+              if (pos == num.size()) return bval; } catch (...) {}
     }
 
     // ── Pattern: "human_label (N clusters)" ──────────────────────────────────
@@ -375,64 +462,112 @@ static nlohmann::ordered_json normalise_json_value(const std::string& val) {
         size_t open = val.rfind('(', val.size() - clust_suffix.size());
         if (open != std::string::npos) {
             std::string num = val.substr(open + 1, val.size() - clust_suffix.size() - open - 1);
-            try {
-                size_t pos = 0;
-                long long cval = std::stoll(num, &pos);
-                if (pos == num.size()) return cval;
-            } catch (...) {}
+            try { size_t pos = 0; long long cval = std::stoll(num, &pos);
+                  if (pos == num.size()) return cval; } catch (...) {}
         }
     }
 
-    // ── Pattern: "N clusters (human_size)" ───────────────────────────────────
-    // Starts with an integer followed by " clusters"
+    // ── Pattern: "N clusters (...)" — integer or fractional cluster count ─────
     {
-        const std::string clust_prefix = " clusters";
-        size_t sp = val.find(clust_prefix);
+        const std::string clust_tok = " clusters";
+        size_t sp = val.find(clust_tok);
         if (sp != std::string::npos && sp > 0) {
             std::string num = val.substr(0, sp);
-            try {
-                size_t pos = 0;
-                long long cval = std::stoll(num, &pos);
-                if (pos == num.size()) return cval;
-            } catch (...) {}
+            try { size_t pos = 0; long long cval = std::stoll(num, &pos);
+                  if (pos == num.size()) return cval; } catch (...) {}
+            try { size_t pos = 0; double cval = std::stod(num, &pos);
+                  if (pos == num.size()) return cval; } catch (...) {}
         }
     }
 
-    // ── Drive root: strip trailing \ or / (e.g. "A:\" → "A:") ────────────────
+    // ── Pattern: "N%" -> double N (percentage) ───────────────────────────────
+    if (!val.empty() && val.back() == '%') {
+        std::string num = val.substr(0, val.size() - 1);
+        try { size_t pos = 0; double pval = std::stod(num, &pos);
+              if (pos == num.size()) return pval; } catch (...) {}
+    }
+
+    // ── Drive root: strip trailing \ or / (e.g. "A:\" -> "A:") ──────────────
     if (!val.empty() && (val.back() == '\\' || val.back() == '/')) {
         return val.substr(0, val.size() - 1);
     }
 
     // ── Pure integer ─────────────────────────────────────────────────────────
-    try {
-        size_t pos = 0;
-        long long ival = std::stoll(val, &pos);
-        if (pos == val.size()) return ival;
-    } catch (...) {}
+    try { size_t pos = 0; long long ival = std::stoll(val, &pos);
+          if (pos == val.size()) return ival; } catch (...) {}
 
     // ── Pure double ──────────────────────────────────────────────────────────
-    try {
-        size_t pos = 0;
-        double dval = std::stod(val, &pos);
-        if (pos == val.size()) return dval;
-    } catch (...) {}
+    try { size_t pos = 0; double dval = std::stod(val, &pos);
+          if (pos == val.size()) return dval; } catch (...) {}
 
     return val;
 }
 
+// ── JsonOutput methods ────────────────────────────────────────────────────────
+
+JsonOutput::JsonOutput(const std::wstring& command, const std::wstring& output_file)
+    : command_(to_narrow(command)), output_file_(output_file) {
+    root_["command"]  = command_;
+    root_["status"]   = "success";
+    root_["warnings"] = nlohmann::ordered_json::array();
+    root_["errors"]   = nlohmann::ordered_json::array();
+    root_["data"]     = nlohmann::ordered_json::object();
+}
+
+nlohmann::ordered_json& JsonOutput::current() {
+    nlohmann::ordered_json* node = &root_["data"];
+    for (const auto& key : section_keys_) {
+        node = &(*node)[key];
+    }
+    return *node;
+}
+
+void JsonOutput::set_command(const std::wstring& command) {
+    command_ = to_narrow(command);
+    root_["command"] = command_;
+}
+
+void JsonOutput::status(const std::wstring&) {
+    // Status/progress messages are not included in JSON output.
+}
+
+void JsonOutput::warn(const std::wstring& message) {
+    root_["warnings"].push_back(to_narrow(message));
+}
+
+void JsonOutput::error(const std::wstring& message) {
+    has_error_ = true;
+    root_["errors"].push_back(to_narrow(message));
+}
+
 void JsonOutput::field(const std::wstring& name, const std::wstring& value) {
-    current()[to_narrow(name)] = normalise_json_value(to_narrow(value));
+    current()[to_json_key(to_narrow(name))] = normalise_json_value(to_narrow(value));
 }
 
 void JsonOutput::begin_section(const std::wstring& name) {
-    std::string key = to_narrow(name);
+    current_section_name_ = to_narrow(name);
+
+    if (section_depth_ == 0) {
+        // Top-level section: enter the data context without nesting.
+        // All field() and begin_table() calls write flat into root_["data"].
+        // This eliminates the dynamic root-key problem entirely.
+        section_depth_++;
+        return;
+    }
+
+    // Nested section: create a camelCase sub-object within the current context.
+    std::string key = to_json_key(current_section_name_);
     current()[key] = nlohmann::ordered_json::object();
     section_keys_.push_back(key);
+    section_depth_++;
 }
 
 void JsonOutput::end_section() {
-    if (!section_keys_.empty()) {
-        section_keys_.pop_back();
+    if (section_depth_ > 0) {
+        --section_depth_;
+        if (!section_keys_.empty()) {
+            section_keys_.pop_back();
+        }
     }
 }
 
@@ -441,27 +576,15 @@ void JsonOutput::begin_table(const std::vector<std::wstring>& columns) {
     for (const auto& col : columns) {
         table_columns_.push_back(col);
     }
-
-    // Derive the JSON array key from the first column header.
-    // e.g. "Extent" -> "extent", "Total Clusters" -> "total_clusters"
-    if (!columns.empty()) {
-        std::string key = to_narrow(columns[0]);
-        for (char& c : key) {
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-        std::replace(key.begin(), key.end(), ' ', '_');
-        current_table_key_ = key;
-    } else {
-        current_table_key_ = "rows";
-    }
-
+    std::string first = columns.empty() ? "" : to_narrow(columns[0]);
+    current_table_key_ = get_table_array_key(first, current_section_name_);
     current()[current_table_key_] = nlohmann::ordered_json::array();
 }
 
 void JsonOutput::table_row(const std::vector<std::wstring>& values) {
     nlohmann::ordered_json row = nlohmann::ordered_json::object();
     for (size_t i = 0; i < values.size() && i < table_columns_.size(); ++i) {
-        row[to_narrow(table_columns_[i])] =
+        row[to_json_key(to_narrow(table_columns_[i]))] =
             normalise_json_value(to_narrow(values[i]));
     }
     current()[current_table_key_].push_back(row);
@@ -473,21 +596,20 @@ void JsonOutput::end_table() {
 }
 
 void JsonOutput::progress(const std::wstring&, ULONGLONG, ULONGLONG) {
-    // JSON does not output progress information
+    // JSON does not output progress information.
 }
 
 void JsonOutput::flush() {
+    root_["status"] = has_error_ ? "error" : "success";
     std::string json_str = root_.dump(2);
 
     if (!output_file_.empty()) {
-        // Write to file
         std::ofstream file(output_file_, std::ios::out | std::ios::binary);
         if (file.is_open()) {
             file.write(json_str.c_str(), json_str.size());
             file.put('\n');
         }
     } else {
-        // Write to stdout
         HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD written = 0;
         WriteFile(out, json_str.c_str(), static_cast<DWORD>(json_str.size()), &written, NULL);
