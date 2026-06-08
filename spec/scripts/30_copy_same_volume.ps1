@@ -21,14 +21,14 @@ Write-Host "TEST: copy — same-volume clone (FSCTL_DUPLICATE_EXTENTS_TO_FILE)" 
 # ── Arrange ───────────────────────────────────────────────────────────────────
 Write-Section "Arrange"
 $drv = $env:RETOOL_DRIVE_A -replace ':',''
-$src  = "${drv}:\copy_src.bin"
-$dest = "${drv}:\copy_dest.bin"
+$src  = "{0}:\copy_src.bin" -f $drv
+$dest = "{0}:\copy_dest.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $src -Force
 Remove-DriveFile -Path $dest
 Assert-FileExists -Path $src -Description "Source file on Drive A"
 
 $freeBeforeMB = [math]::Round((Get-PSDrive -Name $drv).Free / 1MB, 1)
-Write-Host "    Free space before copy: $freeBeforeMB MB" -ForegroundColor DarkGray
+Write-Host ("    Free space before copy: {0} MB" -f $freeBeforeMB) -ForegroundColor DarkGray
 
 # ── Act ───────────────────────────────────────────────────────────────────────
 Write-Section "Run: retool copy <src> <dest> (same volume)"
@@ -46,12 +46,12 @@ Assert-HashMatch -Path $src  -ExpectedHash $env:RETOOL_TEST_HASH -Description "S
 # Verify space savings: free space should not have dropped by a full 100 MB
 $freeAfterMB = [math]::Round((Get-PSDrive -Name $drv).Free / 1MB, 1)
 $dropped = $freeBeforeMB - $freeAfterMB
-Write-Host "    Free space after copy:  $freeAfterMB MB (dropped $dropped MB)" -ForegroundColor DarkGray
+Write-Host ("    Free space after copy:  {0} MB (dropped {1} MB)" -f $freeAfterMB, $dropped) -ForegroundColor DarkGray
 if ($dropped -lt 10) {
     Write-Host "    [PASS] Disk space consumption < 10 MB (blocks are shared)" -ForegroundColor Green
     $script:TestsPassed++
 } else {
-    Write-Host "    [WARN] Disk dropped $dropped MB — blocks may not be shared (ReFS dedup may not have fired)" -ForegroundColor Yellow
+    Write-Host ("    [WARN] Disk dropped {0} MB — blocks may not be shared (ReFS dedup may not have fired)" -f $dropped) -ForegroundColor Yellow
     # Not a hard failure since VHDX allocation is approximate
 }
 

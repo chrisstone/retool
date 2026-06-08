@@ -21,8 +21,8 @@ Write-Host "TEST: copy — cross-volume ReFS→ReFS (64K cluster)" -ForegroundCo
 Write-Section "Arrange"
 $drvA = $env:RETOOL_DRIVE_A -replace ':',''
 $drvB = $env:RETOOL_DRIVE_B -replace ':',''
-$src  = "${drvA}:\xvol_src.bin"
-$dest = "${drvB}:\xvol_dest.bin"
+$src  = "{0}:\xvol_src.bin" -f $drvA
+$dest = "{0}:\xvol_dest.bin" -f $drvB
 Copy-Item $env:RETOOL_TEST_FILE $src -Force
 Remove-DriveFile -Path $dest
 Assert-FileExists -Path $src -Description "Source file on Drive A"

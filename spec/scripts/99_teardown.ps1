@@ -31,25 +31,29 @@ if (Test-Path $envFile) {
 function Remove-Vhdx {
     param([string] $Path)
     if (-not (Test-Path $Path)) {
-        Write-Host "    Skipped (not found): $Path" -ForegroundColor DarkGray
+        Write-Host ("    Skipped (not found): {0}" -f $Path) -ForegroundColor DarkGray
         return
     }
     try {
-        $vhd = Get-VHD $Path -ErrorAction SilentlyContinue
-        if ($vhd -and $vhd.Attached) {
-            Write-Host "    Dismounting: $Path" -ForegroundColor Cyan
-            Dismount-VHD -Path $Path -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 500
-        }
+        Write-Host ("    Dismounting: {0}" -f $Path) -ForegroundColor Cyan
+        $tempScript = [System.IO.Path]::GetTempFileName()
+        $commands = @(
+            ('select vdisk file="{0}"' -f $Path),
+            "detach vdisk"
+        )
+        $commands | Set-Content $tempScript -Encoding ASCII
+        diskpart /s $tempScript | Out-Null
+        Remove-Item $tempScript -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
     } catch {
-        Write-Host "    Warning: could not query VHD state for $Path" -ForegroundColor Yellow
+        Write-Host ("    Warning: could not dismount {0}" -f $Path) -ForegroundColor Yellow
     }
-    Write-Host "    Deleting: $Path" -ForegroundColor Cyan
+    Write-Host ("    Deleting: {0}" -f $Path) -ForegroundColor Cyan
     Remove-Item $Path -Force -ErrorAction SilentlyContinue
     if (Test-Path $Path) {
-        Write-Host "    WARNING: Could not delete $Path" -ForegroundColor Yellow
+        Write-Host ("    WARNING: Could not delete {0}" -f $Path) -ForegroundColor Yellow
     } else {
-        Write-Host "    Deleted: $Path" -ForegroundColor Green
+        Write-Host ("    Deleted: {0}" -f $Path) -ForegroundColor Green
     }
 }
 
@@ -61,15 +65,15 @@ Remove-Vhdx -Path $env:RETOOL_VHDX_C
 Write-Host "==> Removing test file..." -ForegroundColor Cyan
 if (Test-Path $env:RETOOL_TEST_FILE) {
     Remove-Item $env:RETOOL_TEST_FILE -Force -ErrorAction SilentlyContinue
-    Write-Host "    Deleted: $env:RETOOL_TEST_FILE" -ForegroundColor Green
+    Write-Host ("    Deleted: {0}" -f $env:RETOOL_TEST_FILE) -ForegroundColor Green
 } else {
-    Write-Host "    Not found (already gone): $env:RETOOL_TEST_FILE" -ForegroundColor DarkGray
+    Write-Host ("    Not found (already gone): {0}" -f $env:RETOOL_TEST_FILE) -ForegroundColor DarkGray
 }
 
 Write-Host "==> Removing environment file..." -ForegroundColor Cyan
 if (Test-Path $envFile) {
     Remove-Item $envFile -Force -ErrorAction SilentlyContinue
-    Write-Host "    Deleted: $envFile" -ForegroundColor Green
+    Write-Host ("    Deleted: {0}" -f $envFile) -ForegroundColor Green
 }
 
 # Also clean up any stray JSON or filelist files left by tests

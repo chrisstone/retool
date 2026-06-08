@@ -20,8 +20,8 @@ $drvB = $env:RETOOL_DRIVE_B -replace ':',''
 
 # ── Same-volume JSON ──────────────────────────────────────────────────────────
 Write-Section "Same-volume copy -j"
-$src  = "${drvA}:\json_copy_src.bin"
-$dest = "${drvA}:\json_copy_dest.bin"
+$src  = "{0}:\json_copy_src.bin" -f $drvA
+$dest = "{0}:\json_copy_dest.bin" -f $drvA
 Copy-Item $env:RETOOL_TEST_FILE $src -Force
 Remove-DriveFile -Path $dest
 
@@ -35,7 +35,7 @@ Assert-HashMatch -Path $dest -ExpectedHash $env:RETOOL_TEST_HASH -Description "D
 
 # ── Cross-volume JSON ─────────────────────────────────────────────────────────
 Write-Section "Cross-volume copy -j"
-$destB = "${drvB}:\json_copy_dest_b.bin"
+$destB = "{0}:\json_copy_dest_b.bin" -f $drvB
 Remove-DriveFile -Path $destB
 
 $out = Invoke-Retool -Args @('copy', $src, $destB, '-j')

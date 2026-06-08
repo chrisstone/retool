@@ -16,7 +16,7 @@
 Write-Host "TEST: volume — basic volume information" -ForegroundColor White
 
 # ── Drive A: ReFS 64K ─────────────────────────────────────────────────────────
-Write-Section "Drive A ($env:RETOOL_DRIVE_A) — ReFS 64K cluster"
+Write-Section ("Drive A ({0}) — ReFS 64K cluster" -f $env:RETOOL_DRIVE_A)
 $out = Invoke-Retool -Args @('volume', $env:RETOOL_DRIVE_A)
 & $env:RETOOL_EXE volume $env:RETOOL_DRIVE_A | Out-Null
 Assert-ExitCode -Expected 0 -Actual $LASTEXITCODE -Description "retool volume DriveA exits 0"
@@ -26,7 +26,7 @@ Assert-OutputContains -Output ($out -join "`n") -Substring 'Total Space'  -Descr
 Assert-OutputContains -Output ($out -join "`n") -Substring 'Free Space'   -Description "Drive A output has Free Space field"
 
 # ── Drive B: ReFS 64K ─────────────────────────────────────────────────────────
-Write-Section "Drive B ($env:RETOOL_DRIVE_B) — ReFS 64K cluster"
+Write-Section ("Drive B ({0}) — ReFS 64K cluster" -f $env:RETOOL_DRIVE_B)
 $out = Invoke-Retool -Args @('volume', $env:RETOOL_DRIVE_B)
 & $env:RETOOL_EXE volume $env:RETOOL_DRIVE_B | Out-Null
 Assert-ExitCode -Expected 0 -Actual $LASTEXITCODE -Description "retool volume DriveB exits 0"
@@ -34,7 +34,7 @@ Assert-OutputContains -Output ($out -join "`n") -Substring 'ReFS'  -Description 
 Assert-OutputContains -Output ($out -join "`n") -Substring '65536' -Description "Drive B reports 65536-byte cluster size"
 
 # ── Drive C: ReFS 4K ──────────────────────────────────────────────────────────
-Write-Section "Drive C ($env:RETOOL_DRIVE_C) — ReFS 4K cluster"
+Write-Section ("Drive C ({0}) — ReFS 4K cluster" -f $env:RETOOL_DRIVE_C)
 $out = Invoke-Retool -Args @('volume', $env:RETOOL_DRIVE_C)
 & $env:RETOOL_EXE volume $env:RETOOL_DRIVE_C | Out-Null
 Assert-ExitCode -Expected 0 -Actual $LASTEXITCODE -Description "retool volume DriveC exits 0"

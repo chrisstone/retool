@@ -20,12 +20,12 @@ Write-Host "TEST: inspect — volume scan mode" -ForegroundColor White
 # ── Arrange ───────────────────────────────────────────────────────────────────
 Write-Section "Arrange"
 $drv = $env:RETOOL_DRIVE_A -replace ':',''
-$file = "${drv}:\vol_scan_test.bin"
+$file = "{0}:\vol_scan_test.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $file -Force
 Assert-FileExists -Path $file -Description "Test file copied to Drive A"
 
 # ── Act ───────────────────────────────────────────────────────────────────────
-Write-Section "Run: retool inspect $env:RETOOL_DRIVE_A"
+Write-Section ("Run: retool inspect {0}" -f $env:RETOOL_DRIVE_A)
 $out = Invoke-Retool -Args @('inspect', $env:RETOOL_DRIVE_A)
 & $env:RETOOL_EXE inspect $env:RETOOL_DRIVE_A | Out-Null
 $exitCode = $LASTEXITCODE

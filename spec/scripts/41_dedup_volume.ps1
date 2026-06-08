@@ -22,8 +22,8 @@ Write-Host "TEST: dedup — volume-wide (actual dedup)" -ForegroundColor White
 # ── Arrange ───────────────────────────────────────────────────────────────────
 Write-Section "Arrange"
 $drv   = $env:RETOOL_DRIVE_A -replace ':',''
-$fileA = "${drv}:\dedup_dry_a.bin"
-$fileB = "${drv}:\dedup_dry_b.bin"
+$fileA = "{0}:\dedup_dry_a.bin" -f $drv
+$fileB = "{0}:\dedup_dry_b.bin" -f $drv
 
 # Re-copy if a prior run cleaned up
 if (-not (Test-Path $fileA)) { Copy-Item $env:RETOOL_TEST_FILE $fileA -Force }
@@ -32,10 +32,10 @@ Assert-FileExists -Path $fileA -Description "fileA present"
 Assert-FileExists -Path $fileB -Description "fileB present"
 
 $freeBefore = (Get-PSDrive -Name $drv).Free
-Write-Host "    Free before dedup: $([math]::Round($freeBefore/1MB,1)) MB" -ForegroundColor DarkGray
+Write-Host ("    Free before dedup: {0} MB" -f [math]::Round($freeBefore/1MB,1)) -ForegroundColor DarkGray
 
 # ── Act ───────────────────────────────────────────────────────────────────────
-Write-Section "Run: retool dedup $env:RETOOL_DRIVE_A"
+Write-Section ("Run: retool dedup {0}" -f $env:RETOOL_DRIVE_A)
 $out = Invoke-Retool -Args @('dedup', $env:RETOOL_DRIVE_A)
 & $env:RETOOL_EXE dedup $env:RETOOL_DRIVE_A | Out-Null
 $exitCode = $LASTEXITCODE
@@ -54,12 +54,12 @@ Assert-HashMatch -Path $fileB -ExpectedHash $env:RETOOL_TEST_HASH -Description "
 # Disk space should have been reclaimed
 $freeAfter = (Get-PSDrive -Name $drv).Free
 $reclaimed = $freeAfter - $freeBefore
-Write-Host "    Free after dedup: $([math]::Round($freeAfter/1MB,1)) MB (reclaimed ~$([math]::Round($reclaimed/1MB,1)) MB)" -ForegroundColor DarkGray
+Write-Host ("    Free after dedup: {0} MB (reclaimed ~{1} MB)" -f [math]::Round($freeAfter/1MB,1), [math]::Round($reclaimed/1MB,1)) -ForegroundColor DarkGray
 if ($reclaimed -gt 50MB) {
     Write-Host "    [PASS] > 50 MB reclaimed after volume-wide dedup" -ForegroundColor Green
     $script:TestsPassed++
 } else {
-    Write-Host "    [WARN] Only $([math]::Round($reclaimed/1MB,1)) MB reclaimed — check that blocks were actually shared" -ForegroundColor Yellow
+    Write-Host ("    [WARN] Only {0} MB reclaimed — check that blocks were actually shared" -f [math]::Round($reclaimed/1MB,1)) -ForegroundColor Yellow
     # Not a hard fail: VHDX space reporting can lag; data integrity is the primary check
 }
 

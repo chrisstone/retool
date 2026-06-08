@@ -26,18 +26,18 @@ Write-Host "TEST: dedup — volume-wide dry run (--dry-run)" -ForegroundColor Wh
 # ── Arrange ───────────────────────────────────────────────────────────────────
 Write-Section "Arrange — copy test file twice to Drive A"
 $drv   = $env:RETOOL_DRIVE_A -replace ':',''
-$fileA = "${drv}:\dedup_dry_a.bin"
-$fileB = "${drv}:\dedup_dry_b.bin"
+$fileA = "{0}:\dedup_dry_a.bin" -f $drv
+$fileB = "{0}:\dedup_dry_b.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $fileA -Force
 Copy-Item $env:RETOOL_TEST_FILE $fileB -Force
 Assert-FileExists -Path $fileA -Description "fileA copied"
 Assert-FileExists -Path $fileB -Description "fileB copied"
 
 $freeBefore = (Get-PSDrive -Name $drv).Free
-Write-Host "    Free before dry-run: $([math]::Round($freeBefore/1MB,1)) MB" -ForegroundColor DarkGray
+Write-Host ("    Free before dry-run: {0} MB" -f [math]::Round($freeBefore/1MB,1)) -ForegroundColor DarkGray
 
 # ── Act ───────────────────────────────────────────────────────────────────────
-Write-Section "Run: retool dedup $env:RETOOL_DRIVE_A -n"
+Write-Section ("Run: retool dedup {0} -n" -f $env:RETOOL_DRIVE_A)
 $out = Invoke-Retool -Args @('dedup', $env:RETOOL_DRIVE_A, '-n')
 & $env:RETOOL_EXE dedup $env:RETOOL_DRIVE_A -n | Out-Null
 $exitCode = $LASTEXITCODE
@@ -61,7 +61,7 @@ if ($delta -lt 1MB) {
     Write-Host "    [PASS] Free space unchanged (delta < 1 MB)" -ForegroundColor Green
     $script:TestsPassed++
 } else {
-    Write-Host "    [FAIL] Free space changed by $([math]::Round($delta/1MB,1)) MB during dry-run" -ForegroundColor Red
+    Write-Host ("    [FAIL] Free space changed by {0} MB during dry-run" -f [math]::Round($delta/1MB,1)) -ForegroundColor Red
     $script:TestsFailed++
 }
 

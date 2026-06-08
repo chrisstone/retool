@@ -17,7 +17,7 @@ $drv = $env:RETOOL_DRIVE_A -replace ':',''
 
 # ── Single file JSON ──────────────────────────────────────────────────────────
 Write-Section "Single file -j"
-$file = "${drv}:\json_single.bin"
+$file = "{0}:\json_single.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $file -Force
 
 $out = Invoke-Retool -Args @('inspect', $file, '-j')
@@ -28,7 +28,7 @@ Assert-NotEmpty -Value $json -Description "Single file JSON parses successfully"
 
 # ── Multi-file JSON ───────────────────────────────────────────────────────────
 Write-Section "Multi-file -j"
-$file2 = "${drv}:\json_multi.bin"
+$file2 = "{0}:\json_multi.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $file2 -Force
 
 $out = Invoke-Retool -Args @('inspect', $file, $file2, '-j')

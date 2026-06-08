@@ -20,8 +20,8 @@ Write-Host "TEST: inspect — file list input (-i)" -ForegroundColor White
 # ── Arrange ───────────────────────────────────────────────────────────────────
 Write-Section "Arrange"
 $drv = $env:RETOOL_DRIVE_A -replace ':',''
-$file1 = "${drv}:\filelist_a.bin"
-$file2 = "${drv}:\filelist_b.bin"
+$file1 = "{0}:\filelist_a.bin" -f $drv
+$file2 = "{0}:\filelist_b.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $file1 -Force
 Copy-Item $env:RETOOL_TEST_FILE $file2 -Force
 Assert-FileExists -Path $file1 -Description "file1 copied to Drive A"
@@ -30,7 +30,7 @@ Assert-FileExists -Path $file2 -Description "file2 copied to Drive A"
 # Write file list with UTF-8 BOM, a comment line, and a blank line
 $listPath = 'C:\Temp\retool_filelist.txt'
 $bom = [System.Text.Encoding]::UTF8.GetPreamble()
-$listContent = "# This is a comment line`r`n`r`n$file1`r`n$file2`r`n"
+$listContent = "# This is a comment line`r`n`r`n{0}`r`n{1}`r`n" -f $file1, $file2
 $bytes = $bom + [System.Text.Encoding]::UTF8.GetBytes($listContent)
 [System.IO.File]::WriteAllBytes($listPath, $bytes)
 Assert-FileExists -Path $listPath -Description "File list created at C:\Temp\retool_filelist.txt"

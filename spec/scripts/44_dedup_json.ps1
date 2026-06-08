@@ -19,8 +19,8 @@ $drv = $env:RETOOL_DRIVE_A -replace ':',''
 
 # ── Volume-wide dedup JSON (dry-run to avoid side effects) ────────────────────
 Write-Section "Volume-wide dedup -j -n"
-$fileA = "${drv}:\dedup_json_a.bin"
-$fileB = "${drv}:\dedup_json_b.bin"
+$fileA = "{0}:\dedup_json_a.bin" -f $drv
+$fileB = "{0}:\dedup_json_b.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $fileA -Force
 Copy-Item $env:RETOOL_TEST_FILE $fileB -Force
 

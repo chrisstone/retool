@@ -14,8 +14,8 @@ Write-Host "TEST: dedup — pair-wise dry run (--dry-run)" -ForegroundColor Whit
 # ── Arrange ───────────────────────────────────────────────────────────────────
 Write-Section "Arrange"
 $drv   = $env:RETOOL_DRIVE_A -replace ':',''
-$fileA = "${drv}:\pdry_a.bin"
-$fileB = "${drv}:\pdry_b.bin"
+$fileA = "{0}:\pdry_a.bin" -f $drv
+$fileB = "{0}:\pdry_b.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $fileA -Force
 Copy-Item $env:RETOOL_TEST_FILE $fileB -Force
 Assert-FileExists -Path $fileA -Description "fileA copied"
@@ -48,7 +48,7 @@ if ($delta -lt 1MB) {
     Write-Host "    [PASS] Free space unchanged during dry-run" -ForegroundColor Green
     $script:TestsPassed++
 } else {
-    Write-Host "    [FAIL] Free space changed by $([math]::Round($delta/1MB,1)) MB during dry-run" -ForegroundColor Red
+    Write-Host ("    [FAIL] Free space changed by {0} MB during dry-run" -f [math]::Round($delta/1MB,1)) -ForegroundColor Red
     $script:TestsFailed++
 }
 

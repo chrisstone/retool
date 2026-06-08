@@ -21,8 +21,8 @@ $drvB = $env:RETOOL_DRIVE_B -replace ':',''
 
 # ── Same-volume dry run ───────────────────────────────────────────────────────
 Write-Section "Same-volume -n"
-$src  = "${drvA}:\dryrun_src.bin"
-$dest = "${drvA}:\dryrun_dest.bin"
+$src  = "{0}:\dryrun_src.bin" -f $drvA
+$dest = "{0}:\dryrun_dest.bin" -f $drvA
 Copy-Item $env:RETOOL_TEST_FILE $src -Force
 Remove-DriveFile -Path $dest
 
@@ -42,7 +42,7 @@ Assert-OutputContains -Output ($out -join "`n") -Substring 'dry' -Description "O
 
 # ── Cross-volume dry run ──────────────────────────────────────────────────────
 Write-Section "Cross-volume -n"
-$destB = "${drvB}:\dryrun_dest_b.bin"
+$destB = "{0}:\dryrun_dest_b.bin" -f $drvB
 Remove-DriveFile -Path $destB
 
 $out = Invoke-Retool -Args @('copy', $src, $destB, '-n')

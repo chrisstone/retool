@@ -34,10 +34,10 @@ $envFile    = Join-Path $scriptDir '.retool_env.ps1'
 # ── 1. Verify retool.exe ─────────────────────────────────────────────────────
 Write-Host "==> Verifying retool.exe..." -ForegroundColor Cyan
 if (-not (Test-Path $retoolExe)) {
-    Write-Error "retool.exe not found at: $retoolExe`nPlease build the project first: cmake --build build/debug --config Debug"
+    Write-Error ("retool.exe not found at: {0}`nPlease build the project first: cmake --build build/debug --config Debug" -f $retoolExe)
     exit 1
 }
-Write-Host "    Found: $retoolExe" -ForegroundColor Green
+Write-Host ("    Found: {0}" -f $retoolExe) -ForegroundColor Green
 
 # ── 2. Create C:\Temp ────────────────────────────────────────────────────────
 Write-Host "==> Creating C:\Temp..." -ForegroundColor Cyan
@@ -50,7 +50,7 @@ if (-not (Test-Path $vhdxDir)) {
 
 # ── 3. Create 100 MB test file ───────────────────────────────────────────────
 $testFile = Join-Path $vhdxDir 'testfile.bin'
-Write-Host "==> Creating 100 MB test file at $testFile..." -ForegroundColor Cyan
+Write-Host ("==> Creating 100 MB test file at {0}..." -f $testFile) -ForegroundColor Cyan
 if (Test-Path $testFile) {
     Write-Host "    Removing existing test file" -ForegroundColor Yellow
     Remove-Item $testFile -Force
@@ -69,7 +69,7 @@ try {
     $fs.Close()
 }
 $testHash = (Get-FileHash $testFile -Algorithm SHA256).Hash
-Write-Host "    Created $testFile  SHA-256: $testHash" -ForegroundColor Green
+Write-Host ("    Created {0}  SHA-256: {1}" -f $testFile, $testHash) -ForegroundColor Green
 
 # ── Helper: create, attach, format, and mount a VHDX ────────────────────────
 function New-RetoolVhdx {
@@ -81,39 +81,55 @@ function New-RetoolVhdx {
     )
 
     if (Test-Path $VhdxPath) {
-        Write-Host "    Removing existing VHDX: $VhdxPath" -ForegroundColor Yellow
-        # Detach if mounted
-        $disk = Get-VHD $VhdxPath -ErrorAction SilentlyContinue
-        if ($disk -and $disk.Attached) {
-            Dismount-VHD -Path $VhdxPath
-        }
+        Write-Host ("    Removing existing VHDX: {0}" -f $VhdxPath) -ForegroundColor Yellow
+        # Detach if mounted using diskpart
+        $tempScript = [System.IO.Path]::GetTempFileName()
+        $commands = @(
+            ('select vdisk file="{0}"' -f $VhdxPath),
+            "detach vdisk"
+        )
+        $commands | Set-Content $tempScript -Encoding ASCII
+        diskpart /s $tempScript | Out-Null
+        Remove-Item $tempScript -Force -ErrorAction SilentlyContinue
         Remove-Item $VhdxPath -Force
     }
 
-    Write-Host "    Creating VHDX: $VhdxPath ($SizeMB MB, cluster=$ClusterSizeBytes bytes)" -ForegroundColor Cyan
+    Write-Host ("    Creating VHDX: {0} ({1} MB, cluster={2} bytes)" -f $VhdxPath, $SizeMB, $ClusterSizeBytes) -ForegroundColor Cyan
 
-    # Create dynamically expanding VHDX
-    New-VHD -Path $VhdxPath -SizeBytes ($SizeMB * 1MB) -Dynamic -BlockSizeBytes 2MB | Out-Null
+    # Find a free drive letter (D..Z)
+    $usedLetters = [System.IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 1).ToUpper() }
+    $driveLetter = $null
+    foreach ($letter in "K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z") {
+        if ($letter -notin $usedLetters) {
+            $driveLetter = $letter
+            break
+        }
+    }
+    if ($null -eq $driveLetter) {
+        throw "No free drive letters available!"
+    }
 
-    # Attach
-    $vhd = Mount-VHD -Path $VhdxPath -PassThru
-    $diskNum = $vhd.DiskNumber
+    # Create script for diskpart to build, mount, partition, format ReFS, and assign letter
+    $tempScript = [System.IO.Path]::GetTempFileName()
+    $commands = @(
+        ('create vdisk file="{0}" maximum={1} type=expandable' -f $VhdxPath, $SizeMB),
+        ('select vdisk file="{0}"' -f $VhdxPath),
+        "attach vdisk",
+        "convert gpt",
+        "create partition primary",
+        ('format fs=ReFS unit={0} label="{1}" quick' -f $ClusterSizeBytes, $VolumeLabel),
+        ('assign letter={0}' -f $driveLetter)
+    )
+    $commands | Set-Content $tempScript -Encoding ASCII
 
-    # Initialise (GPT)
-    Initialize-Disk -Number $diskNum -PartitionStyle GPT -Confirm:$false | Out-Null
+    diskpart /s $tempScript | Out-Null
+    Remove-Item $tempScript -Force -ErrorAction SilentlyContinue
 
-    # Create a single data partition (leave 1 MB for GPT overhead)
-    $partition = New-Partition -DiskNumber $diskNum -UseMaximumSize -AssignDriveLetter
-    $driveLetter = $partition.DriveLetter
+    if (-not (Test-Path ("{0}:\" -f $driveLetter))) {
+        throw ("Failed to create/mount VHDX at drive {0}:" -f $driveLetter)
+    }
 
-    # Format with ReFS
-    Format-Volume -DriveLetter $driveLetter `
-                  -FileSystem ReFS `
-                  -AllocationUnitSize $ClusterSizeBytes `
-                  -NewFileSystemLabel $VolumeLabel `
-                  -Confirm:$false | Out-Null
-
-    Write-Host "    Mounted as ${driveLetter}: (label=$VolumeLabel)" -ForegroundColor Green
+    Write-Host ("    Mounted as {0}: (label={1})" -f $driveLetter, $VolumeLabel) -ForegroundColor Green
     return $driveLetter
 }
 
@@ -132,27 +148,27 @@ Write-Host "==> Creating VHDX C (ReFS 4K cluster)..." -ForegroundColor Cyan
 $driveC = New-RetoolVhdx -VhdxPath $vhdxC -SizeMB 1024 -ClusterSizeBytes 4096  -VolumeLabel 'RetoolC'
 
 # ── 5. Write environment file ────────────────────────────────────────────────
-Write-Host "==> Writing environment file: $envFile" -ForegroundColor Cyan
-@"
+Write-Host ("==> Writing environment file: {0}" -f $envFile) -ForegroundColor Cyan
+@'
 # Auto-generated by 00_setup.ps1 — do not edit manually.
-`$env:RETOOL_EXE    = '$retoolExe'
-`$env:RETOOL_DRIVE_A = '${driveA}:'
-`$env:RETOOL_DRIVE_B = '${driveB}:'
-`$env:RETOOL_DRIVE_C = '${driveC}:'
-`$env:RETOOL_TEST_FILE = '$testFile'
-`$env:RETOOL_TEST_HASH = '$testHash'
-`$env:RETOOL_VHDX_A   = '$vhdxA'
-`$env:RETOOL_VHDX_B   = '$vhdxB'
-`$env:RETOOL_VHDX_C   = '$vhdxC'
-"@ | Set-Content $envFile -Encoding UTF8
+$env:RETOOL_EXE    = '{0}'
+$env:RETOOL_DRIVE_A = '{1}:'
+$env:RETOOL_DRIVE_B = '{2}:'
+$env:RETOOL_DRIVE_C = '{3}:'
+$env:RETOOL_TEST_FILE = '{4}'
+$env:RETOOL_TEST_HASH = '{5}'
+$env:RETOOL_VHDX_A   = '{6}'
+$env:RETOOL_VHDX_B   = '{7}'
+$env:RETOOL_VHDX_C   = '{8}'
+'@ -f $retoolExe, $driveA, $driveB, $driveC, $testFile, $testHash, $vhdxA, $vhdxB, $vhdxC | Set-Content $envFile -Encoding UTF8
 
 Write-Host ""
 Write-Host "==> Setup complete." -ForegroundColor Green
-Write-Host "    Drive A (ReFS 64K): ${driveA}:"
-Write-Host "    Drive B (ReFS 64K): ${driveB}:"
-Write-Host "    Drive C (ReFS  4K): ${driveC}:"
-Write-Host "    Test file:          $testFile"
-Write-Host "    Test file SHA-256:  $testHash"
+Write-Host ("    Drive A (ReFS 64K): {0}:" -f $driveA)
+Write-Host ("    Drive B (ReFS 64K): {0}:" -f $driveB)
+Write-Host ("    Drive C (ReFS  4K): {0}:" -f $driveC)
+Write-Host ("    Test file:          {0}" -f $testFile)
+Write-Host ("    Test file SHA-256:  {0}" -f $testHash)
 Write-Host ""
 Write-Host "    Run test scripts in numeric order.  Dot-source .retool_env.ps1 if" -ForegroundColor Yellow
 Write-Host "    you open a new shell between scripts." -ForegroundColor Yellow

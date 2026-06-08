@@ -15,8 +15,8 @@ Write-Host "TEST: inspect — multi-file with fragmentation report (-r)" -Foregr
 # ── Arrange ───────────────────────────────────────────────────────────────────
 Write-Section "Arrange"
 $drv = $env:RETOOL_DRIVE_A -replace ':',''
-$file1 = "${drv}:\multifrag_a.bin"
-$file2 = "${drv}:\multifrag_b.bin"
+$file1 = "{0}:\multifrag_a.bin" -f $drv
+$file2 = "{0}:\multifrag_b.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $file1 -Force
 Copy-Item $env:RETOOL_TEST_FILE $file2 -Force
 Assert-FileExists -Path $file1 -Description "file1 copied to Drive A"

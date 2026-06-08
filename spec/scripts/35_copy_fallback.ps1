@@ -21,8 +21,8 @@ Write-Host "TEST: copy — fallback (cluster size mismatch: 64K → 4K)" -Foregr
 Write-Section "Arrange"
 $drvA = $env:RETOOL_DRIVE_A -replace ':',''
 $drvC = $env:RETOOL_DRIVE_C -replace ':',''
-$src  = "${drvA}:\fallback_src.bin"
-$dest = "${drvC}:\fallback_dest.bin"
+$src  = "{0}:\fallback_src.bin" -f $drvA
+$dest = "{0}:\fallback_dest.bin" -f $drvC
 Copy-Item $env:RETOOL_TEST_FILE $src -Force
 Remove-DriveFile -Path $dest
 Assert-FileExists -Path $src -Description "Source file on Drive A (64K)"

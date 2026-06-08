@@ -26,12 +26,12 @@ $drvA = $env:RETOOL_DRIVE_A -replace ':',''
 $drvB = $env:RETOOL_DRIVE_B -replace ':',''
 
 # Pre-seed Drive B with a copy of the test file so -d can find it
-$seedFile = "${drvB}:\scan_dest_seed.bin"
+$seedFile = "{0}:\scan_dest_seed.bin" -f $drvB
 Copy-Item $env:RETOOL_TEST_FILE $seedFile -Force
 Assert-FileExists -Path $seedFile -Description "Seed file pre-copied to Drive B"
 
-$src  = "${drvA}:\scan_dest_src.bin"
-$dest = "${drvB}:\scan_dest_out.bin"
+$src  = "{0}:\scan_dest_src.bin" -f $drvA
+$dest = "{0}:\scan_dest_out.bin" -f $drvB
 Copy-Item $env:RETOOL_TEST_FILE $src -Force
 Remove-DriveFile -Path $dest
 Assert-FileExists -Path $src -Description "Source file on Drive A"

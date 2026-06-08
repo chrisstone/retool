@@ -19,15 +19,15 @@ Write-Host "TEST: dedup — pair-wise (<file1> <file2>)" -ForegroundColor White
 # ── Arrange ───────────────────────────────────────────────────────────────────
 Write-Section "Arrange"
 $drv   = $env:RETOOL_DRIVE_A -replace ':',''
-$fileA = "${drv}:\pair_a.bin"
-$fileB = "${drv}:\pair_b.bin"
+$fileA = "{0}:\pair_a.bin" -f $drv
+$fileB = "{0}:\pair_b.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $fileA -Force
 Copy-Item $env:RETOOL_TEST_FILE $fileB -Force
 Assert-FileExists -Path $fileA -Description "fileA present"
 Assert-FileExists -Path $fileB -Description "fileB present"
 
 $freeBefore = (Get-PSDrive -Name $drv).Free
-Write-Host "    Free before dedup: $([math]::Round($freeBefore/1MB,1)) MB" -ForegroundColor DarkGray
+Write-Host ("    Free before dedup: {0} MB" -f [math]::Round($freeBefore/1MB,1)) -ForegroundColor DarkGray
 
 # ── Act ───────────────────────────────────────────────────────────────────────
 Write-Section "Run: retool dedup <file1> <file2>"
@@ -47,12 +47,12 @@ Assert-HashMatch -Path $fileB -ExpectedHash $env:RETOOL_TEST_HASH -Description "
 
 $freeAfter = (Get-PSDrive -Name $drv).Free
 $reclaimed = $freeAfter - $freeBefore
-Write-Host "    Free after dedup: $([math]::Round($freeAfter/1MB,1)) MB (reclaimed ~$([math]::Round($reclaimed/1MB,1)) MB)" -ForegroundColor DarkGray
+Write-Host ("    Free after dedup: {0} MB (reclaimed ~{1} MB)" -f [math]::Round($freeAfter/1MB,1), [math]::Round($reclaimed/1MB,1)) -ForegroundColor DarkGray
 if ($reclaimed -gt 50MB) {
     Write-Host "    [PASS] > 50 MB reclaimed after pair-wise dedup" -ForegroundColor Green
     $script:TestsPassed++
 } else {
-    Write-Host "    [WARN] Only $([math]::Round($reclaimed/1MB,1)) MB reclaimed" -ForegroundColor Yellow
+    Write-Host ("    [WARN] Only {0} MB reclaimed" -f [math]::Round($reclaimed/1MB,1)) -ForegroundColor Yellow
 }
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────

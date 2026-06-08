@@ -23,8 +23,8 @@ Write-Host "TEST: inspect — multi-file sharing analysis" -ForegroundColor Whit
 # ── Arrange ───────────────────────────────────────────────────────────────────
 Write-Section "Arrange"
 $drv = $env:RETOOL_DRIVE_A -replace ':',''
-$file1 = "${drv}:\multi_a.bin"
-$file2 = "${drv}:\multi_b.bin"
+$file1 = "{0}:\multi_a.bin" -f $drv
+$file2 = "{0}:\multi_b.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $file1 -Force
 Copy-Item $env:RETOOL_TEST_FILE $file2 -Force
 Assert-FileExists -Path $file1 -Description "file1 copied to Drive A"
