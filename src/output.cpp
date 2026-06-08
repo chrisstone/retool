@@ -473,7 +473,7 @@ static nlohmann::ordered_json normalise_json_value(const std::string& val) {
         }
     }
 
-    // ── Pattern: "N clusters (...)" — integer or fractional cluster count ─────
+    // ── Pattern: "N clusters (...)" - integer or fractional cluster count ─────
     {
         const std::string clust_tok = " clusters";
         size_t sp = val.find(clust_tok);
@@ -614,10 +614,7 @@ void JsonOutput::flush() {
             file.put('\n');
         }
     } else {
-        HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
-        DWORD written = 0;
-        WriteFile(out, json_str.c_str(), static_cast<DWORD>(json_str.size()), &written, NULL);
-        WriteFile(out, "\n", 1, &written, NULL);
+        std::wcout << util::to_wstring(json_str) << std::endl;
     }
     flushed_ = true;
 }

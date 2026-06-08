@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    99_teardown.ps1 — Dismount and delete all retool test VHDXs.
+    99_teardown.ps1 - Dismount and delete all retool test VHDXs.
 
 .DESCRIPTION
     Cleans up the test environment created by 00_setup.ps1:
@@ -21,7 +21,7 @@ Write-Host "==> Loading environment..." -ForegroundColor Cyan
 if (Test-Path $envFile) {
     . $envFile
 } else {
-    Write-Host "    Environment file not found — using defaults" -ForegroundColor Yellow
+    Write-Host "    Environment file not found - using defaults" -ForegroundColor Yellow
     $env:RETOOL_VHDX_A    = 'C:\Temp\retool-a.vhdx'
     $env:RETOOL_VHDX_B    = 'C:\Temp\retool-b.vhdx'
     $env:RETOOL_VHDX_C    = 'C:\Temp\retool-c.vhdx'

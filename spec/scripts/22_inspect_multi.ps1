@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    22_inspect_multi.ps1 — Test: retool inspect <file1> <file2> (multi-file sharing)
+    22_inspect_multi.ps1 - Test: retool inspect <file1> <file2> (multi-file sharing)
 
 .DESCRIPTION
     Copies the same test file twice to Drive A (so they are identical and will share
@@ -18,9 +18,9 @@
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: inspect — multi-file sharing analysis" -ForegroundColor White
+Write-Host "TEST: inspect - multi-file sharing analysis" -ForegroundColor White
 
-# ── Arrange ───────────────────────────────────────────────────────────────────
+# -- Arrange -------------------------------------------------------------------
 Write-Section "Arrange"
 $drv = $env:RETOOL_DRIVE_A -replace ':',''
 $file1 = "{0}:\multi_a.bin" -f $drv
@@ -30,13 +30,13 @@ Copy-Item $env:RETOOL_TEST_FILE $file2 -Force
 Assert-FileExists -Path $file1 -Description "file1 copied to Drive A"
 Assert-FileExists -Path $file2 -Description "file2 copied to Drive A"
 
-# ── Act ───────────────────────────────────────────────────────────────────────
+# -- Act -----------------------------------------------------------------------
 Write-Section "Run: retool inspect <file1> <file2>"
 $out = Invoke-Retool -Args @('inspect', $file1, $file2, '-e')
 & $env:RETOOL_EXE inspect $file1 $file2 -e | Out-Null
 $exitCode = $LASTEXITCODE
 
-# ── Assert ────────────────────────────────────────────────────────────────────
+# -- Assert --------------------------------------------------------------------
 Write-Section "Assertions"
 Assert-ExitCode -Expected 0 -Actual $exitCode -Description "Exit code 0"
 $outStr = $out -join "`n"
@@ -51,7 +51,7 @@ Assert-OutputContains -Output $outStr -Substring 'F1'             -Description "
 Assert-HashMatch -Path $file1 -ExpectedHash $env:RETOOL_TEST_HASH -Description "file1 data unchanged"
 Assert-HashMatch -Path $file2 -ExpectedHash $env:RETOOL_TEST_HASH -Description "file2 data unchanged"
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
+# -- Cleanup -------------------------------------------------------------------
 Remove-DriveFile -Path $file1
 Remove-DriveFile -Path $file2
 

@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    41_dedup_volume.ps1 — Test: retool dedup <volume> (volume-wide, actual dedup)
+    41_dedup_volume.ps1 - Test: retool dedup <volume> (volume-wide, actual dedup)
 
 .DESCRIPTION
     Depends on 40_dedup_volume_dry_run.ps1 leaving two copies of the test file
@@ -17,9 +17,9 @@
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: dedup — volume-wide (actual dedup)" -ForegroundColor White
+Write-Host "TEST: dedup - volume-wide (actual dedup)" -ForegroundColor White
 
-# ── Arrange ───────────────────────────────────────────────────────────────────
+# -- Arrange -------------------------------------------------------------------
 Write-Section "Arrange"
 $drv   = $env:RETOOL_DRIVE_A -replace ':',''
 $fileA = "{0}:\dedup_dry_a.bin" -f $drv
@@ -34,20 +34,20 @@ Assert-FileExists -Path $fileB -Description "fileB present"
 $freeBefore = (Get-PSDrive -Name $drv).Free
 Write-Host ("    Free before dedup: {0} MB" -f [math]::Round($freeBefore/1MB,1)) -ForegroundColor DarkGray
 
-# ── Act ───────────────────────────────────────────────────────────────────────
+# -- Act -----------------------------------------------------------------------
 Write-Section ("Run: retool dedup {0}" -f $env:RETOOL_DRIVE_A)
 $out = Invoke-Retool -Args @('dedup', $env:RETOOL_DRIVE_A)
 & $env:RETOOL_EXE dedup $env:RETOOL_DRIVE_A | Out-Null
 $exitCode = $LASTEXITCODE
 
-# ── Assert ────────────────────────────────────────────────────────────────────
+# -- Assert --------------------------------------------------------------------
 Write-Section "Assertions"
 Assert-ExitCode -Expected 0 -Actual $exitCode -Description "Exit code 0"
 $outStr = $out -join "`n"
 Assert-OutputContains -Output $outStr -Substring 'Clusters Deduped' -Description "Clusters Deduped field present"
 Assert-OutputContains -Output $outStr -Substring 'Space Reclaimed'  -Description "Space Reclaimed field present"
 
-# Data integrity — both files must read back correctly after dedup
+# Data integrity - both files must read back correctly after dedup
 Assert-HashMatch -Path $fileA -ExpectedHash $env:RETOOL_TEST_HASH -Description "fileA data correct after dedup"
 Assert-HashMatch -Path $fileB -ExpectedHash $env:RETOOL_TEST_HASH -Description "fileB data correct after dedup"
 
@@ -59,11 +59,11 @@ if ($reclaimed -gt 50MB) {
     Write-Host "    [PASS] > 50 MB reclaimed after volume-wide dedup" -ForegroundColor Green
     $script:TestsPassed++
 } else {
-    Write-Host ("    [WARN] Only {0} MB reclaimed — check that blocks were actually shared" -f [math]::Round($reclaimed/1MB,1)) -ForegroundColor Yellow
+    Write-Host ("    [WARN] Only {0} MB reclaimed - check that blocks were actually shared" -f [math]::Round($reclaimed/1MB,1)) -ForegroundColor Yellow
     # Not a hard fail: VHDX space reporting can lag; data integrity is the primary check
 }
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
+# -- Cleanup -------------------------------------------------------------------
 Remove-DriveFile -Path $fileA
 Remove-DriveFile -Path $fileB
 

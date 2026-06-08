@@ -1,12 +1,12 @@
 # retool
 
-**ReFS Tool** — A Windows command-line utility for inspecting and working with Resilient File System (ReFS) files at the block level.
+**ReFS Tool** - A Windows command-line utility for inspecting and working with Resilient File System (ReFS) files at the block level.
 
 [![Create Release & Publish](https://github.com/chrisstone/retool/actions/workflows/release.yml/badge.svg)](https://github.com/chrisstone/retool/actions/workflows/release.yml)
 
 ## Overview
 
-`retool` exposes ReFS block-level internals that Windows does not surface through normal file APIs. It lets you inspect how files are laid out on disk, measure actual deduplication savings, copy files in a way that preserves block sharing, and deduplicate files in-place — keeping your ReFS deduplication intact rather than breaking it with a conventional copy.
+`retool` exposes ReFS block-level internals that Windows does not surface through normal file APIs. It lets you inspect how files are laid out on disk, measure actual deduplication savings, copy files in a way that preserves block sharing, and deduplicate files in-place - keeping your ReFS deduplication intact rather than breaking it with a conventional copy.
 
 > [!WARNING]
 > **Administrator privileges are required** to run `retool`. All queries and block operations use low-level filesystem ioctls that require full administrative rights. Run the utility from an elevated Command Prompt or PowerShell window.
@@ -17,12 +17,12 @@
 ## Requirements
 
 - **Windows 10 / Windows Server 2016** or later (ReFS v3.x)
-- **Administrator privileges** — required for all operations (block-level ioctls mandate elevation)
-- **ReFS-formatted volume** — required for block cloning and deduplication
+- **Administrator privileges** - required for all operations (block-level ioctls mandate elevation)
+- **ReFS-formatted volume** - required for block cloning and deduplication
 
 ## Features
 
-### 1. `inspect` — Block Layout, Sharing Analysis & Volume Scan
+### 1. `inspect` - Block Layout, Sharing Analysis & Volume Scan
 
 Inspect a file's physical block layout, compare sharing across multiple files, or scan an entire volume to measure deduplication potential.
 
@@ -66,7 +66,7 @@ Add `-r` to include a per-file fragmentation report after the sharing matrix.
 
 ---
 
-### 2. `copy` — Deduplication-Preserving File Copy
+### 2. `copy` - Deduplication-Preserving File Copy
 
 Copy a file or directory tree while preserving ReFS block sharing using `FSCTL_DUPLICATE_EXTENTS_TO_FILE`.
 
@@ -75,7 +75,7 @@ retool copy <source> <dest> [options]
 retool copy <source-dir> <dest-dir> -r [options]
 ```
 
-**Same-volume copies** use extent duplication — the copied file shares physical blocks with the source, consuming no additional disk space for shared content. The deduplication relationship is preserved exactly.
+**Same-volume copies** use extent duplication - the copied file shares physical blocks with the source, consuming no additional disk space for shared content. The deduplication relationship is preserved exactly.
 
 **Cross-volume copies** (ReFS → ReFS, matching cluster size) preserve deduplication by tracking which source logical cluster numbers (LCNs) have already been copied to the destination and issuing `FSCTL_DUPLICATE_EXTENTS_TO_FILE` for duplicate blocks, rather than copying bytes twice.
 
@@ -99,9 +99,9 @@ For incompatible volumes (non-ReFS destination, cluster size mismatch), retool f
 
 ---
 
-### 3. `dedup` — In-Place File Deduplication
+### 3. `dedup` - In-Place File Deduplication
 
-Deduplicate files already resident on a ReFS volume using `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Identifies clusters with identical SHA-256 content and replaces physical duplicates with shared block references — reclaiming disk space without touching file data.
+Deduplicate files already resident on a ReFS volume using `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Identifies clusters with identical SHA-256 content and replaces physical duplicates with shared block references - reclaiming disk space without touching file data.
 
 ```
 retool dedup <volume-root>
@@ -127,7 +127,7 @@ Both modes support `-n` to report what would be reclaimed without making any cha
 
 ---
 
-### 4. `volume` — Volume-Level Block Statistics
+### 4. `volume` - Volume-Level Block Statistics
 
 Display ReFS volume-level information including cluster size, total clusters, free space, and used space.
 
@@ -155,7 +155,7 @@ cd retool
 # Configure
 cmake --preset debug    # or: cmake --preset release
 
-# Build (use the build directory directly — build presets require VS CMake integration)
+# Build (use the build directory directly - build presets require VS CMake integration)
 cmake --build build/debug --config Debug
 cmake --build build/release --config Release
 ```
@@ -213,7 +213,7 @@ retool dedup E:\ -n -j -o dedup-report.json
 - Block inspection uses `FSCTL_GET_RETRIEVAL_POINTERS` to query VCN → LCN extent maps for each file.
 - Block cloning uses `FSCTL_DUPLICATE_EXTENTS_TO_FILE` (ReFS only; both files must reside on the same volume).
 - SHA-256 hashing for content-based deduplication uses the Windows **CNG BCrypt API**, which automatically leverages SHA-NI processor instructions for hardware acceleration when available.
-- LCN values (logical cluster numbers) are volume-relative and directly comparable across files on the same volume — two files referencing the same LCN share that physical block.
+- LCN values (logical cluster numbers) are volume-relative and directly comparable across files on the same volume - two files referencing the same LCN share that physical block.
 - All block-level operations require Administrator privileges.
 
 ---

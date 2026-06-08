@@ -1,10 +1,10 @@
-# AGENTS.md — Agent Guidelines for retool
+# AGENTS.md - Agent Guidelines for retool
 
 This file provides guidance for AI coding agents working on this repository.
 
 ## Project Overview
 
-`retool` is a Windows C++ command-line utility for inspecting and working with ReFS (Resilient File System) files at the block level. It is built with CMake and targets the Windows SDK/DDK only — no external libraries.
+`retool` is a Windows C++ command-line utility for inspecting and working with ReFS (Resilient File System) files at the block level. It is built with CMake and targets the Windows SDK/DDK only - no external libraries.
 
 See [README.md](README.md) for full feature descriptions and [doc/features.md](doc/features.md) for detailed technical specifications.
 
@@ -76,9 +76,9 @@ retool/
 - **Administrator privileges** are required at runtime; do not attempt to work around this.
 - **Unicode throughout.** Use `wchar_t` / `std::wstring` / `LPWSTR` for all paths and system strings.
 - **ReFS ioctls** of primary interest:
-  - `FSCTL_GET_RETRIEVAL_POINTERS` — VCN→LCN extent map for a file
-  - `FSCTL_DUPLICATE_EXTENTS_TO_FILE` — block clone (same-volume ReFS only)
-  - `FSCTL_QUERY_EXTENT_METADATA` — ReFS-specific extent metadata (undocumented; use carefully)
+  - `FSCTL_GET_RETRIEVAL_POINTERS` - VCN→LCN extent map for a file
+  - `FSCTL_DUPLICATE_EXTENTS_TO_FILE` - block clone (same-volume ReFS only)
+  - `FSCTL_QUERY_EXTENT_METADATA` - ReFS-specific extent metadata (undocumented; use carefully)
 
 ## Workflow
 

@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    33_copy_cross_volume_scan_dest.ps1 — Test: retool copy <src> <dest> -d
+    33_copy_cross_volume_scan_dest.ps1 - Test: retool copy <src> <dest> -d
 
 .DESCRIPTION
     Pre-populates Drive B with a copy of the test file using a regular copy.
@@ -18,9 +18,9 @@
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: copy — cross-volume with -d (content-hash matching)" -ForegroundColor White
+Write-Host "TEST: copy - cross-volume with -d (content-hash matching)" -ForegroundColor White
 
-# ── Arrange ───────────────────────────────────────────────────────────────────
+# -- Arrange -------------------------------------------------------------------
 Write-Section "Arrange"
 $drvA = $env:RETOOL_DRIVE_A -replace ':',''
 $drvB = $env:RETOOL_DRIVE_B -replace ':',''
@@ -36,13 +36,13 @@ Copy-Item $env:RETOOL_TEST_FILE $src -Force
 Remove-DriveFile -Path $dest
 Assert-FileExists -Path $src -Description "Source file on Drive A"
 
-# ── Act ───────────────────────────────────────────────────────────────────────
+# -- Act -----------------------------------------------------------------------
 Write-Section "Run: retool copy <src> <dest> -d"
 $out = Invoke-Retool -Args @('copy', $src, $dest, '-d')
 & $env:RETOOL_EXE copy $src $dest -d | Out-Null
 $exitCode = $LASTEXITCODE
 
-# ── Assert ────────────────────────────────────────────────────────────────────
+# -- Assert --------------------------------------------------------------------
 Write-Section "Assertions"
 Assert-ExitCode -Expected 0 -Actual $exitCode -Description "Exit code 0"
 Assert-FileExists -Path $dest                 -Description "Destination file exists"
@@ -50,7 +50,7 @@ Assert-HashMatch -Path $dest -ExpectedHash $env:RETOOL_TEST_HASH -Description "D
 Assert-HashMatch -Path $src  -ExpectedHash $env:RETOOL_TEST_HASH -Description "Source unchanged"
 Assert-HashMatch -Path $seedFile -ExpectedHash $env:RETOOL_TEST_HASH -Description "Seed file unchanged"
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
+# -- Cleanup -------------------------------------------------------------------
 Remove-DriveFile -Path $src
 Remove-DriveFile -Path $dest
 Remove-DriveFile -Path $seedFile

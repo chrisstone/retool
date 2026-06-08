@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    34_copy_dry_run.ps1 — Test: retool copy <src> <dest> -n
+    34_copy_dry_run.ps1 - Test: retool copy <src> <dest> -n
 
 .DESCRIPTION
     Runs 'retool copy -n' and verifies:
@@ -14,12 +14,12 @@
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: copy — dry run (--dry-run)" -ForegroundColor White
+Write-Host "TEST: copy - dry run (--dry-run)" -ForegroundColor White
 
 $drvA = $env:RETOOL_DRIVE_A -replace ':',''
 $drvB = $env:RETOOL_DRIVE_B -replace ':',''
 
-# ── Same-volume dry run ───────────────────────────────────────────────────────
+# -- Same-volume dry run -------------------------------------------------------
 Write-Section "Same-volume -n"
 $src  = "{0}:\dryrun_src.bin" -f $drvA
 $dest = "{0}:\dryrun_dest.bin" -f $drvA
@@ -40,7 +40,7 @@ if (-not (Test-Path $dest)) {
 Assert-HashMatch -Path $src -ExpectedHash $env:RETOOL_TEST_HASH -Description "Source unchanged after dry-run"
 Assert-OutputContains -Output ($out -join "`n") -Substring 'dry' -Description "Output mentions dry-run"
 
-# ── Cross-volume dry run ──────────────────────────────────────────────────────
+# -- Cross-volume dry run ------------------------------------------------------
 Write-Section "Cross-volume -n"
 $destB = "{0}:\dryrun_dest_b.bin" -f $drvB
 Remove-DriveFile -Path $destB
@@ -57,7 +57,7 @@ if (-not (Test-Path $destB)) {
     Remove-DriveFile -Path $destB
 }
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
+# -- Cleanup -------------------------------------------------------------------
 Remove-DriveFile -Path $src
 
 Exit-TestSummary -ScriptName $MyInvocation.MyCommand.Name

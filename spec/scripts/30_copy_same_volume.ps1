@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    30_copy_same_volume.ps1 — Test: retool copy <src> <dest> (same ReFS volume)
+    30_copy_same_volume.ps1 - Test: retool copy <src> <dest> (same ReFS volume)
 
 .DESCRIPTION
     Copies the test file onto Drive A, then uses retool copy to clone it to a second
@@ -16,9 +16,9 @@
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: copy — same-volume clone (FSCTL_DUPLICATE_EXTENTS_TO_FILE)" -ForegroundColor White
+Write-Host "TEST: copy - same-volume clone (FSCTL_DUPLICATE_EXTENTS_TO_FILE)" -ForegroundColor White
 
-# ── Arrange ───────────────────────────────────────────────────────────────────
+# -- Arrange -------------------------------------------------------------------
 Write-Section "Arrange"
 $drv = $env:RETOOL_DRIVE_A -replace ':',''
 $src  = "{0}:\copy_src.bin" -f $drv
@@ -30,13 +30,13 @@ Assert-FileExists -Path $src -Description "Source file on Drive A"
 $freeBeforeMB = [math]::Round((Get-PSDrive -Name $drv).Free / 1MB, 1)
 Write-Host ("    Free space before copy: {0} MB" -f $freeBeforeMB) -ForegroundColor DarkGray
 
-# ── Act ───────────────────────────────────────────────────────────────────────
+# -- Act -----------------------------------------------------------------------
 Write-Section "Run: retool copy <src> <dest> (same volume)"
 $out = Invoke-Retool -Args @('copy', $src, $dest)
 & $env:RETOOL_EXE copy $src $dest | Out-Null
 $exitCode = $LASTEXITCODE
 
-# ── Assert ────────────────────────────────────────────────────────────────────
+# -- Assert --------------------------------------------------------------------
 Write-Section "Assertions"
 Assert-ExitCode -Expected 0 -Actual $exitCode       -Description "Exit code 0"
 Assert-FileExists -Path $dest                        -Description "Destination file exists"
@@ -51,11 +51,11 @@ if ($dropped -lt 10) {
     Write-Host "    [PASS] Disk space consumption < 10 MB (blocks are shared)" -ForegroundColor Green
     $script:TestsPassed++
 } else {
-    Write-Host ("    [WARN] Disk dropped {0} MB — blocks may not be shared (ReFS dedup may not have fired)" -f $dropped) -ForegroundColor Yellow
+    Write-Host ("    [WARN] Disk dropped {0} MB - blocks may not be shared (ReFS dedup may not have fired)" -f $dropped) -ForegroundColor Yellow
     # Not a hard failure since VHDX allocation is approximate
 }
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
+# -- Cleanup -------------------------------------------------------------------
 Remove-DriveFile -Path $src
 Remove-DriveFile -Path $dest
 

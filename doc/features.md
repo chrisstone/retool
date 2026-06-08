@@ -1,4 +1,4 @@
-# doc/features.md — retool Feature Specifications
+# doc/features.md - retool Feature Specifications
 
 This document provides technical detail for each feature implemented in retool. It is intended to guide agent implementation and design decisions. For user-facing documentation see [README.md](file:///c:/Users/chris.stone/workspace/retool/README.md).
 
@@ -6,10 +6,10 @@ This document provides technical detail for each feature implemented in retool. 
 
 ## Index
 
-* [Feature 1: inspect — Block Layout, Sharing Analysis & Volume Scan](#feature-1-inspect--block-layout-sharing-analysis--volume-scan)
-* [Feature 2: copy — Deduplication-Preserving File Copy](#feature-2-copy--deduplication-preserving-file-copy)
-* [Feature 3: dedup — In-Place File Deduplication](#feature-3-dedup--in-place-file-deduplication)
-* [Feature 4: volume — Volume-Level Block Statistics](#feature-4-volume--volume-level-block-statistics)
+* [Feature 1: inspect - Block Layout, Sharing Analysis & Volume Scan](#feature-1-inspect--block-layout-sharing-analysis--volume-scan)
+* [Feature 2: copy - Deduplication-Preserving File Copy](#feature-2-copy--deduplication-preserving-file-copy)
+* [Feature 3: dedup - In-Place File Deduplication](#feature-3-dedup--in-place-file-deduplication)
+* [Feature 4: volume - Volume-Level Block Statistics](#feature-4-volume--volume-level-block-statistics)
 * [CLI Design](#cli-design)
 * [Output Format](#output-format)
 * [Error Handling & Privilege Model](#error-handling--privilege-model)
@@ -17,7 +17,7 @@ This document provides technical detail for each feature implemented in retool. 
 
 ---
 
-## Feature 1: [inspect](file:///c:/Users/chris.stone/workspace/retool/src/inspect.cpp) — Block Layout, Sharing Analysis & Volume Scan
+## Feature 1: [inspect](file:///c:/Users/chris.stone/workspace/retool/src/inspect.cpp) - Block Layout, Sharing Analysis & Volume Scan
 
 ### Purpose
 
@@ -31,10 +31,10 @@ Invoked when exactly one file path is supplied (and it is not a volume root).
 
 **Win32 API Sequence:**
 
-1. `CreateFileW` — open the file with `FILE_FLAG_BACKUP_SEMANTICS | GENERIC_READ | FILE_SHARE_READ | FILE_SHARE_WRITE`. Requires Administrator.
-2. `GetVolumePathNameW` — extract the volume root from the file path.
-3. `GetDiskFreeSpaceW` — obtain cluster size.
-4. Loop: `DeviceIoControl(FSCTL_GET_RETRIEVAL_POINTERS)` — iteratively query extents. Pass `STARTING_VCN_INPUT_BUFFER` starting at VCN 0; on each call the last `NextVcn` becomes the next starting VCN. Stop when the call returns `true` (all extents fit) or `ERROR_HANDLE_EOF` (sparse/small file).
+1. `CreateFileW` - open the file with `FILE_FLAG_BACKUP_SEMANTICS | GENERIC_READ | FILE_SHARE_READ | FILE_SHARE_WRITE`. Requires Administrator.
+2. `GetVolumePathNameW` - extract the volume root from the file path.
+3. `GetDiskFreeSpaceW` - obtain cluster size.
+4. Loop: `DeviceIoControl(FSCTL_GET_RETRIEVAL_POINTERS)` - iteratively query extents. Pass `STARTING_VCN_INPUT_BUFFER` starting at VCN 0; on each call the last `NextVcn` becomes the next starting VCN. Stop when the call returns `true` (all extents fit) or `ERROR_HANDLE_EOF` (sparse/small file).
 
 **Default output (summary only):**
 
@@ -104,9 +104,9 @@ Invoked when a single argument is a volume root (e.g. `E:\`).
 
 **Goal:** Walk every file on the volume, build a full LCN index, and report aggregate deduplication savings. Optionally hash every cluster to enable content-based matching.
 
-**Implementation — [inspect::build_lcn_index()](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L79-L83):**
+**Implementation - [inspect::build_lcn_index()](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L79-L83):**
 
-1. [enumerate_files_recursive()](file:///c:/Users/chris.stone/workspace/retool/src/inspect.cpp#L270-L305) — walks the volume tree with `FindFirstFileW` / `FindNextFileW`. Skips `FILE_ATTRIBUTE_SYSTEM` files and `FILE_ATTRIBUTE_REPARSE_POINT` junctions.
+1. [enumerate_files_recursive()](file:///c:/Users/chris.stone/workspace/retool/src/inspect.cpp#L270-L305) - walks the volume tree with `FindFirstFileW` / `FindNextFileW`. Skips `FILE_ATTRIBUTE_SYSTEM` files and `FILE_ATTRIBUTE_REPARSE_POINT` junctions.
 2. For each file, calls `inspect_file()` to obtain all extents via `FSCTL_GET_RETRIEVAL_POINTERS`.
 3. Populates [LcnIndex](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L36) (`unordered_map<LONGLONG, vector<BlockEntry>>`): maps each LCN to the file(s) (by interned index) and byte offsets that reference it.
 4. In `kWithHash` mode: additionally reads each cluster and computes a SHA-256 digest via the Windows CNG BCrypt API (`BCryptOpenAlgorithmProvider(BCRYPT_SHA256_ALGORITHM)`, `BCryptCreateHash`, `BCryptHashData`, `BCryptFinishHash`). The hardware SHA-NI instruction set is used automatically when available. Populates [HashIndex](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L40) (`unordered_map<string, vector<LONGLONG>>`): SHA-256 hex digest → list of LCNs with identical content.
@@ -199,10 +199,10 @@ all counts.
 **`compute_frag_stat(const FileInspectResult&) → FragStat`:**
 
 Iterates the file's `VcnExtent` list and accumulates:
-- `fragment_count` — number of non-sparse extents
-- `total_clusters` — sum of all non-sparse extent cluster counts
-- `min/max_extent_clusters` — smallest and largest non-sparse extent
-- `avg_extent_clusters` — mean extent size (`total_clusters / fragment_count`)
+- `fragment_count` - number of non-sparse extents
+- `total_clusters` - sum of all non-sparse extent cluster counts
+- `min/max_extent_clusters` - smallest and largest non-sparse extent
+- `avg_extent_clusters` - mean extent size (`total_clusters / fragment_count`)
 
 **`output_frag_report()` emitted fields:**
 
@@ -215,14 +215,14 @@ Iterates the file's `VcnExtent` list and accumulates:
 | Largest Extent | Max extent size in clusters and human-readable bytes |
 | Avg Extent | Mean extent size in clusters and human-readable bytes |
 
-Byte formatting uses `util::format_size(ULONGLONG bytes)` — renders as KB/MB/GB/TB with 2 decimal places.
+Byte formatting uses `util::format_size(ULONGLONG bytes)` - renders as KB/MB/GB/TB with 2 decimal places.
 
 > [!NOTE]
 > `-r` deliberately avoids `-f` (reserved for future `--force` semantics). In `copy` context, `-r` retains its meaning as recursive; in `inspect`, it means fragmentation report. Both map to `CliArg::recursive`.
 
 ---
 
-## Feature 2: `copy` — Deduplication-Preserving File Copy
+## Feature 2: `copy` - Deduplication-Preserving File Copy
 
 ### Purpose
 
@@ -232,22 +232,22 @@ Copy one or more files (or a full directory tree) while preserving ReFS block sh
 
 `execute_copy` is a three-phase pipeline:
 
-1. **Inspection** (`inspect_and_prepare`) — resolve paths, query volume topology, select strategy.
-2. **Operation** (`copy_directory_recursive` / `ICopyStrategy::copy_file`) — perform the copy.
-3. **Finalization** (`finalize_and_report`) — emit summary statistics.
+1. **Inspection** (`inspect_and_prepare`) - resolve paths, query volume topology, select strategy.
+2. **Operation** (`copy_directory_recursive` / `ICopyStrategy::copy_file`) - perform the copy.
+3. **Finalization** (`finalize_and_report`) - emit summary statistics.
 
 ### Strategy Selection
 
 | Condition | Strategy |
 |-----------|----------|
-| Same volume | `SameVolumeCopyStrategy` — pure `FSCTL_DUPLICATE_EXTENTS_TO_FILE` |
-| Different volumes, dest is ReFS, cluster sizes match | `CrossVolumeRefsCopyStrategy` — LCN-mapped dedup-preserving copy |
-| Otherwise | `FallbackCopyStrategy` — standard `CopyFileExW` |
+| Same volume | `SameVolumeCopyStrategy` - pure `FSCTL_DUPLICATE_EXTENTS_TO_FILE` |
+| Different volumes, dest is ReFS, cluster sizes match | `CrossVolumeRefsCopyStrategy` - LCN-mapped dedup-preserving copy |
+| Otherwise | `FallbackCopyStrategy` - standard `CopyFileExW` |
 
 ### Same-Volume Clone (`SameVolumeCopyStrategy`)
 
-1. `CreateFileW` on source — `GENERIC_READ | FILE_SHARE_READ`, `FILE_FLAG_BACKUP_SEMANTICS`.
-2. `CreateFileW` on destination — `GENERIC_READ | GENERIC_WRITE`, `CREATE_ALWAYS`, `FILE_FLAG_BACKUP_SEMANTICS`. Mark sparse via `FSCTL_SET_SPARSE`.
+1. `CreateFileW` on source - `GENERIC_READ | FILE_SHARE_READ`, `FILE_FLAG_BACKUP_SEMANTICS`.
+2. `CreateFileW` on destination - `GENERIC_READ | GENERIC_WRITE`, `CREATE_ALWAYS`, `FILE_FLAG_BACKUP_SEMANTICS`. Mark sparse via `FSCTL_SET_SPARSE`.
 3. Pre-size destination with `SetEndOfFile` (falls back to incremental sizing on disk-full).
 4. Query source extents via `FSCTL_GET_RETRIEVAL_POINTERS`.
 5. For each non-sparse extent: `DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)`.
@@ -255,12 +255,12 @@ Copy one or more files (or a full directory tree) while preserving ReFS block sh
 
 ### Cross-Volume Copy (`CrossVolumeRefsCopyStrategy`)
 
-Maintains `CopyContext::lcn_map` — a mapping from source LCN to `{dest_file_path, dest_byte_offset}` tracking every cluster already written to the destination.
+Maintains `CopyContext::lcn_map` - a mapping from source LCN to `{dest_file_path, dest_byte_offset}` tracking every cluster already written to the destination.
 
 For each extent of each source file, processes clusters in runs:
 
-- **Duplicate LCN run** (`clone_duplicate_run`): the source LCN is already in `lcn_map` — issue `FSCTL_DUPLICATE_EXTENTS_TO_FILE` using the previously-copied destination block. Scans forward to find the longest contiguous run that maps to contiguous destination offsets, cloning in a single ioctl call.
-- **New LCN run** (`copy_new_run`): LCN not seen before — physically copy bytes from source to destination in 4 MB chunks (`copy_bytes_physical`), then record every LCN in the run in `lcn_map`.
+- **Duplicate LCN run** (`clone_duplicate_run`): the source LCN is already in `lcn_map` - issue `FSCTL_DUPLICATE_EXTENTS_TO_FILE` using the previously-copied destination block. Scans forward to find the longest contiguous run that maps to contiguous destination offsets, cloning in a single ioctl call.
+- **New LCN run** (`copy_new_run`): LCN not seen before - physically copy bytes from source to destination in 4 MB chunks (`copy_bytes_physical`), then record every LCN in the run in `lcn_map`.
 
 Progress is reported per-cluster run via `IOutput::progress()`.
 
@@ -269,7 +269,7 @@ Progress is reported per-cluster run via `IOutput::progress()`.
 When `-d` is passed and the strategy is `CrossVolumeRefsCopyStrategy`, an additional **Phase 1b** runs before any file is copied:
 
 1. Calls `inspect::build_lcn_index(dest_volume_root, kWithHash, out)`.
-2. Seeds `CopyContext::lcn_map` from the resulting `LcnIndex` — each destination LCN is recorded as a pre-existing clone source.
+2. Seeds `CopyContext::lcn_map` from the resulting `LcnIndex` - each destination LCN is recorded as a pre-existing clone source.
 3. Stores the `HashIndex` in `CopyContext::hash_index` for future content-based matching.
 
 This allows blocks already physically present on the destination (from a prior copy or dedup operation) to be cloned rather than re-transferred.
@@ -285,7 +285,7 @@ Uses `CopyFileExW` with a progress callback forwarded to `IOutput::progress()`. 
 - Walk source with `FindFirstFileW` / `FindNextFileW`.
 - Mirror directory structure at destination using `CreateDirectoryW`.
 - Skip `FILE_ATTRIBUTE_SYSTEM` entries.
-- Best-effort by default — errors recorded in `CopyStats::errors`, reported in finalization. `-s` aborts on first error.
+- Best-effort by default - errors recorded in `CopyStats::errors`, reported in finalization. `-s` aborts on first error.
 
 ### Cancellation
 
@@ -305,19 +305,19 @@ A global `std::atomic<bool> copy::g_cancel_requested` is checked at every copy-l
 
 ---
 
-## Feature 3: `dedup` — In-Place File Deduplication
+## Feature 3: `dedup` - In-Place File Deduplication
 
 ### Purpose
 
-Deduplicate files already resident on a ReFS volume in-place using `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Identifies clusters with identical SHA-256 content and replaces physical duplicates with shared block references — reclaiming disk space without modifying file content.
+Deduplicate files already resident on a ReFS volume in-place using `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Identifies clusters with identical SHA-256 content and replaces physical duplicates with shared block references - reclaiming disk space without modifying file content.
 
 ### Pipeline Architecture
 
 `execute_dedup` is a three-phase pipeline:
 
-1. **Inspection** (`inspect_and_prepare`) — validate arguments, verify ReFS, run `build_lcn_index(kWithHash)`, select strategy.
-2. **Operation** (`execute_operation`) — apply `FSCTL_DUPLICATE_EXTENTS_TO_FILE` to each candidate cluster.
-3. **Finalization** (`finalize_and_report`) — emit summary statistics.
+1. **Inspection** (`inspect_and_prepare`) - validate arguments, verify ReFS, run `build_lcn_index(kWithHash)`, select strategy.
+2. **Operation** (`execute_operation`) - apply `FSCTL_DUPLICATE_EXTENTS_TO_FILE` to each candidate cluster.
+3. **Finalization** (`finalize_and_report`) - emit summary statistics.
 
 ### Modes and Strategy Selection
 
@@ -329,18 +329,18 @@ Deduplicate files already resident on a ReFS volume in-place using `FSCTL_DUPLIC
 ### Volume-Wide Deduplication (`VolumeWideDedupStrategy`)
 
 1. Receives the `ScanResult` from `build_lcn_index(kWithHash)`.
-2. Iterates `HashIndex` — for each SHA-256 digest with two or more LCNs:
+2. Iterates `HashIndex` - for each SHA-256 digest with two or more LCNs:
    - Designates `lcns[0]` as the canonical (master) cluster.
    - For each subsequent LCN in the group: produces a `DedupCandidate` with `canonical_path/offset` and `duplicate_path/offset`.
 3. Returns the full candidate list for Phase 2 execution.
 
 ### Pair-Wise Deduplication (`PairwiseDedupStrategy`)
 
-1. Partitions the `LcnIndex` by file — identifies exactly two distinct file paths.
-2. Iterates `HashIndex` — for each digest where one LCN belongs to file A and one to file B: produces a `DedupCandidate` pointing from file A (canonical) to file B (duplicate).
+1. Partitions the `LcnIndex` by file - identifies exactly two distinct file paths.
+2. Iterates `HashIndex` - for each digest where one LCN belongs to file A and one to file B: produces a `DedupCandidate` pointing from file A (canonical) to file B (duplicate).
 3. Skips hashes where both LCNs belong to the same file.
 
-### Operation — Cluster-Level Dedup
+### Operation - Cluster-Level Dedup
 
 For each `DedupCandidate`:
 
@@ -383,7 +383,7 @@ Space Reclaimed:  512.00 MB (536870912 bytes)
 
 ---
 
-## Feature 4: `volume` — Volume-Level Block Statistics
+## Feature 4: `volume` - Volume-Level Block Statistics
 
 ### Purpose
 
@@ -403,9 +403,9 @@ Used Space:     5.80 GB (6227702580 bytes)
 
 ### Win32 APIs
 
-- `GetVolumeInformationW` — file system name and flags.
-- `GetDiskFreeSpaceW` — sectors per cluster, bytes per sector.
-- `GetDiskFreeSpaceExW` — total and free bytes (64-bit safe).
+- `GetVolumeInformationW` - file system name and flags.
+- `GetDiskFreeSpaceW` - sectors per cluster, bytes per sector.
+- `GetDiskFreeSpaceExW` - total and free bytes (64-bit safe).
 
 ---
 
@@ -447,11 +447,11 @@ Implemented in `src/util.cpp` (`util::parse_arguments`). Uses the wide-character
 ### Plain Text (CLI)
 
 Human-readable, column-aligned. Rendered via `output::CliOutput`:
-- `message(Level, text)` — outputs informational (`Level::info`), warning (`Level::warn`), or error (`Level::error`) messages.
-- `field(name, value)` — key/value pairs.
-- `begin_table(columns)` / `table_row(values)` / `end_table()` — tabular output with auto-sized columns.
-- `begin_section(title)` / `end_section()` — groups related output.
-- `progress(filename, bytes_done, bytes_total)` — in-place progress bar overwriting the current line.
+- `message(Level, text)` - outputs informational (`Level::info`), warning (`Level::warn`), or error (`Level::error`) messages.
+- `field(name, value)` - key/value pairs.
+- `begin_table(columns)` / `table_row(values)` / `end_table()` - tabular output with auto-sized columns.
+- `begin_section(title)` / `end_section()` - groups related output.
+- `progress(filename, bytes_done, bytes_total)` - in-place progress bar overwriting the current line.
 
 ### JSON
 
@@ -468,7 +468,7 @@ Human-readable, column-aligned. Rendered via `output::CliOutput`:
 ### Privilege Check
 
 At startup, before any operation:
-1. `OpenProcessToken` + `GetTokenInformation(TokenElevation)` — verify the process is elevated.
+1. `OpenProcessToken` + `GetTokenInformation(TokenElevation)` - verify the process is elevated.
 2. If not elevated, print a clear error and exit with code 1:
    ```
    ERROR: retool requires Administrator privileges.
@@ -481,9 +481,9 @@ At startup, before any operation:
 - Default (best-effort): errors collected and reported in finalization summary.
 - `-s`: any error immediately exits with code 2.
 - Exit codes:
-  - `0` — success
-  - `1` — usage / privilege error
-  - `2` — operational error (file not found, ioctl failed, etc.)
+  - `0` - success
+  - `1` - usage / privilege error
+  - `2` - operational error (file not found, ioctl failed, etc.)
 
 ---
 
@@ -496,8 +496,8 @@ Key types as implemented:
 | [`util::CliArg`](file:///c:/Users/chris.stone/workspace/retool/src/util.h) | [`src/util.h`](file:///c:/Users/chris.stone/workspace/retool/src/util.h) | Parsed command-line arguments (command, positional, flags) |
 | [`inspect::ScanMode`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L23) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | Enum: `kLcnOnly` or `kWithHash` |
 | [`inspect::BlockEntry`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L29) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | Interned file path index + byte offset for one cluster reference |
-| [`inspect::LcnIndex`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L36) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | `unordered_map<LONGLONG, vector<BlockEntry>>` — LCN→file map |
-| [`inspect::HashIndex`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L40) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | `unordered_map<string, vector<LONGLONG>>` — SHA-256→LCN map |
+| [`inspect::LcnIndex`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L36) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | `unordered_map<LONGLONG, vector<BlockEntry>>` - LCN→file map |
+| [`inspect::HashIndex`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L40) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | `unordered_map<string, vector<LONGLONG>>` - SHA-256→LCN map |
 | [`inspect::ScanResult`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L43) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | Output of `build_lcn_index`: indexes, stats, errors, file_table |
 | [`copy::CopyContext`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp#L142) | [`src/copy.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp) | Pipeline state: paths, volumes, strategy, lcn_map, hash_index, stats |
 | [`copy::ICopyStrategy`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp#L205) | [`src/copy.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp) | Abstract interface: `copy_file(src, dest, args, context)` |

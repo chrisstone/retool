@@ -1,12 +1,12 @@
 #
-# .retool_common.ps1 — Shared helpers for all retool test scripts.
+# .retool_common.ps1 - Shared helpers for all retool test scripts.
 # Dot-source this file at the top of every 1X_ test script.
 #
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ── Load environment ──────────────────────────────────────────────────────────
+# -- Load environment ----------------------------------------------------------
 $envFile = Join-Path $PSScriptRoot '.retool_env.ps1'
 if (-not (Test-Path $envFile)) {
     Write-Error "Environment file not found: $envFile`nPlease run 00_setup.ps1 first."
@@ -14,11 +14,11 @@ if (-not (Test-Path $envFile)) {
 }
 . $envFile
 
-# ── Global test state ─────────────────────────────────────────────────────────
+# -- Global test state ---------------------------------------------------------
 $script:TestsPassed = 0
 $script:TestsFailed = 0
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------------
 
 <#
 .SYNOPSIS
@@ -27,11 +27,18 @@ $script:TestsFailed = 0
 #>
 function Invoke-Retool {
     param(
-        [string[]] $Args,
+        [Alias('Args')]
+        [string[]] $ToolArgs,
         [switch]   $AllowFailure
     )
-    Write-Host "    > retool $($Args -join ' ')" -ForegroundColor DarkGray
-    $output = & $env:RETOOL_EXE @Args 2>&1
+    Write-Host "    > retool $($ToolArgs -join ' ')" -ForegroundColor DarkGray
+    $oldEncoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [System.Text.Encoding]::Unicode
+        $output = & $env:RETOOL_EXE @ToolArgs 2>&1
+    } finally {
+        [Console]::OutputEncoding = $oldEncoding
+    }
     if ($LASTEXITCODE -ne 0 -and -not $AllowFailure) {
         Write-Error "retool exited with code $LASTEXITCODE`nOutput: $output"
     }
@@ -132,7 +139,7 @@ function Assert-ExitCode {
 function Write-Section {
     param([string] $Title)
     Write-Host ""
-    Write-Host "── $Title ──" -ForegroundColor Cyan
+    Write-Host "-- $Title --" -ForegroundColor Cyan
 }
 
 <#
@@ -142,14 +149,14 @@ function Write-Section {
 function Exit-TestSummary {
     param([string] $ScriptName)
     Write-Host ""
-    Write-Host "═══════════════════════════════════════" -ForegroundColor White
+    Write-Host "=======================================" -ForegroundColor White
     if ($script:TestsFailed -eq 0) {
         Write-Host "  RESULT: PASSED ($($script:TestsPassed) checks)" -ForegroundColor Green
     } else {
         Write-Host "  RESULT: FAILED ($($script:TestsFailed) failed / $($script:TestsPassed + $script:TestsFailed) total)" -ForegroundColor Red
     }
     Write-Host "  Script: $ScriptName" -ForegroundColor White
-    Write-Host "═══════════════════════════════════════" -ForegroundColor White
+    Write-Host "=======================================" -ForegroundColor White
     exit $(if ($script:TestsFailed -eq 0) { 0 } else { 1 })
 }
 

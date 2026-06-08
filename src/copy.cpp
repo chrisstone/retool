@@ -1160,7 +1160,7 @@ private:
             DWORD to_read = static_cast<DWORD>(std::min<ULONGLONG>(cluster_size, bytes_remaining));
 
             if (to_read == 0) {
-                // Past EOF — record in map and skip
+                // Past EOF - record in map and skip
                 context.lcn_map[ext.lcn + c_offset + k] = {path_idx, cluster_offset};
                 continue;
             }
@@ -1201,7 +1201,7 @@ private:
             }
 
             if (!cloned) {
-                // No match or clone failed — write physically
+                // No match or clone failed - write physically
                 LARGE_INTEGER li_dest;
                 li_dest.QuadPart = cluster_offset;
                 if (!SetFilePointerEx(dest_handle, li_dest, NULL, FILE_BEGIN)) {
@@ -1258,7 +1258,7 @@ private:
 };
 
 // ============================================================================
-// Phase 1: Inspection — Validate & Decorate Context
+// Phase 1: Inspection - Validate & Decorate Context
 // ============================================================================
 
 /**
@@ -1358,7 +1358,7 @@ std::expected<bool, std::wstring> seed_from_dest_scan(CopyContext& context) {
 }
 
 // ============================================================================
-// Phase 2: Operation — Directory Recursion
+// Phase 2: Operation - Directory Recursion
 // ============================================================================
 
 /**
@@ -1448,7 +1448,7 @@ std::expected<bool, std::wstring> copy_directory_recursive(
 }
 
 // ============================================================================
-// Phase 3: Finalization — Summary & Cleanup
+// Phase 3: Finalization - Summary & Cleanup
 // ============================================================================
 
 /**
@@ -1485,9 +1485,9 @@ int finalize_and_report(CopyContext& context) {
  * @brief Executes the copy subcommand.
  *
  * Orchestrates a three-phase pipeline:
- *   1. Inspection — validate inputs, query volumes, select strategy.
- *   2. Operation — recursively copy files using the selected strategy.
- *   3. Finalization — print summary statistics, return exit code.
+ *   1. Inspection - validate inputs, query volumes, select strategy.
+ *   2. Operation - recursively copy files using the selected strategy.
+ *   3. Finalization - print summary statistics, return exit code.
  *
  * @param args CLI arguments containing positional source and destination paths.
  * @return Exit code on success, or error string on failure.

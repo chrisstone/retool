@@ -1,17 +1,17 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    43_dedup_pairwise_dry_run.ps1 — Test: retool dedup <file1> <file2> -n
+    43_dedup_pairwise_dry_run.ps1 - Test: retool dedup <file1> <file2> -n
 
 .DESCRIPTION
-    Pair-wise dedup dry run — verifies no data is written and summary is reported.
+    Pair-wise dedup dry run - verifies no data is written and summary is reported.
 #>
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: dedup — pair-wise dry run (--dry-run)" -ForegroundColor White
+Write-Host "TEST: dedup - pair-wise dry run (--dry-run)" -ForegroundColor White
 
-# ── Arrange ───────────────────────────────────────────────────────────────────
+# -- Arrange -------------------------------------------------------------------
 Write-Section "Arrange"
 $drv   = $env:RETOOL_DRIVE_A -replace ':',''
 $fileA = "{0}:\pdry_a.bin" -f $drv
@@ -23,13 +23,13 @@ Assert-FileExists -Path $fileB -Description "fileB copied"
 
 $freeBefore = (Get-PSDrive -Name $drv).Free
 
-# ── Act ───────────────────────────────────────────────────────────────────────
+# -- Act -----------------------------------------------------------------------
 Write-Section "Run: retool dedup <file1> <file2> -n"
 $out = Invoke-Retool -Args @('dedup', $fileA, $fileB, '-n')
 & $env:RETOOL_EXE dedup $fileA $fileB -n | Out-Null
 $exitCode = $LASTEXITCODE
 
-# ── Assert ────────────────────────────────────────────────────────────────────
+# -- Assert --------------------------------------------------------------------
 Write-Section "Assertions"
 Assert-ExitCode -Expected 0 -Actual $exitCode -Description "Exit code 0"
 $outStr = $out -join "`n"
@@ -52,7 +52,7 @@ if ($delta -lt 1MB) {
     $script:TestsFailed++
 }
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
+# -- Cleanup -------------------------------------------------------------------
 Remove-DriveFile -Path $fileA
 Remove-DriveFile -Path $fileB
 

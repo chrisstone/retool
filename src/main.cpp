@@ -64,11 +64,11 @@ void print_command_help(const std::wstring& cmd) {
         std::wcout << L"Usage: retool inspect <file|dir|glob> [file2 ...] [options]\n"
                    << L"       retool inspect <volume-root> [options]\n\n"
                    << L"Inputs:\n"
-                   << L"  <file>          Single file  — 5-field summary; add -e for extent table\n"
-                   << L"  <file1> <file2> Multiple files — per-file cluster sharing report\n"
-                   << L"  <dir>           Directory — recursively enumerates all files\n"
+                   << L"  <file>          Single file  - 5-field summary; add -e for extent table\n"
+                   << L"  <file1> <file2> Multiple files - per-file cluster sharing report\n"
+                   << L"  <dir>           Directory - recursively enumerates all files\n"
                    << L"  <glob>          Glob pattern e.g. E:\\Data\\*.vbk (non-recursive)\n"
-                   << L"  <volume-root>   Volume scan e.g. E:\\ — full LCN index\n\n"
+                   << L"  <volume-root>   Volume scan e.g. E:\\ - full LCN index\n\n"
                    << L"Options:\n"
                    << L"  -e            Extended mode: extent table (single-file) or sharing\n"
                    << L"                matrix (multi-file); per-file cluster table always shown\n"
@@ -139,10 +139,10 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
 
 /**
  * @brief Application entry point.
- * 
+ *
  * Parses command line arguments, handles help and version flags, performs privilege
  * checks, checks OS-level ReFS support, and dispatches the specified subcommand.
- * 
+ *
  * @param argc The number of command line arguments.
  * @param argv The array of wide command line arguments.
  * @return int 0 on success, 1 on syntax or privilege error, 2 on operational error.

@@ -103,7 +103,7 @@ private:
 // ============================================================================
 
 /**
- * @brief Quiet output — all methods are no-ops.
+ * @brief Quiet output - all methods are no-ops.
  *
  * Selected via the -q CLI flag.
  */

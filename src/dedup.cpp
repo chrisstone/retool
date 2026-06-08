@@ -193,7 +193,7 @@ struct PairwiseDedupStrategy : IDedupStrategy {
             } else if (scan.resolve_path(entry0.file_index) == path_b && scan.resolve_path(entry1.file_index) == path_a) {
                 from = &entry1; to = &entry0;
             } else {
-                continue; // Both LCNs in the same file — skip
+                continue; // Both LCNs in the same file - skip
             }
 
             DedupCandidate cand;
@@ -331,7 +331,7 @@ std::expected<bool, std::wstring> inspect_and_prepare(
     }
     context.cluster_size = spc * bps;
 
-    // Run the scan (always kWithHash — we need content matching)
+    // Run the scan (always kWithHash - we need content matching)
     context.out->message(output::Level::info, L"[dedup.inspect_and_prepare] Scanning " + context.volume_root + L"...");
 
     auto scan = inspect::build_lcn_index(context.volume_root, inspect::ScanMode::kWithHash, *context.out);

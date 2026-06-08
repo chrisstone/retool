@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    10_volume_basic.ps1 — Test: retool volume <drive>
+    10_volume_basic.ps1 - Test: retool volume <drive>
 
 .DESCRIPTION
     Runs 'retool volume' against each of the three test drives and verifies:
@@ -13,10 +13,10 @@
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: volume — basic volume information" -ForegroundColor White
+Write-Host "TEST: volume - basic volume information" -ForegroundColor White
 
-# ── Drive A: ReFS 64K ─────────────────────────────────────────────────────────
-Write-Section ("Drive A ({0}) — ReFS 64K cluster" -f $env:RETOOL_DRIVE_A)
+# -- Drive A: ReFS 64K ---------------------------------------------------------
+Write-Section ("Drive A ({0}) - ReFS 64K cluster" -f $env:RETOOL_DRIVE_A)
 $out = Invoke-Retool -Args @('volume', $env:RETOOL_DRIVE_A)
 & $env:RETOOL_EXE volume $env:RETOOL_DRIVE_A | Out-Null
 Assert-ExitCode -Expected 0 -Actual $LASTEXITCODE -Description "retool volume DriveA exits 0"
@@ -25,24 +25,24 @@ Assert-OutputContains -Output ($out -join "`n") -Substring '65536'        -Descr
 Assert-OutputContains -Output ($out -join "`n") -Substring 'Total Space'  -Description "Drive A output has Total Space field"
 Assert-OutputContains -Output ($out -join "`n") -Substring 'Free Space'   -Description "Drive A output has Free Space field"
 
-# ── Drive B: ReFS 64K ─────────────────────────────────────────────────────────
-Write-Section ("Drive B ({0}) — ReFS 64K cluster" -f $env:RETOOL_DRIVE_B)
+# -- Drive B: ReFS 64K ---------------------------------------------------------
+Write-Section ("Drive B ({0}) - ReFS 64K cluster" -f $env:RETOOL_DRIVE_B)
 $out = Invoke-Retool -Args @('volume', $env:RETOOL_DRIVE_B)
 & $env:RETOOL_EXE volume $env:RETOOL_DRIVE_B | Out-Null
 Assert-ExitCode -Expected 0 -Actual $LASTEXITCODE -Description "retool volume DriveB exits 0"
 Assert-OutputContains -Output ($out -join "`n") -Substring 'ReFS'  -Description "Drive B reports ReFS filesystem"
 Assert-OutputContains -Output ($out -join "`n") -Substring '65536' -Description "Drive B reports 65536-byte cluster size"
 
-# ── Drive C: ReFS 4K ──────────────────────────────────────────────────────────
-Write-Section ("Drive C ({0}) — ReFS 4K cluster" -f $env:RETOOL_DRIVE_C)
+# -- Drive C: ReFS 4K ----------------------------------------------------------
+Write-Section ("Drive C ({0}) - ReFS 4K cluster" -f $env:RETOOL_DRIVE_C)
 $out = Invoke-Retool -Args @('volume', $env:RETOOL_DRIVE_C)
 & $env:RETOOL_EXE volume $env:RETOOL_DRIVE_C | Out-Null
 Assert-ExitCode -Expected 0 -Actual $LASTEXITCODE -Description "retool volume DriveC exits 0"
 Assert-OutputContains -Output ($out -join "`n") -Substring 'ReFS' -Description "Drive C reports ReFS filesystem"
 Assert-OutputContains -Output ($out -join "`n") -Substring '4096' -Description "Drive C reports 4096-byte cluster size"
 
-# ── JSON output variant ───────────────────────────────────────────────────────
-Write-Section "Drive A — JSON output"
+# -- JSON output variant -------------------------------------------------------
+Write-Section "Drive A - JSON output"
 $jsonOut = Invoke-Retool -Args @('volume', $env:RETOOL_DRIVE_A, '-j')
 & $env:RETOOL_EXE volume $env:RETOOL_DRIVE_A -j | Out-Null
 Assert-ExitCode -Expected 0 -Actual $LASTEXITCODE -Description "retool volume -j exits 0"

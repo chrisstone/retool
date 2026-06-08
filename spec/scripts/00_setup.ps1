@@ -1,22 +1,22 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    00_setup.ps1 — Test environment setup for retool spec scripts.
+    00_setup.ps1 - Test environment setup for retool spec scripts.
 
 .DESCRIPTION
     1. Verifies that build/debug/Debug/retool.exe exists (relative to repo root).
     2. Creates C:\Temp if it does not exist.
-    3. Creates a 100 MB binary test file at C:\Temp\testfile.bin.
+    3. Creates a 50 MB binary test file at C:\Temp\testfile.bin.
     4. Creates, attaches, initialises, and mounts three 1 GB VHDX files:
-         - retool-a.vhdx  (ReFS, 64 K cluster) → expected drive letter stored in $env:RETOOL_DRIVE_A
-         - retool-b.vhdx  (ReFS, 64 K cluster) → $env:RETOOL_DRIVE_B
-         - retool-c.vhdx  (ReFS,  4 K cluster) → $env:RETOOL_DRIVE_C
+         - retool-a.vhdx  (ReFS, 64 K cluster) -> expected drive letter stored in $env:RETOOL_DRIVE_A
+         - retool-b.vhdx  (ReFS, 64 K cluster) -> $env:RETOOL_DRIVE_B
+         - retool-c.vhdx  (ReFS,  4 K cluster) -> $env:RETOOL_DRIVE_C
     5. Writes a shared environment file (spec\scripts\.retool_env.ps1) that all
        subsequent test scripts dot-source to pick up drive-letter variables.
 
     RATIONALE FOR 1 GB SIZE:
     ReFS metadata overhead on a 1 GB volume consumes the majority of available
-    clusters, leaving just enough room for one 100 MB test file.  All subsequent
+    clusters, leaving just enough room for one 50 MB test file.  All subsequent
     "copies" of that file (without dedup) fill the disk, forcing retool's
     deduplication code paths to be exercised before additional files can coexist.
 #>
@@ -24,14 +24,14 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ── Paths ────────────────────────────────────────────────────────────────────
+# -- Paths --------------------------------------------------------------------
 $scriptDir  = $PSScriptRoot
 $repoRoot   = Resolve-Path (Join-Path $scriptDir '..\..')
 $retoolExe  = Join-Path $repoRoot 'build\debug\Debug\retool.exe'
 $vhdxDir    = 'C:\Temp'
 $envFile    = Join-Path $scriptDir '.retool_env.ps1'
 
-# ── 1. Verify retool.exe ─────────────────────────────────────────────────────
+# -- 1. Verify retool.exe -----------------------------------------------------
 Write-Host "==> Verifying retool.exe..." -ForegroundColor Cyan
 if (-not (Test-Path $retoolExe)) {
     Write-Error ("retool.exe not found at: {0}`nPlease build the project first: cmake --build build/debug --config Debug" -f $retoolExe)
@@ -39,7 +39,7 @@ if (-not (Test-Path $retoolExe)) {
 }
 Write-Host ("    Found: {0}" -f $retoolExe) -ForegroundColor Green
 
-# ── 2. Create C:\Temp ────────────────────────────────────────────────────────
+# -- 2. Create C:\Temp --------------------------------------------------------
 Write-Host "==> Creating C:\Temp..." -ForegroundColor Cyan
 if (-not (Test-Path $vhdxDir)) {
     New-Item -ItemType Directory -Path $vhdxDir | Out-Null
@@ -48,9 +48,9 @@ if (-not (Test-Path $vhdxDir)) {
     Write-Host "    C:\Temp already exists" -ForegroundColor Yellow
 }
 
-# ── 3. Create 100 MB test file ───────────────────────────────────────────────
+# -- 3. Create 50 MB test file -----------------------------------------------
 $testFile = Join-Path $vhdxDir 'testfile.bin'
-Write-Host ("==> Creating 100 MB test file at {0}..." -f $testFile) -ForegroundColor Cyan
+Write-Host ("==> Creating 50 MB test file at {0}..." -f $testFile) -ForegroundColor Cyan
 if (Test-Path $testFile) {
     Write-Host "    Removing existing test file" -ForegroundColor Yellow
     Remove-Item $testFile -Force
@@ -61,7 +61,7 @@ $rng = [System.Random]::new(42)
 $buf = [byte[]]::new(1MB)
 $fs  = [System.IO.File]::OpenWrite($testFile)
 try {
-    for ($i = 0; $i -lt 100; $i++) {
+    for ($i = 0; $i -lt 50; $i++) {
         $rng.NextBytes($buf)
         $fs.Write($buf, 0, $buf.Length)
     }
@@ -71,7 +71,7 @@ try {
 $testHash = (Get-FileHash $testFile -Algorithm SHA256).Hash
 Write-Host ("    Created {0}  SHA-256: {1}" -f $testFile, $testHash) -ForegroundColor Green
 
-# ── Helper: create, attach, format, and mount a VHDX ────────────────────────
+# -- Helper: create, attach, format, and mount a VHDX ------------------------
 function New-RetoolVhdx {
     param(
         [string] $VhdxPath,
@@ -133,7 +133,7 @@ function New-RetoolVhdx {
     return $driveLetter
 }
 
-# ── 4. Create three VHDXs ────────────────────────────────────────────────────
+# -- 4. Create three VHDXs ----------------------------------------------------
 $vhdxA = Join-Path $vhdxDir 'retool-a.vhdx'
 $vhdxB = Join-Path $vhdxDir 'retool-b.vhdx'
 $vhdxC = Join-Path $vhdxDir 'retool-c.vhdx'
@@ -147,10 +147,10 @@ $driveB = New-RetoolVhdx -VhdxPath $vhdxB -SizeMB 1024 -ClusterSizeBytes 65536 -
 Write-Host "==> Creating VHDX C (ReFS 4K cluster)..." -ForegroundColor Cyan
 $driveC = New-RetoolVhdx -VhdxPath $vhdxC -SizeMB 1024 -ClusterSizeBytes 4096  -VolumeLabel 'RetoolC'
 
-# ── 5. Write environment file ────────────────────────────────────────────────
+# -- 5. Write environment file ------------------------------------------------
 Write-Host ("==> Writing environment file: {0}" -f $envFile) -ForegroundColor Cyan
 @'
-# Auto-generated by 00_setup.ps1 — do not edit manually.
+# Auto-generated by 00_setup.ps1 - do not edit manually.
 $env:RETOOL_EXE    = '{0}'
 $env:RETOOL_DRIVE_A = '{1}:'
 $env:RETOOL_DRIVE_B = '{2}:'

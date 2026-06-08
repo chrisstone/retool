@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    36_copy_json.ps1 — Test: retool copy <src> <dest> -j
+    36_copy_json.ps1 - Test: retool copy <src> <dest> -j
 
 .DESCRIPTION
     Runs 'retool copy -j' for same-volume and cross-volume cases.
@@ -13,12 +13,12 @@
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: copy — JSON output (--json)" -ForegroundColor White
+Write-Host "TEST: copy - JSON output (--json)" -ForegroundColor White
 
 $drvA = $env:RETOOL_DRIVE_A -replace ':',''
 $drvB = $env:RETOOL_DRIVE_B -replace ':',''
 
-# ── Same-volume JSON ──────────────────────────────────────────────────────────
+# -- Same-volume JSON ----------------------------------------------------------
 Write-Section "Same-volume copy -j"
 $src  = "{0}:\json_copy_src.bin" -f $drvA
 $dest = "{0}:\json_copy_dest.bin" -f $drvA
@@ -33,7 +33,7 @@ Assert-NotEmpty -Value $json -Description "Same-volume JSON output parses"
 Assert-FileExists -Path $dest                     -Description "Destination exists"
 Assert-HashMatch -Path $dest -ExpectedHash $env:RETOOL_TEST_HASH -Description "Destination data correct"
 
-# ── Cross-volume JSON ─────────────────────────────────────────────────────────
+# -- Cross-volume JSON ---------------------------------------------------------
 Write-Section "Cross-volume copy -j"
 $destB = "{0}:\json_copy_dest_b.bin" -f $drvB
 Remove-DriveFile -Path $destB
@@ -46,7 +46,7 @@ Assert-NotEmpty -Value $json -Description "Cross-volume JSON output parses"
 Assert-FileExists -Path $destB                     -Description "Cross-volume destination exists"
 Assert-HashMatch -Path $destB -ExpectedHash $env:RETOOL_TEST_HASH -Description "Cross-volume data correct"
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
+# -- Cleanup -------------------------------------------------------------------
 Remove-DriveFile -Path $src
 Remove-DriveFile -Path $dest
 Remove-DriveFile -Path $destB

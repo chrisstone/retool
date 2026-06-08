@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    24_inspect_volume.ps1 — Test: retool inspect <volume-root>
+    24_inspect_volume.ps1 - Test: retool inspect <volume-root>
 
 .DESCRIPTION
     Copies the test file to Drive A, then runs 'retool inspect E:\' (volume scan mode).
@@ -15,22 +15,22 @@
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: inspect — volume scan mode" -ForegroundColor White
+Write-Host "TEST: inspect - volume scan mode" -ForegroundColor White
 
-# ── Arrange ───────────────────────────────────────────────────────────────────
+# -- Arrange -------------------------------------------------------------------
 Write-Section "Arrange"
 $drv = $env:RETOOL_DRIVE_A -replace ':',''
 $file = "{0}:\vol_scan_test.bin" -f $drv
 Copy-Item $env:RETOOL_TEST_FILE $file -Force
 Assert-FileExists -Path $file -Description "Test file copied to Drive A"
 
-# ── Act ───────────────────────────────────────────────────────────────────────
+# -- Act -----------------------------------------------------------------------
 Write-Section ("Run: retool inspect {0}" -f $env:RETOOL_DRIVE_A)
 $out = Invoke-Retool -Args @('inspect', $env:RETOOL_DRIVE_A)
 & $env:RETOOL_EXE inspect $env:RETOOL_DRIVE_A | Out-Null
 $exitCode = $LASTEXITCODE
 
-# ── Assert ────────────────────────────────────────────────────────────────────
+# -- Assert --------------------------------------------------------------------
 Write-Section "Assertions"
 Assert-ExitCode -Expected 0 -Actual $exitCode -Description "Exit code 0"
 $outStr = $out -join "`n"
@@ -42,7 +42,7 @@ Assert-OutputContains -Output $outStr -Substring 'Dedup Savings'    -Description
 # File on volume should be intact
 Assert-HashMatch -Path $file -ExpectedHash $env:RETOOL_TEST_HASH -Description "File on volume intact after scan"
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
+# -- Cleanup -------------------------------------------------------------------
 Remove-DriveFile -Path $file
 
 Exit-TestSummary -ScriptName $MyInvocation.MyCommand.Name

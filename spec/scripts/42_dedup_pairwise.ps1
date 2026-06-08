@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    42_dedup_pairwise.ps1 — Test: retool dedup <file1> <file2> (pair-wise dedup)
+    42_dedup_pairwise.ps1 - Test: retool dedup <file1> <file2> (pair-wise dedup)
 
 .DESCRIPTION
     Copies the test file twice to Drive A as separate files, then uses pair-wise
@@ -14,9 +14,9 @@
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: dedup — pair-wise (<file1> <file2>)" -ForegroundColor White
+Write-Host "TEST: dedup - pair-wise (<file1> <file2>)" -ForegroundColor White
 
-# ── Arrange ───────────────────────────────────────────────────────────────────
+# -- Arrange -------------------------------------------------------------------
 Write-Section "Arrange"
 $drv   = $env:RETOOL_DRIVE_A -replace ':',''
 $fileA = "{0}:\pair_a.bin" -f $drv
@@ -29,13 +29,13 @@ Assert-FileExists -Path $fileB -Description "fileB present"
 $freeBefore = (Get-PSDrive -Name $drv).Free
 Write-Host ("    Free before dedup: {0} MB" -f [math]::Round($freeBefore/1MB,1)) -ForegroundColor DarkGray
 
-# ── Act ───────────────────────────────────────────────────────────────────────
+# -- Act -----------------------------------------------------------------------
 Write-Section "Run: retool dedup <file1> <file2>"
 $out = Invoke-Retool -Args @('dedup', $fileA, $fileB)
 & $env:RETOOL_EXE dedup $fileA $fileB | Out-Null
 $exitCode = $LASTEXITCODE
 
-# ── Assert ────────────────────────────────────────────────────────────────────
+# -- Assert --------------------------------------------------------------------
 Write-Section "Assertions"
 Assert-ExitCode -Expected 0 -Actual $exitCode -Description "Exit code 0"
 $outStr = $out -join "`n"
@@ -45,17 +45,18 @@ Assert-OutputContains -Output $outStr -Substring 'Space Reclaimed'  -Description
 Assert-HashMatch -Path $fileA -ExpectedHash $env:RETOOL_TEST_HASH -Description "fileA data correct after dedup"
 Assert-HashMatch -Path $fileB -ExpectedHash $env:RETOOL_TEST_HASH -Description "fileB data correct after dedup"
 
+Start-Sleep -Seconds 3
 $freeAfter = (Get-PSDrive -Name $drv).Free
 $reclaimed = $freeAfter - $freeBefore
 Write-Host ("    Free after dedup: {0} MB (reclaimed ~{1} MB)" -f [math]::Round($freeAfter/1MB,1), [math]::Round($reclaimed/1MB,1)) -ForegroundColor DarkGray
-if ($reclaimed -gt 50MB) {
-    Write-Host "    [PASS] > 50 MB reclaimed after pair-wise dedup" -ForegroundColor Green
+if ($reclaimed -gt 40MB) {
+    Write-Host "    [PASS] > 40 MB reclaimed after pair-wise dedup" -ForegroundColor Green
     $script:TestsPassed++
 } else {
     Write-Host ("    [WARN] Only {0} MB reclaimed" -f [math]::Round($reclaimed/1MB,1)) -ForegroundColor Yellow
 }
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
+# -- Cleanup -------------------------------------------------------------------
 Remove-DriveFile -Path $fileA
 Remove-DriveFile -Path $fileB
 

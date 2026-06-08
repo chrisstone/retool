@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    25_inspect_filelist.ps1 — Test: retool inspect -i <filelist.txt>
+    25_inspect_filelist.ps1 - Test: retool inspect -i <filelist.txt>
 
 .DESCRIPTION
     Writes a newline-delimited file list to C:\Temp, copies two test files to Drive A,
@@ -15,9 +15,9 @@
 
 . (Join-Path $PSScriptRoot '.retool_common.ps1')
 
-Write-Host "TEST: inspect — file list input (-i)" -ForegroundColor White
+Write-Host "TEST: inspect - file list input (-i)" -ForegroundColor White
 
-# ── Arrange ───────────────────────────────────────────────────────────────────
+# -- Arrange -------------------------------------------------------------------
 Write-Section "Arrange"
 $drv = $env:RETOOL_DRIVE_A -replace ':',''
 $file1 = "{0}:\filelist_a.bin" -f $drv
@@ -35,13 +35,13 @@ $bytes = $bom + [System.Text.Encoding]::UTF8.GetBytes($listContent)
 [System.IO.File]::WriteAllBytes($listPath, $bytes)
 Assert-FileExists -Path $listPath -Description "File list created at C:\Temp\retool_filelist.txt"
 
-# ── Act ───────────────────────────────────────────────────────────────────────
+# -- Act -----------------------------------------------------------------------
 Write-Section "Run: retool inspect -i <filelist>"
 $out = Invoke-Retool -Args @('inspect', '-i', $listPath, '-e')
 & $env:RETOOL_EXE inspect -i $listPath -e | Out-Null
 $exitCode = $LASTEXITCODE
 
-# ── Assert ────────────────────────────────────────────────────────────────────
+# -- Assert --------------------------------------------------------------------
 Write-Section "Assertions"
 Assert-ExitCode -Expected 0 -Actual $exitCode -Description "Exit code 0"
 $outStr = $out -join "`n"
@@ -52,7 +52,7 @@ Assert-OutputContains -Output $outStr -Substring 'F0'             -Description "
 Assert-HashMatch -Path $file1 -ExpectedHash $env:RETOOL_TEST_HASH -Description "file1 intact"
 Assert-HashMatch -Path $file2 -ExpectedHash $env:RETOOL_TEST_HASH -Description "file2 intact"
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
+# -- Cleanup -------------------------------------------------------------------
 Remove-DriveFile -Path $file1
 Remove-DriveFile -Path $file2
 Remove-Item $listPath -Force -ErrorAction SilentlyContinue

@@ -620,7 +620,7 @@ void output_frag_report(const FileInspectResult& res, const FragStat& stat, outp
  * @brief Outputs the multi-file inspect report via IOutput.
  *
  * Default (show_extended = false): emits the aggregate summary fields and the
- * per-file unique/shared cluster breakdown table only — no cross-file sharing
+ * per-file unique/shared cluster breakdown table only - no cross-file sharing
  * matrix and no per-cluster correlation detail.
  *
  * Extended (show_extended = true, -e flag): additionally emits the cross-file
@@ -970,7 +970,7 @@ std::vector<std::wstring> expand_path_glob(
     if (last_sep != std::wstring::npos) {
         dir_part = arg.substr(0, last_sep + 1);
     } else {
-        // No directory prefix — use current directory
+        // No directory prefix - use current directory
         wchar_t cwd[MAX_PATH];
         if (GetCurrentDirectoryW(MAX_PATH, cwd)) {
             dir_part = std::wstring(cwd) + L'\\';
