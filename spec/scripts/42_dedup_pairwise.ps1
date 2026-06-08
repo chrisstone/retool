@@ -45,7 +45,7 @@ Assert-OutputContains -Output $outStr -Substring 'Space Reclaimed'  -Description
 Assert-HashMatch -Path $fileA -ExpectedHash $env:RETOOL_TEST_HASH -Description "fileA data correct after dedup"
 Assert-HashMatch -Path $fileB -ExpectedHash $env:RETOOL_TEST_HASH -Description "fileB data correct after dedup"
 
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 10
 $freeAfter = (Get-PSDrive -Name $drv).Free
 $reclaimed = $freeAfter - $freeBefore
 Write-Host ("    Free after dedup: {0} MB (reclaimed ~{1} MB)" -f [math]::Round($freeAfter/1MB,1), [math]::Round($reclaimed/1MB,1)) -ForegroundColor DarkGray

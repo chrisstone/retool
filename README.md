@@ -14,6 +14,9 @@
 > [!CAUTION]
 > `retool` **Copy** and **Dedupe** commands change data on disk. Please run in **dry-run mode** (`-n`) first to see what will happen before running the command for real. Data loss is possible. There is no undo command. Backups are strongly recommended.
 
+> [!IMPORTANT]
+> Analyzing large files or large numbers of files with `retool` may take a long time and consume a significant amount of RAM. For example, analyzing a 100 GB file with `retool inspect` may take several minutes and consume several hundred MB of RAM.
+
 ## Requirements
 
 - **Windows 10 / Windows Server 2016** or later (ReFS v3.x)
