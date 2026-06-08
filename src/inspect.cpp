@@ -577,7 +577,9 @@ FragStat compute_frag_stat(const FileInspectResult& res) {
  * @param out   The output interface.
  */
 void output_frag_report(const FileInspectResult& res, const FragStat& stat, output::IOutput& out) {
-    out.begin_section(L"Fragmentation Report");
+    // begin_nested_section: CLI prints "--- Fragmentation Report ---"; JSON nests
+    // fields under data.fragmentationReport rather than writing them flat into data.
+    out.begin_nested_section(L"Fragmentation Report");
     out.field(L"File",             res.path);
     out.field(L"Fragments",        std::to_wstring(stat.fragment_count));
     out.field(L"Frag Score",       std::to_wstring(stat.fragment_count) +
@@ -604,8 +606,9 @@ void output_frag_report(const FileInspectResult& res, const FragStat& stat, outp
            << L" clusters (" << util::format_size(avg_bytes) << L")";
         out.field(L"Avg Extent",     ss.str());
     }
-    out.end_section();
+    out.end_nested_section();
 }
+
 
 /**
  * @brief Outputs the multi-file inspect report via IOutput.

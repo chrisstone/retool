@@ -80,6 +80,20 @@ struct IOutput {
      * (e.g., "inspect_multi", "inspect_scan"). Default is a no-op.
      */
     virtual void set_command(const std::wstring&) {}
+
+    /**
+     * @brief Begin a section that must be nested as a sub-object in JSON output.
+     *
+     * In JSON: always creates a named sub-object within the current data context,
+     * regardless of nesting depth — use for semantic sub-sections like fragmentation.
+     * In CLI/NoOutput: delegates to begin_section() for the same display as today.
+     *
+     * @param name Section/sub-object name (e.g., L"Fragmentation Report").
+     */
+    virtual void begin_nested_section(const std::wstring& name) { begin_section(name); }
+
+    /// @brief End a section started by begin_nested_section().
+    virtual void end_nested_section() { end_section(); }
 };
 
 // ============================================================================
@@ -104,6 +118,8 @@ struct NoOutput : IOutput {
     void progress(const std::wstring&, ULONGLONG, ULONGLONG) override {}
     void flush() override {}
     void set_command(const std::wstring&) override {}
+    void begin_nested_section(const std::wstring&) override {}
+    void end_nested_section() override {}
 };
 
 /**
@@ -134,6 +150,9 @@ struct CliOutput : IOutput {
     /// @brief No-op: CLI output has no command envelope.
     void set_command(const std::wstring&) override {}
 
+    /// @brief Delegates to begin_section() — CLI displays frag report as a normal section.
+    void begin_nested_section(const std::wstring& name) override { begin_section(name); }
+    void end_nested_section() override { end_section(); }
 
 private:
     /// @brief Renders the 20-character progress bar string from a percentage.
@@ -189,6 +208,10 @@ struct JsonOutput : IOutput {
 
     /// @brief Override the command field in the JSON envelope at runtime.
     void set_command(const std::wstring& command) override;
+
+    /// @brief Always creates a named sub-object, regardless of current nesting depth.
+    void begin_nested_section(const std::wstring& name) override;
+    void end_nested_section() override;
 
 private:
     nlohmann::ordered_json root_;                                ///< Top-level JSON envelope.

@@ -527,6 +527,26 @@ void JsonOutput::set_command(const std::wstring& command) {
     root_["command"] = command_;
 }
 
+void JsonOutput::begin_nested_section(const std::wstring& name) {
+    current_section_name_ = to_narrow(name);
+    // Always create a named sub-object in the current context, regardless of
+    // section_depth_. This lets fragmentation reports nest under data.fragmentationReport
+    // even when called at the top level (after the file section has ended).
+    std::string key = to_json_key(current_section_name_);
+    current()[key] = nlohmann::ordered_json::object();
+    section_keys_.push_back(key);
+    section_depth_++;
+}
+
+void JsonOutput::end_nested_section() {
+    if (section_depth_ > 0) {
+        --section_depth_;
+        if (!section_keys_.empty()) {
+            section_keys_.pop_back();
+        }
+    }
+}
+
 void JsonOutput::status(const std::wstring&) {
     // Status/progress messages are not included in JSON output.
 }
