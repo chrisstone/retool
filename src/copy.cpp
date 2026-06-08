@@ -643,16 +643,16 @@ struct FallbackCopyStrategy : ICopyStrategy {
         CopyContext& context
     ) override {
         if (args.dry_run) {
-            context.out->status(L"[DRY-RUN] Would copy with standard fallback: " + src + L" -> " + dest);
+            context.out->message(output::Level::info, L"[DRY-RUN] Would copy with standard fallback: " + src + L" -> " + dest);
             context.stats.fallback_files++;
             context.stats.total_files++;
             return true;
         }
 
         if (!context.dest_is_refs) {
-            context.out->warn(L"Destination volume is non-ReFS. Falling back to standard copy for: " + src);
+            context.out->message(output::Level::warn, L"Destination volume is non-ReFS. Falling back to standard copy for: " + src);
         } else {
-            context.out->warn(L"Destination volume cluster size mismatch ("
+            context.out->message(output::Level::warn, L"Destination volume cluster size mismatch ("
                 + std::to_wstring(context.dest_cluster_size) + L" vs " + std::to_wstring(context.src_cluster_size)
                 + L"). Falling back to standard copy for: " + src);
         }
@@ -723,7 +723,7 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
         CopyContext& context
     ) override {
         if (args.dry_run) {
-            context.out->status(L"[DRY-RUN] Would clone (same volume): " + src + L" -> " + dest);
+            context.out->message(output::Level::info, L"[DRY-RUN] Would clone (same volume): " + src + L" -> " + dest);
             context.stats.cloned_files++;
             context.stats.total_files++;
             return true;
@@ -835,7 +835,7 @@ private:
         if (g_cancel_requested) {
             return std::unexpected(L"Copy cancelled by user.");
         }
-        context.out->warn(L"Deduplication-preserving copy failed (" + original_error
+        context.out->message(output::Level::warn, L"Deduplication-preserving copy failed (" + original_error
             + L"). Falling back to standard copy for: " + src);
 
         if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
@@ -870,7 +870,7 @@ struct CrossVolumeRefsCopyStrategy : ICopyStrategy {
         CopyContext& context
     ) override {
         if (args.dry_run) {
-            context.out->status(L"[DRY-RUN] Would copy preserving deduplication (cross volume ReFS): "
+            context.out->message(output::Level::info, L"[DRY-RUN] Would copy preserving deduplication (cross volume ReFS): "
                 + src + L" -> " + dest);
             context.stats.cloned_files++;
             context.stats.total_files++;
@@ -1236,7 +1236,7 @@ private:
         if (g_cancel_requested) {
             return std::unexpected(L"Copy cancelled by user.");
         }
-        context.out->warn(L"Deduplication-preserving copy failed (" + original_error
+        context.out->message(output::Level::warn, L"Deduplication-preserving copy failed (" + original_error
             + L"). Falling back to standard copy for: " + src);
 
         if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
@@ -1334,7 +1334,7 @@ std::expected<CopyContext, std::wstring> inspect_and_prepare(const util::CliArg&
  * @return true on success, or error string on failure.
  */
 std::expected<bool, std::wstring> seed_from_dest_scan(CopyContext& context) {
-    context.out->status(L"[seed_from_dest_scan] Pre-scanning destination volume " +
+    context.out->message(output::Level::info, L"[seed_from_dest_scan] Pre-scanning destination volume " +
                         context.dest_volume_root + L" for deduplication...");
 
     auto scan = inspect::build_lcn_index(
@@ -1352,7 +1352,7 @@ std::expected<bool, std::wstring> seed_from_dest_scan(CopyContext& context) {
         if (lcns.size() >= 1) hash_groups++;
     }
 
-    context.out->status(L"[seed_from_dest_scan] Done. " +
+    context.out->message(output::Level::info, L"[seed_from_dest_scan] Done. " +
                         std::to_wstring(hash_groups) + L" unique hashes indexed from destination.");
     return true;
 }
@@ -1469,7 +1469,7 @@ int finalize_and_report(CopyContext& context) {
               L" (" + std::to_wstring(stats.total_bytes) + L" bytes)");
 
     for (const auto& err : stats.errors) {
-        out.error(err);
+        out.message(output::Level::error, err);
     }
 
     out.end_section();
@@ -1503,7 +1503,7 @@ std::expected<int, std::wstring> execute_copy(const util::CliArg& args, output::
     if (args.scan_dest && !context->same_volume && context->dest_is_refs) {
         auto seed_ok = seed_from_dest_scan(*context);
         if (!seed_ok) {
-            context->out->warn(L"Destination pre-scan failed: " + seed_ok.error() +
+            context->out->message(output::Level::warn, L"Destination pre-scan failed: " + seed_ok.error() +
                                L". Continuing without scan-dest seeding.");
         }
     }

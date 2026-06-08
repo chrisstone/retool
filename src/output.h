@@ -23,7 +23,16 @@
 namespace output {
 
 /**
- * @brief Abstract interface for all program output.
+ * @brief Message level for program output.
+ */
+enum class Level {
+    info,
+    warn,
+    error
+};
+
+/**
+ * @brief Abstract interface for all program program output.
  *
  * Commands receive an IOutput reference and call its methods instead of
  * writing to std::wcout directly. This decouples content generation from
@@ -32,14 +41,8 @@ namespace output {
 struct IOutput {
     virtual ~IOutput() = default;
 
-    /// @brief Emit an informational status message (e.g., dry-run actions).
-    virtual void status(const std::wstring& message) = 0;
-
-    /// @brief Emit a warning message.
-    virtual void warn(const std::wstring& message) = 0;
-
-    /// @brief Emit an error message.
-    virtual void error(const std::wstring& message) = 0;
+    /// @brief Emit a message at the specified level.
+    virtual void message(Level level, const std::wstring& text) = 0;
 
     /// @brief Emit a named key-value field (e.g., "Cluster Size" = "4096 bytes").
     virtual void field(const std::wstring& name, const std::wstring& value) = 0;
@@ -70,23 +73,18 @@ struct IOutput {
      */
     virtual void progress(const std::wstring& filename, ULONGLONG current, ULONGLONG total) = 0;
 
-    /// @brief Finalize output. JSON serializes here; CLI may print a trailing newline.
-    virtual void flush() = 0;
-
     /**
-     * @brief Override the command name recorded in JSON output.
+     * @brief Gracefully tear down the output interface.
      *
-     * Called by command modules to specialise the envelope's "command" field
-     * (e.g., "inspect_multi", "inspect_scan"). Default is a no-op.
+     * Flushes any buffered data and closes open file streams. Used during normal
+     * program exit and signal handling (e.g. Ctrl+C).
      */
-    virtual void set_command(const std::wstring&) {}
+    virtual void graceful_teardown() = 0;
 
     /**
      * @brief Begin a section that must be nested as a sub-object in JSON output.
      *
-     * In JSON: always creates a named sub-object within the current data context,
-     * regardless of nesting depth — use for semantic sub-sections like fragmentation.
-     * In CLI/NoOutput: delegates to begin_section() for the same display as today.
+     * Delegated to begin_section() now that sections support automatic nesting.
      *
      * @param name Section/sub-object name (e.g., L"Fragmentation Report").
      */
@@ -94,6 +92,10 @@ struct IOutput {
 
     /// @brief End a section started by begin_nested_section().
     virtual void end_nested_section() { end_section(); }
+
+private:
+    /// @brief Finalize output. JSON serializes here; CLI may print a trailing newline.
+    virtual void flush() = 0;
 };
 
 // ============================================================================
@@ -101,14 +103,12 @@ struct IOutput {
 // ============================================================================
 
 /**
- * @brief Silent output — all methods are no-ops.
+ * @brief Quiet output — all methods are no-ops.
  *
  * Selected via the -q CLI flag.
  */
-struct NoOutput : IOutput {
-    void status(const std::wstring&) override {}
-    void warn(const std::wstring&) override {}
-    void error(const std::wstring&) override {}
+struct QuietOutput : IOutput {
+    void message(Level, const std::wstring&) override {}
     void field(const std::wstring&, const std::wstring&) override {}
     void begin_section(const std::wstring&) override {}
     void end_section() override {}
@@ -116,10 +116,10 @@ struct NoOutput : IOutput {
     void table_row(const std::vector<std::wstring>&) override {}
     void end_table() override {}
     void progress(const std::wstring&, ULONGLONG, ULONGLONG) override {}
+    void graceful_teardown() override {}
+
+private:
     void flush() override {}
-    void set_command(const std::wstring&) override {}
-    void begin_nested_section(const std::wstring&) override {}
-    void end_nested_section() override {}
 };
 
 /**
@@ -135,9 +135,7 @@ struct CliOutput : IOutput {
     explicit CliOutput(const std::wstring& output_file = L"");
     ~CliOutput() override;
 
-    void status(const std::wstring& message) override;
-    void warn(const std::wstring& message) override;
-    void error(const std::wstring& message) override;
+    void message(Level level, const std::wstring& text) override;
     void field(const std::wstring& name, const std::wstring& value) override;
     void begin_section(const std::wstring& name) override;
     void end_section() override;
@@ -145,14 +143,7 @@ struct CliOutput : IOutput {
     void table_row(const std::vector<std::wstring>& values) override;
     void end_table() override;
     void progress(const std::wstring& filename, ULONGLONG current, ULONGLONG total) override;
-    void flush() override;
-
-    /// @brief No-op: CLI output has no command envelope.
-    void set_command(const std::wstring&) override {}
-
-    /// @brief Delegates to begin_section() — CLI displays frag report as a normal section.
-    void begin_nested_section(const std::wstring& name) override { begin_section(name); }
-    void end_nested_section() override { end_section(); }
+    void graceful_teardown() override;
 
 private:
     /// @brief Renders the 20-character progress bar string from a percentage.
@@ -164,6 +155,8 @@ private:
     /// @brief Clears the progress line if one is active.
     void clear_progress_line();
 
+    void flush() override;
+
     std::wofstream file_out_;                                              ///< File output stream (if -o specified).
     bool use_file_ = false;                                                ///< True if outputting to file.
     std::wstring last_progress_file_;                                      ///< Last file reported for progress.
@@ -173,6 +166,8 @@ private:
     size_t last_line_len_ = 0;                                             ///< Length of the last rendered progress line.
     std::vector<std::wstring> table_columns_;                              ///< Current table column headers.
     std::vector<std::vector<std::wstring>> table_rows_;                    ///< Buffered rows; flushed by end_table.
+    int section_depth_ = 0;                                                ///< Active section nesting depth.
+    bool flushed_ = false;                                                 ///< True if flush() has run.
 };
 
 /**
@@ -193,10 +188,9 @@ struct JsonOutput : IOutput {
      */
     explicit JsonOutput(const std::wstring& command,
                         const std::wstring& output_file = L"");
+    ~JsonOutput() override;
 
-    void status(const std::wstring& message) override;
-    void warn(const std::wstring& message) override;
-    void error(const std::wstring& message) override;
+    void message(Level level, const std::wstring& text) override;
     void field(const std::wstring& name, const std::wstring& value) override;
     void begin_section(const std::wstring& name) override;
     void end_section() override;
@@ -204,16 +198,11 @@ struct JsonOutput : IOutput {
     void table_row(const std::vector<std::wstring>& values) override;
     void end_table() override;
     void progress(const std::wstring& filename, ULONGLONG current, ULONGLONG total) override;
-    void flush() override;
-
-    /// @brief Override the command field in the JSON envelope at runtime.
-    void set_command(const std::wstring& command) override;
-
-    /// @brief Always creates a named sub-object, regardless of current nesting depth.
-    void begin_nested_section(const std::wstring& name) override;
-    void end_nested_section() override;
+    void graceful_teardown() override;
 
 private:
+    void flush() override;
+
     nlohmann::ordered_json root_;                                ///< Top-level JSON envelope.
     std::vector<std::string> section_keys_;                      ///< Key path for nested sections within data.
     std::vector<std::wstring> table_columns_;                    ///< Current table column headers.
@@ -223,6 +212,7 @@ private:
     std::string command_;                                        ///< Command name for the envelope.
     int section_depth_ = 0;                                      ///< Nesting depth of begin_section calls.
     bool has_error_    = false;                                  ///< True if error() was called.
+    bool flushed_ = false;                                       ///< True if flush() has run.
 
     /// @brief Returns the currently active JSON object (data or nested sub-object).
     nlohmann::ordered_json& current();

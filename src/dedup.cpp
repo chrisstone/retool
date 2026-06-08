@@ -332,7 +332,7 @@ std::expected<bool, std::wstring> inspect_and_prepare(
     context.cluster_size = spc * bps;
 
     // Run the scan (always kWithHash — we need content matching)
-    context.out->status(L"[dedup.inspect_and_prepare] Scanning " + context.volume_root + L"...");
+    context.out->message(output::Level::info, L"[dedup.inspect_and_prepare] Scanning " + context.volume_root + L"...");
 
     auto scan = inspect::build_lcn_index(context.volume_root, inspect::ScanMode::kWithHash, *context.out);
     if (!scan) return std::unexpected(scan.error());
@@ -350,8 +350,8 @@ std::expected<bool, std::wstring> inspect_and_prepare(
             }
             if (found1 && found2) break;
         }
-        if (!found1) context.out->warn(L"File not found in scan results: " + p1);
-        if (!found2) context.out->warn(L"File not found in scan results: " + p2);
+        if (!found1) context.out->message(output::Level::warn, L"File not found in scan results: " + p1);
+        if (!found2) context.out->message(output::Level::warn, L"File not found in scan results: " + p2);
     }
 
     context.scan = std::move(*scan);
@@ -377,11 +377,11 @@ std::expected<bool, std::wstring> execute_operation(
     const ULONGLONG total  = candidates.size();
 
     if (total == 0) {
-        context.out->status(L"[dedup.execute_operation] No deduplication candidates found.");
+        context.out->message(output::Level::info, L"[dedup.execute_operation] No deduplication candidates found.");
         return true;
     }
 
-    context.out->status(L"[dedup.execute_operation] Processing " +
+    context.out->message(output::Level::info, L"[dedup.execute_operation] Processing " +
                         std::to_wstring(total) + L" dedup candidates...");
 
     // Cache of open read/write file handles to avoid reopening on every cluster
@@ -499,7 +499,7 @@ int finalize_and_report(const DedupContext& context, bool dry_run) {
               L" (" + std::to_wstring(stats.bytes_reclaimed) + L" bytes)");
 
     for (const auto& err : stats.errors) {
-        out.error(err);
+        out.message(output::Level::error, err);
     }
 
     out.end_section();
@@ -526,7 +526,7 @@ std::expected<int, std::wstring> execute_dedup(const util::CliArg& args, output:
     if (!candidates) return std::unexpected(candidates.error());
     context.candidates = std::move(*candidates);
 
-    out.status(L"[dedup.execute_dedup] Found " +
+    out.message(output::Level::info, L"[dedup.execute_dedup] Found " +
                std::to_wstring(context.candidates.size()) + L" dedup candidate clusters.");
 
     // Phase 2: Operation

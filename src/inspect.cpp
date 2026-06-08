@@ -325,7 +325,7 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
     result.cluster_size = spc * bps;
 
     // Phase A: Enumerate all file paths
-    status_out.status(L"[build_lcn_index] Enumerating files on " + volume_root + L"...");
+    status_out.message(output::Level::info, L"[build_lcn_index] Enumerating files on " + volume_root + L"...");
     std::vector<std::wstring> file_paths;
     enumerate_files_recursive(volume_root, file_paths, result.errors);
 
@@ -421,7 +421,7 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
 
         // Periodic progress update
         if (result.files_scanned % kProgressInterval == 0) {
-            status_out.status(L"[build_lcn_index] Indexed " +
+            status_out.message(output::Level::info, L"[build_lcn_index] Indexed " +
                               std::to_wstring(result.files_scanned) + L" files...");
         }
 
@@ -468,7 +468,7 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
         CloseHandle(file_handle);
     }
 
-    status_out.status(L"[build_lcn_index] Complete: " +
+    status_out.message(output::Level::info, L"[build_lcn_index] Complete: " +
                       std::to_wstring(result.files_scanned) + L" files, " +
                       std::to_wstring(result.clusters_indexed) + L" clusters indexed.");
 
@@ -478,6 +478,9 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
 // ============================================================================
 // Output Helpers
 // ============================================================================
+
+FragStat compute_frag_stat(const FileInspectResult& res);
+void output_frag_report(const FileInspectResult& res, const FragStat& stat, output::IOutput& out);
 
 /**
  * @brief Outputs the single-file inspect report via IOutput.
@@ -489,7 +492,7 @@ std::expected<ScanResult, std::wstring> build_lcn_index(
  * @param show_extents If true, emit the full VCN/LCN extent table.
  *                     If false, emit only the summary fields.
  */
-void output_single_file(const FileInspectResult& res, output::IOutput& out, bool show_extents) {
+void output_single_file(const FileInspectResult& res, output::IOutput& out, bool show_extents, bool recursive) {
     // Use the bare filename as the section name for a clean JSON key.
     std::wstring section_name = res.path;
     size_t last_sep = section_name.find_last_of(L"\\/ ");
@@ -524,6 +527,11 @@ void output_single_file(const FileInspectResult& res, output::IOutput& out, bool
         }
 
         out.end_table();
+    }
+
+    if (recursive) {
+        auto stat = compute_frag_stat(res);
+        output_frag_report(res, stat, out);
     }
 
     out.end_section();
@@ -577,9 +585,7 @@ FragStat compute_frag_stat(const FileInspectResult& res) {
  * @param out   The output interface.
  */
 void output_frag_report(const FileInspectResult& res, const FragStat& stat, output::IOutput& out) {
-    // begin_nested_section: CLI prints "--- Fragmentation Report ---"; JSON nests
-    // fields under data.fragmentationReport rather than writing them flat into data.
-    out.begin_nested_section(L"Fragmentation Report");
+    out.begin_section(L"Fragmentation Report");
     out.field(L"File",             res.path);
     out.field(L"Fragments",        std::to_wstring(stat.fragment_count));
     out.field(L"Frag Score",       std::to_wstring(stat.fragment_count) +
@@ -606,7 +612,7 @@ void output_frag_report(const FileInspectResult& res, const FragStat& stat, outp
            << L" clusters (" << util::format_size(avg_bytes) << L")";
         out.field(L"Avg Extent",     ss.str());
     }
-    out.end_nested_section();
+    out.end_section();
 }
 
 
@@ -629,7 +635,8 @@ void output_multi_file(
     const std::vector<FileInspectResult>& results,
     const std::vector<std::wstring>& errors,
     output::IOutput& out,
-    bool show_extended
+    bool show_extended,
+    bool recursive
 ) {
     // ── Build LCN → file index ────────────────────────────────────────────────
     std::unordered_map<LONGLONG, std::vector<size_t>> lcn_to_files;
@@ -755,7 +762,6 @@ void output_multi_file(
         ss << std::fixed << std::setprecision(2) << savings_pct << L"%";
         out.field(L"Dedup Savings", ss.str());
     }
-    out.end_section();
 
     // ── Per-file unique / shared cluster breakdown ────────────────────────────
     out.begin_section(L"Per-File Cluster Breakdown");
@@ -828,9 +834,19 @@ void output_multi_file(
         out.end_section();
     }
 
-    for (const auto& err : errors) {
-        out.error(err);
+    if (recursive) {
+        for (const auto& res : results) {
+            if (!res.error.empty()) continue;
+            auto stat = compute_frag_stat(res);
+            output_frag_report(res, stat, out);
+        }
     }
+
+    for (const auto& err : errors) {
+        out.message(output::Level::error, err);
+    }
+
+    out.end_section();
 }
 
 /**
@@ -882,7 +898,7 @@ void output_scan_report(const ScanResult& scan, output::IOutput& out) {
     out.end_section();
 
     for (const auto& err : scan.errors) {
-        out.error(err);
+        out.message(output::Level::error, err);
     }
 }
 
@@ -1013,7 +1029,7 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
     }
 
     for (const auto& err : expand_errors) {
-        out.warn(err);
+        out.message(output::Level::warn, err);
     }
 
     if (target_paths.empty()) {
@@ -1025,7 +1041,6 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
         ScanMode mode = ScanMode::kLcnOnly;
         auto scan_res = build_lcn_index(target_paths[0], mode, out);
         if (!scan_res) return std::unexpected(scan_res.error());
-        out.set_command(L"inspect_scan");
         output_scan_report(*scan_res, out);
         return 0;
     }
@@ -1040,10 +1055,10 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
         std::wstring name = path;
         size_t last_sep = name.find_last_of(L"\\/ ");
         if (last_sep != std::wstring::npos) name = name.substr(last_sep + 1);
-        out.status(L"Inspecting: " + name);
+        out.message(output::Level::info, L"Inspecting: " + name);
     } else {
         // Multi-file: announce the count up-front, then log each file
-        out.status(L"Inspecting " + std::to_wstring(target_paths.size()) + L" files...");
+        out.message(output::Level::info, L"Inspecting " + std::to_wstring(target_paths.size()) + L" files...");
     }
 
     const ULONGLONG total_files = static_cast<ULONGLONG>(target_paths.size());
@@ -1075,22 +1090,9 @@ std::expected<int, std::wstring> execute_inspect(const util::CliArg& args, outpu
     if (results.size() == 1) {
         const auto& res = results[0];
         if (!res.error.empty()) return std::unexpected(res.error);
-        out.set_command(L"inspect");
-        output_single_file(res, out, args.show_extents);
-        if (args.recursive) {
-            auto stat = compute_frag_stat(res);
-            output_frag_report(res, stat, out);
-        }
+        output_single_file(res, out, args.show_extents, args.recursive);
     } else {
-        out.set_command(L"inspect_multi");
-        output_multi_file(results, errors, out, args.show_extents);
-        if (args.recursive) {
-            for (const auto& res : results) {
-                if (!res.error.empty()) continue;
-                auto stat = compute_frag_stat(res);
-                output_frag_report(res, stat, out);
-            }
-        }
+        output_multi_file(results, errors, out, args.show_extents, args.recursive);
     }
 
     return 0;

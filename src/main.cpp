@@ -111,15 +111,28 @@ void print_command_help(const std::wstring& cmd) {
     }
 }
 
+static output::IOutput* g_active_output = nullptr;
+static bool g_is_copy_or_dedup = false;
+
 /**
  * @brief Windows console control handler callback to process Ctrl+C and Ctrl+Break.
- * Sets the copy cancellation flags to signal active copying operations to stop and clean up.
+ * Sets the copy cancellation flags to signal active copying operations to stop and clean up,
+ * and gracefully tears down the output interface.
  */
 BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
-    if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT) {
+    if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT || ctrlType == CTRL_CLOSE_EVENT) {
         copy::g_cancel_requested = true;
         copy::g_cancel_requested_bool = TRUE;
-        return TRUE; // Consume event to prevent default immediate termination
+        if (g_active_output) {
+            g_active_output->graceful_teardown();
+        }
+        if (ctrlType == CTRL_CLOSE_EVENT) {
+            ExitProcess(0xC000013A);
+        }
+        if (!g_is_copy_or_dedup) {
+            ExitProcess(0xC000013A);
+        }
+        return TRUE; // Consume event to let copy/dedup terminate gracefully on the main thread
     }
     return FALSE;
 }
@@ -192,7 +205,7 @@ int wmain(int argc, wchar_t* argv[]) {
     // Construct the appropriate output interface
     std::unique_ptr<output::IOutput> out;
     if (args.quiet) {
-        out = std::make_unique<output::NoOutput>();
+        out = std::make_unique<output::QuietOutput>();
     } else if (args.json) {
         out = std::make_unique<output::JsonOutput>(args.command, args.output_file);
 
@@ -200,12 +213,12 @@ int wmain(int argc, wchar_t* argv[]) {
         out = std::make_unique<output::CliOutput>(args.output_file);
     }
 
-    // Register console control handler for long-running copy/dedup commands
-    const bool is_copy  = (args.command == L"copy"  || args.command == L"cp");
-    const bool is_dedup = (args.command == L"dedup" || args.command == L"dd");
-    if (is_copy || is_dedup) {
-        SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
-    }
+    g_active_output = out.get();
+    g_is_copy_or_dedup = (args.command == L"copy"  || args.command == L"cp" ||
+                          args.command == L"dedup" || args.command == L"dd");
+
+    // Register console control handler for all commands (handles teardown on Ctrl+C)
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
     // Dispatch subcommands
     std::expected<int, std::wstring> run_res;
@@ -220,18 +233,13 @@ int wmain(int argc, wchar_t* argv[]) {
     } else {
         std::wcerr << L"ERROR: Unknown command '" << args.command << L"'.\n" << std::endl;
         print_general_help();
-        if (is_copy || is_dedup) {
-            SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
-        }
+        SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+        g_active_output = nullptr;
         return 1;
     }
 
-    if (is_copy || is_dedup) {
-        SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
-    }
-
-    // Finalize output (JSON serializes here)
-    out->flush();
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+    g_active_output = nullptr;
 
     if (!run_res) {
         std::wcerr << L"ERROR: " << run_res.error() << std::endl;

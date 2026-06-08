@@ -32,11 +32,8 @@ CliOutput::CliOutput(const std::wstring& output_file) {
 }
 
 CliOutput::~CliOutput() {
-    if (progress_active_) {
-        // Clean up any lingering progress line
-        HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
-        DWORD written = 0;
-        WriteConsoleA(console, "\n", 1, &written, NULL);
+    if (!flushed_) {
+        flush();
     }
 }
 
@@ -62,19 +59,15 @@ void CliOutput::clear_progress_line() {
     }
 }
 
-void CliOutput::status(const std::wstring& message) {
+void CliOutput::message(Level level, const std::wstring& text) {
     clear_progress_line();
-    out() << message << std::endl;
-}
-
-void CliOutput::warn(const std::wstring& message) {
-    clear_progress_line();
-    out() << L"WARNING: " << message << std::endl;
-}
-
-void CliOutput::error(const std::wstring& message) {
-    clear_progress_line();
-    out() << L"ERROR: " << message << std::endl;
+    if (level == Level::error) {
+        out() << L"ERROR: " << text << std::endl;
+    } else if (level == Level::warn) {
+        out() << L"WARNING: " << text << std::endl;
+    } else {
+        out() << text << std::endl;
+    }
 }
 
 void CliOutput::field(const std::wstring& name, const std::wstring& value) {
@@ -82,11 +75,19 @@ void CliOutput::field(const std::wstring& name, const std::wstring& value) {
 }
 
 void CliOutput::begin_section(const std::wstring& name) {
+    clear_progress_line();
     out() << L"\n--- " << name << L" ---\n";
+    section_depth_++;
 }
 
 void CliOutput::end_section() {
     out() << std::endl;
+    if (section_depth_ > 0) {
+        section_depth_--;
+        if (section_depth_ == 0) {
+            flush();
+        }
+    }
 }
 
 void CliOutput::begin_table(const std::vector<std::wstring>& columns) {
@@ -292,6 +293,11 @@ void CliOutput::flush() {
     }
     last_progress_file_.clear();
     out().flush();
+    flushed_ = true;
+}
+
+void CliOutput::graceful_teardown() {
+    flush();
 }
 
 // ============================================================================
@@ -514,6 +520,12 @@ JsonOutput::JsonOutput(const std::wstring& command, const std::wstring& output_f
     root_["data"]     = nlohmann::ordered_json::object();
 }
 
+JsonOutput::~JsonOutput() {
+    if (!flushed_) {
+        flush();
+    }
+}
+
 nlohmann::ordered_json& JsonOutput::current() {
     nlohmann::ordered_json* node = &root_["data"];
     for (const auto& key : section_keys_) {
@@ -522,42 +534,11 @@ nlohmann::ordered_json& JsonOutput::current() {
     return *node;
 }
 
-void JsonOutput::set_command(const std::wstring& command) {
-    command_ = to_narrow(command);
-    root_["command"] = command_;
-}
-
-void JsonOutput::begin_nested_section(const std::wstring& name) {
-    current_section_name_ = to_narrow(name);
-    // Always create a named sub-object in the current context, regardless of
-    // section_depth_. This lets fragmentation reports nest under data.fragmentationReport
-    // even when called at the top level (after the file section has ended).
-    std::string key = to_json_key(current_section_name_);
-    current()[key] = nlohmann::ordered_json::object();
-    section_keys_.push_back(key);
-    section_depth_++;
-}
-
-void JsonOutput::end_nested_section() {
-    if (section_depth_ > 0) {
-        --section_depth_;
-        if (!section_keys_.empty()) {
-            section_keys_.pop_back();
-        }
+void JsonOutput::message(Level level, const std::wstring& text) {
+    if (level == Level::error) {
+        has_error_ = true;
+        root_["errors"].push_back(to_narrow(text));
     }
-}
-
-void JsonOutput::status(const std::wstring&) {
-    // Status/progress messages are not included in JSON output.
-}
-
-void JsonOutput::warn(const std::wstring& message) {
-    root_["warnings"].push_back(to_narrow(message));
-}
-
-void JsonOutput::error(const std::wstring& message) {
-    has_error_ = true;
-    root_["errors"].push_back(to_narrow(message));
 }
 
 void JsonOutput::field(const std::wstring& name, const std::wstring& value) {
@@ -587,6 +568,9 @@ void JsonOutput::end_section() {
         --section_depth_;
         if (!section_keys_.empty()) {
             section_keys_.pop_back();
+        }
+        if (section_depth_ == 0) {
+            flush();
         }
     }
 }
@@ -635,6 +619,11 @@ void JsonOutput::flush() {
         WriteFile(out, json_str.c_str(), static_cast<DWORD>(json_str.size()), &written, NULL);
         WriteFile(out, "\n", 1, &written, NULL);
     }
+    flushed_ = true;
+}
+
+void JsonOutput::graceful_teardown() {
+    flush();
 }
 
 } // namespace output

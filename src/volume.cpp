@@ -78,11 +78,13 @@ std::expected<int, std::wstring> execute_volume(const util::CliArg& args, output
     ULONGLONG total_clusters = cluster_size > 0 ? (total_space / cluster_size) : 0;
 
     // Output via IOutput
+    out.begin_section(L"Volume Information");
+
     out.field(L"Volume",         std::wstring(volume_root));
     out.field(L"File System",    fs_name_str);
 
     if (fs_name_str != L"ReFS") {
-        out.warn(L"This is not a ReFS filesystem. Some features (cloning) will not work.");
+        out.message(output::Level::warn, L"This is not a ReFS filesystem. Some features (cloning) will not work.");
     }
 
     out.field(L"Cluster Size",   std::to_wstring(cluster_size) + L" bytes");
@@ -101,6 +103,8 @@ std::expected<int, std::wstring> execute_volume(const util::CliArg& args, output
     out.field(L"Total Space",    total_ss.str());
     out.field(L"Free Space",     free_ss.str());
     out.field(L"Used Space",     used_ss.str());
+
+    out.end_section();
 
     return 0;
 }
