@@ -42,6 +42,7 @@ Assert-HashMatch -Path $fileA -ExpectedHash $env:RETOOL_TEST_HASH -Description "
 Assert-HashMatch -Path $fileB -ExpectedHash $env:RETOOL_TEST_HASH -Description "fileB unchanged after dry-run"
 
 # Disk free space must not have changed
+Start-Sleep -Seconds 3
 $freeAfter = (Get-PSDrive -Name $drv).Free
 $delta = [math]::Abs($freeAfter - $freeBefore)
 if ($delta -lt 1MB) {

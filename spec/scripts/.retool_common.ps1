@@ -34,7 +34,7 @@ function Invoke-Retool {
     Write-Host "    > retool $($ToolArgs -join ' ')" -ForegroundColor DarkGray
     $oldEncoding = [Console]::OutputEncoding
     try {
-        [Console]::OutputEncoding = [System.Text.Encoding]::Unicode
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
         $output = & $env:RETOOL_EXE @ToolArgs 2>&1
     } finally {
         [Console]::OutputEncoding = $oldEncoding

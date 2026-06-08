@@ -24,7 +24,7 @@ namespace output {
 
 CliOutput::CliOutput(const std::wstring& output_file) {
     if (!output_file.empty()) {
-        file_out_.open(output_file, std::ios::out | std::ios::binary);
+        file_out_.open(output_file, std::ios::out);
         if (file_out_.is_open()) {
             use_file_ = true;
         }
@@ -71,6 +71,7 @@ void CliOutput::message(Level level, const std::wstring& text) {
 }
 
 void CliOutput::field(const std::wstring& name, const std::wstring& value) {
+    clear_progress_line();
     out() << std::left << std::setw(15) << name << L" " << value << L"\n";
 }
 
@@ -538,6 +539,8 @@ void JsonOutput::message(Level level, const std::wstring& text) {
     if (level == Level::error) {
         has_error_ = true;
         root_["errors"].push_back(to_narrow(text));
+    } else if (level == Level::warn) {
+        root_["warnings"].push_back(to_narrow(text));
     }
 }
 

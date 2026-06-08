@@ -148,10 +148,26 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
  * @return int 0 on success, 1 on syntax or privilege error, 2 on operational error.
  */
 int wmain(int argc, wchar_t* argv[]) {
-    // Enable wide-character output mode so std::wcout works correctly when
-    // piped or redirected on Windows. Must be done before any wcout writes.
-    _setmode(_fileno(stdout), _O_U16TEXT);
-    _setmode(_fileno(stderr), _O_U16TEXT);
+    // Configure stdout/stderr encoding based on the attached handle type.
+    //
+    // When stdout is a real console (interactive terminal) _O_U16TEXT lets
+    // std::wcout emit UTF-16 via WriteConsoleW, which is the only reliable way
+    // to display Unicode in cmd/conhost.
+    //
+    // When stdout is a pipe or file (redirected, PowerShell capture, etc.) we
+    // switch to _O_U8TEXT so that the byte stream is valid UTF-8 - the de-facto
+    // encoding expected by modern tools and PowerShell's default decoding.
+    auto pick_mode = [](FILE* f) -> int {
+        HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(f)));
+        if (h != INVALID_HANDLE_VALUE &&
+            GetFileType(h) == FILE_TYPE_CHAR) {
+            // Attached to a character device (console)
+            return _O_U16TEXT;
+        }
+        return _O_U8TEXT;
+    };
+    _setmode(_fileno(stdout), pick_mode(stdout));
+    _setmode(_fileno(stderr), pick_mode(stderr));
 
     // Parse arguments
     auto args_res = util::parse_arguments(argc, argv);
