@@ -77,14 +77,3 @@ You can configure and compile the build using the full path:
 ```powershell
 & "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" --build build/debug --config Debug
 ```
-
----
-
-## Developer Environment (Visual Studio IDE)
-
-To edit, debug, and build directly inside Visual Studio:
-1. Open Visual Studio 2022.
-2. Select **Open a local folder** and choose the root `retool/` directory.
-3. Visual Studio will automatically detect the `CMakeLists.txt` and `CMakePresets.json` file.
-4. You can select either the `debug` or `release` target preset from the configuration dropdown menu at the top.
-5. Click **Build > Build All** (or press `Ctrl+Shift+B`) to build.

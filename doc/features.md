@@ -1,6 +1,6 @@
 # doc/features.md — retool Feature Specifications
 
-This document provides technical detail for each feature implemented in retool. It is intended to guide agent implementation and design decisions. For user-facing documentation see [README.md](../README.md).
+This document provides technical detail for each feature implemented in retool. It is intended to guide agent implementation and design decisions. For user-facing documentation see [README.md](file:///c:/Users/chris.stone/workspace/retool/README.md).
 
 ---
 
@@ -17,7 +17,7 @@ This document provides technical detail for each feature implemented in retool. 
 
 ---
 
-## Feature 1: `inspect` — Block Layout, Sharing Analysis & Volume Scan
+## Feature 1: [inspect](file:///c:/Users/chris.stone/workspace/retool/src/inspect.cpp) — Block Layout, Sharing Analysis & Volume Scan
 
 ### Purpose
 
@@ -59,28 +59,26 @@ Extent #  VCN          LCN          Clusters    Bytes        Cumulative
 
 Invoked when two or more file paths are supplied (directly on CLI, via a directory or glob argument, or via `-i <filelist>`).
 
-**Goal:** For each unique LCN present in more than one file, count how many files share it. Report cross-file sharing as a matrix plus a per-file unique/shared cluster breakdown, and compute aggregate savings.
+**Goal:** For each unique LCN present in more than one file, count how many files share it. Report a per-file unique/shared cluster breakdown, and compute aggregate savings. With `-e`, also append a cross-file sharing matrix table.
 
 **Algorithm:**
 
 1. Enumerate all extents for each file via `FSCTL_GET_RETRIEVAL_POINTERS`.
-2. Build an `unordered_map<LONGLONG, vector<size_t>> lcn_to_files` — LCN → list of file indices that contain it.
+2. Build an interned map mapping LCN to file indices: `unordered_map<LONGLONG, vector<size_t>> lcn_to_files`.
 3. Scan the map: clusters with two or more file references are shared. Compute shared bytes and savings percentage.
-4. Build a per-file sharing matrix for tabular output.
+4. If `-e` is set, build a per-file sharing matrix for tabular output.
 5. Compute per-file unique vs. shared cluster counts from the same `lcn_to_files` map.
 
-**Output (multi-file):**
+**Default output (multi-file, summary & breakdown only):**
 
 ```
-Volume:        E:\
-Cluster Size:  65536 bytes
-Files Analyzed: 3
-Total Sizes:   10.23 MB (10726400 bytes)
-Shared Blocks: 4.00 MB (4194304 bytes)
-Saved Space:   4.00 MB (4194304 bytes)
-Dedup Savings: 39.08%
-
-[Sharing matrix table: each cell shows MB shared between file pair Fx and Fy]
+Volume:         E:\
+Cluster Size:   65536 bytes
+Files Analyzed: 2
+Total Size:     200.00 MB (209715200 bytes)
+Shared Blocks:  50.00 MB (52428800 bytes)
+Saved Space:    50.00 MB (52428800 bytes)
+Dedup Savings:  25.00%
 
 ── Per-File Cluster Breakdown ──
 
@@ -90,42 +88,58 @@ backup2.vbk      1600            800              800              50.00 MB     
 [TOTAL]          3200            1600             1600             100.00 MB     100.00 MB
 ```
 
+**With `-e` (sharing matrix table appended):**
+
+```
+── Sharing Matrix ──
+
+File             F0           F1
+backup.vbk       -            50.00 MB
+backup2.vbk      50.00 MB     -
+```
+
 ### Volume Scan Mode
 
 Invoked when a single argument is a volume root (e.g. `E:\`).
 
 **Goal:** Walk every file on the volume, build a full LCN index, and report aggregate deduplication savings. Optionally hash every cluster to enable content-based matching.
 
-**Implementation — `inspect::build_lcn_index()`:**
+**Implementation — [inspect::build_lcn_index()](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L79-L83):**
 
-1. `enumerate_files_recursive()` — walks the volume tree with `FindFirstFileW` / `FindNextFileW`. Skips `FILE_ATTRIBUTE_SYSTEM` files and `FILE_ATTRIBUTE_REPARSE_POINT` junctions.
+1. [enumerate_files_recursive()](file:///c:/Users/chris.stone/workspace/retool/src/inspect.cpp#L270-L305) — walks the volume tree with `FindFirstFileW` / `FindNextFileW`. Skips `FILE_ATTRIBUTE_SYSTEM` files and `FILE_ATTRIBUTE_REPARSE_POINT` junctions.
 2. For each file, calls `inspect_file()` to obtain all extents via `FSCTL_GET_RETRIEVAL_POINTERS`.
-3. Populates `LcnIndex` (`unordered_map<LONGLONG, vector<BlockEntry>>`): maps each LCN to the file(s) and byte offsets that reference it.
-4. In `kWithHash` mode: additionally reads each cluster and computes a SHA-256 digest via the Windows CNG BCrypt API (`BCryptOpenAlgorithmProvider(BCRYPT_SHA256_ALGORITHM)`, `BCryptCreateHash`, `BCryptHashData`, `BCryptFinishHash`). The hardware SHA-NI instruction set is used automatically when available. Populates `HashIndex` (`unordered_map<string, vector<LONGLONG>>`): SHA-256 hex digest → list of LCNs with identical content.
-5. Reports progress via `IOutput::status()` every 500 files.
+3. Populates [LcnIndex](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L36) (`unordered_map<LONGLONG, vector<BlockEntry>>`): maps each LCN to the file(s) (by interned index) and byte offsets that reference it.
+4. In `kWithHash` mode: additionally reads each cluster and computes a SHA-256 digest via the Windows CNG BCrypt API (`BCryptOpenAlgorithmProvider(BCRYPT_SHA256_ALGORITHM)`, `BCryptCreateHash`, `BCryptHashData`, `BCryptFinishHash`). The hardware SHA-NI instruction set is used automatically when available. Populates [HashIndex](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L40) (`unordered_map<string, vector<LONGLONG>>`): SHA-256 hex digest → list of LCNs with identical content.
+5. Reports progress via [IOutput::message()](file:///c:/Users/chris.stone/workspace/retool/src/output.h#L45) every 500 files.
 
-**Scan modes (`ScanMode` enum):**
+**Scan modes ([ScanMode](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L23-L26) enum):**
 
 | Mode | Description |
 |------|-------------|
 | `kLcnOnly` | Build LCN→file map without reading disk data (fast; reports structurally shared clusters only) |
 | `kWithHash` | Also SHA-256 hash every cluster; enables content-based dedup matching across unrelated files |
 
-**Public types exported from `inspect.h`:**
+**Public types exported from [inspect.h](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h):**
 
 ```cpp
-struct BlockEntry { std::wstring file_path; ULONGLONG file_offset; };
+struct BlockEntry {
+    uint32_t  file_index;       // Index into ScanResult::file_table
+    ULONGLONG file_offset;      // Byte offset within the file
+};
 using LcnIndex  = std::unordered_map<LONGLONG, std::vector<BlockEntry>>;
 using HashIndex = std::unordered_map<std::string, std::vector<LONGLONG>>;
 
 struct ScanResult {
     LcnIndex  lcn_index;
     HashIndex hash_index;       // kWithHash only
-    DWORD     cluster_size;
+    DWORD     cluster_size = 0;
     std::wstring volume_root;
-    ULONGLONG files_scanned;
-    ULONGLONG clusters_indexed;
+    ULONGLONG files_scanned = 0;
+    ULONGLONG clusters_indexed = 0;
     std::vector<std::wstring> errors;
+    std::vector<std::wstring> file_table; // Interned file paths
+
+    const std::wstring& resolve_path(uint32_t index) const;
 };
 
 std::expected<ScanResult, std::wstring> build_lcn_index(
@@ -140,7 +154,7 @@ Cluster Size:     65536 bytes
 Files Scanned:    14382
 Clusters Indexed: 892104
 Shared Blocks:    1.23 GB (19847 clusters)
-Dedup Savings:    512 MB saved
+Dedup Savings:    512.00 MB (536870912 bytes)
 Savings %:        14.23%
 Content Groups:   8841       (kWithHash only)
 ```
@@ -168,13 +182,13 @@ Multiple arguments are each expanded independently and merged. A glob matching z
 
 | Flag | Description |
 |------|-------------|
-| `-e` | Show VCN/LCN extent table (single-file mode only; suppressed by default) |
+| `-e` | Show VCN/LCN extent table (single-file mode) or sharing matrix (multi-file mode) |
 | `-r` | Append a fragmentation report for each file (fragment count, min/max/avg extent, score) |
 | `-i <file>` | Read file paths from a newline-delimited input file |
 | `-o <file>` | Write output to a file instead of stdout |
 | `-s` | Abort on first error (default: best-effort with error summary) |
 | `-j` | Output results in JSON format |
-| `-q` | Suppress all output |
+| `-q` | Suppress all output (quiet mode) |
 
 ### Fragmentation Report (`-r`)
 
@@ -286,7 +300,7 @@ A global `std::atomic<bool> copy::g_cancel_requested` is checked at every copy-l
 | `-d` | Pre-scan destination volume to seed the dedup block index |
 | `-s` | Abort on first error |
 | `-j` | Output results in JSON format |
-| `-q` | Suppress all output |
+| `-q` | Suppress all output (quiet mode) |
 | `-o <file>` | Redirect output to a file |
 
 ---
@@ -362,7 +376,7 @@ Space Reclaimed:  512.00 MB (536870912 bytes)
 | `-n` | Report savings without writing |
 | `-s` | Abort on first error |
 | `-j` | Output results in JSON format |
-| `-q` | Suppress all output |
+| `-q` | Suppress all output (quiet mode) |
 
 > [!IMPORTANT]
 > Both files must reside on the same ReFS volume. The operation modifies file allocation metadata; ensure backups exist before running volume-wide dedup on production data.
@@ -381,10 +395,10 @@ Show ReFS volume metadata and a high-level summary of cluster usage.
 Volume:         E:\
 File System:    ReFS
 Cluster Size:   65536 bytes
-Total Clusters: 2,621,440
-Total Space:    10.0 GB
-Free Space:     4.2 GB
-Used Space:     5.8 GB
+Total Clusters: 2621440
+Total Space:    10.00 GB (10737418240 bytes)
+Free Space:     4.20 GB (4509715660 bytes)
+Used Space:     5.80 GB (6227702580 bytes)
 ```
 
 ### Win32 APIs
@@ -417,15 +431,14 @@ retool <command> [options] [arguments]
 | Flag | Description |
 |------|-------------|
 | `-j` | Output in JSON format (uses nlohmann/json) |
-| `-q` | Suppress all output (quiet/silent mode) |
+| `-q` | Suppress all output (quiet mode) |
 | `-o <file>` | Redirect output to a file |
 
 ### Argument Parsing
 
 Implemented in `src/util.cpp` (`util::parse_arguments`). Uses the wide-character `argv[]` array from `wmain`. No third-party CLI library. Rules:
-- Short flags: single `-` + single character (e.g., `-r`, `-i`, `-q`).
-- Long flags: double `--` + word (e.g., `-s`, `-n`, `-d`).
-- Unknown flags: print a clear error and exit with code 1.
+- Short flags only: single `-` followed by a single character (e.g., `-r`, `-e`, `-i`, `-o`, `-j`, `-q`, `-s`, `-n`, `-d`). Long options are not supported.
+- Unknown options: print a clear error and exit with code 1.
 
 ---
 
@@ -434,20 +447,19 @@ Implemented in `src/util.cpp` (`util::parse_arguments`). Uses the wide-character
 ### Plain Text (CLI)
 
 Human-readable, column-aligned. Rendered via `output::CliOutput`:
-- `status()` — single-line informational messages.
+- `message(Level, text)` — outputs informational (`Level::info`), warning (`Level::warn`), or error (`Level::error`) messages.
 - `field(name, value)` — key/value pairs.
 - `begin_table(columns)` / `table_row(values)` / `end_table()` — tabular output with auto-sized columns.
 - `begin_section(title)` / `end_section()` — groups related output.
 - `progress(filename, bytes_done, bytes_total)` — in-place progress bar overwriting the current line.
-- `warn()` / `error()` — prefixed warning and error messages.
 
 ### JSON
 
-`output::JsonOutput` buffers all structured output into a `nlohmann::json` document and serializes it on `flush()` (called at program exit). Progress calls are ignored.
+`output::JsonOutput` buffers all structured output into a `nlohmann::json` document and serializes it when the root section is closed (or on destruction). Progress calls and info/warn messages are ignored. Error messages are added to the top-level `"errors"` array.
 
-### Silent
+### Quiet
 
-`output::NoOutput` discards all output. All virtual methods are no-ops.
+`output::QuietOutput` discards all output. All virtual methods are no-ops.
 
 ---
 
@@ -481,17 +493,17 @@ Key types as implemented:
 
 | Type | Location | Description |
 |------|----------|-------------|
-| `util::CliArg` | `src/util.h` | Parsed command-line arguments (command, positional, flags) |
-| `inspect::ScanMode` | `src/inspect.h` | Enum: `kLcnOnly` or `kWithHash` |
-| `inspect::BlockEntry` | `src/inspect.h` | File path + byte offset for one cluster reference |
-| `inspect::LcnIndex` | `src/inspect.h` | `unordered_map<LONGLONG, vector<BlockEntry>>` — LCN→file map |
-| `inspect::HashIndex` | `src/inspect.h` | `unordered_map<string, vector<LONGLONG>>` — SHA-256→LCN map |
-| `inspect::ScanResult` | `src/inspect.h` | Output of `build_lcn_index`: indexes, stats, errors |
-| `copy::CopyContext` | `src/copy.cpp` | Pipeline state: paths, volumes, strategy, lcn_map, hash_index, stats |
-| `copy::ICopyStrategy` | `src/copy.cpp` | Abstract interface: `copy_file(src, dest, args, context)` |
-| `copy::CopyStats` | `src/copy.cpp` | Accumulated totals: files, bytes, cloned, fallback, errors |
-| `dedup::DedupContext` | `src/dedup.cpp` | Pipeline state: volume, scan, strategy, candidates, stats |
-| `dedup::IDedupStrategy` | `src/dedup.cpp` | Abstract interface: `build_candidates(scan, context)` |
-| `dedup::DedupCandidate` | `src/dedup.cpp` | One cluster-level dedup operation: canonical+duplicate path/offset |
-| `dedup::DedupStats` | `src/dedup.cpp` | Accumulated totals: files, clusters, bytes, errors |
-| `output::IOutput` | `src/output.h` | Abstract output interface: status, field, table, progress, warn, error |
+| [`util::CliArg`](file:///c:/Users/chris.stone/workspace/retool/src/util.h) | [`src/util.h`](file:///c:/Users/chris.stone/workspace/retool/src/util.h) | Parsed command-line arguments (command, positional, flags) |
+| [`inspect::ScanMode`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L23) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | Enum: `kLcnOnly` or `kWithHash` |
+| [`inspect::BlockEntry`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L29) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | Interned file path index + byte offset for one cluster reference |
+| [`inspect::LcnIndex`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L36) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | `unordered_map<LONGLONG, vector<BlockEntry>>` — LCN→file map |
+| [`inspect::HashIndex`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L40) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | `unordered_map<string, vector<LONGLONG>>` — SHA-256→LCN map |
+| [`inspect::ScanResult`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h#L43) | [`src/inspect.h`](file:///c:/Users/chris.stone/workspace/retool/src/inspect.h) | Output of `build_lcn_index`: indexes, stats, errors, file_table |
+| [`copy::CopyContext`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp#L142) | [`src/copy.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp) | Pipeline state: paths, volumes, strategy, lcn_map, hash_index, stats |
+| [`copy::ICopyStrategy`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp#L205) | [`src/copy.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp) | Abstract interface: `copy_file(src, dest, args, context)` |
+| [`copy::CopyStats`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp#L27) | [`src/copy.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp) | Accumulated totals: files, bytes, cloned, fallback, errors |
+| [`dedup::DedupContext`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp#L52) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | Pipeline state: volume, scan, strategy, candidates, stats |
+| [`dedup::IDedupStrategy`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp#L74) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | Abstract interface: `build_candidates(scan, context)` |
+| [`dedup::DedupCandidate`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp#L43) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | One cluster-level dedup operation: canonical+duplicate path/offset |
+| [`dedup::DedupStats`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp#L34) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | Accumulated totals: files, clusters, bytes, errors |
+| [`output::IOutput`](file:///c:/Users/chris.stone/workspace/retool/src/output.h#L41) | [`src/output.h`](file:///c:/Users/chris.stone/workspace/retool/src/output.h) | Abstract output interface: message, field, table, progress, graceful_teardown |

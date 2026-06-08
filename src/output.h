@@ -1,9 +1,9 @@
 /**
  * @file output.h
- * @brief Polymorphic output abstraction for CLI, JSON, and silent modes.
+ * @brief Polymorphic output abstraction for CLI, JSON, and quiet modes.
  *
  * Provides IOutput as the base interface with three implementations:
- * - NoOutput:   All methods are no-ops (-q mode).
+ * - QuietOutput: All methods are no-ops (-q mode).
  * - CliOutput:  Human-readable formatted output to the console.
  * - JsonOutput: Machine-readable JSON output via nlohmann/json.
  */

@@ -2,7 +2,7 @@
 
 **ReFS Tool** — A Windows command-line utility for inspecting and working with Resilient File System (ReFS) files at the block level.
 
-> Inspired by [blockstat](https://github.com/tdewin/blockstat) by tdewin.
+[![Create Release & Publish](https://github.com/chrisstone/retool/actions/workflows/release.yml/badge.svg)](https://github.com/chrisstone/retool/actions/workflows/release.yml)
 
 ## Overview
 
@@ -11,11 +11,14 @@
 > [!WARNING]
 > **Administrator privileges are required** to run `retool`. All queries and block operations use low-level filesystem ioctls that require full administrative rights. Run the utility from an elevated Command Prompt or PowerShell window.
 
+> [!CAUTION]
+> `retool` **Copy** and **Dedupe** commands change data on disk. Please run in **dry-run mode** (`-n`) first to see what will happen before running the command for real. Data loss is possible. There is no undo command. Backups are strongly recommended.
+
 ## Requirements
 
 - **Windows 10 / Windows Server 2016** or later (ReFS v3.x)
 - **Administrator privileges** — required for all operations (block-level ioctls mandate elevation)
-- **ReFS-formatted volume** — required for block cloning and deduplication; `inspect` works on any volume
+- **ReFS-formatted volume** — required for block cloning and deduplication
 
 ## Features
 
@@ -29,7 +32,7 @@ retool inspect <file1> <file2> ... [options]
 retool inspect <directory> [options]
 retool inspect <glob> [options]        (e.g. E:\Data\*.vbk)
 retool inspect -i <filelist.txt> [options]
-retool inspect <volume-root>
+retool inspect <volume-root | device-path> [options]
 ```
 
 **Single file:** Shows a summary (File, Volume, Cluster Size, File Size, Fragments). Add `-e` to include the full VCN → LCN extent table. Add `-r` to append a fragmentation report.
@@ -136,6 +139,8 @@ retool volume <drive-letter or path>
 
 ## Building
 
+Releases contain pre-built binaries for Windows x64. They are not signed at this time, use hash to verify.
+
 ### Prerequisites
 
 - Visual Studio 2022 (with C++ Desktop workload)
@@ -144,7 +149,7 @@ retool volume <drive-letter or path>
 ### Build Steps
 
 ```powershell
-git clone https://github.com/your-org/retool.git
+git clone https://github.com/chrisstone/retool.git
 cd retool
 
 # Configure
@@ -162,14 +167,14 @@ Output binary: `build/debug/Debug/retool.exe` (debug) or `build/release/Release/
 ## Usage Examples
 
 ```powershell
-# Inspect block layout of a single file
-retool inspect E:\Data\backup.vbk
+# Inspect block layout of a single file (extended mode)
+retool inspect E:\Data\backup.vbk -e
 
 # Inspect a file and include its fragmentation report
 retool inspect E:\Data\backup.vbk -r
 
-# Compare block sharing between multiple backup files
-retool inspect E:\Data\backup.vbk E:\Data\backup-inc.vib
+# Compare block sharing between multiple backup files (extended mode for sharing matrix)
+retool inspect E:\Data\backup.vbk E:\Data\backup-inc.vib -e
 
 # Compare files and include per-file fragmentation reports
 retool inspect E:\Data\backup.vbk E:\Data\backup-inc.vib -r
@@ -181,13 +186,13 @@ retool inspect E:\
 retool copy E:\Backups\2024 E:\Backups\2024-clone -r
 
 # Copy cross-volume, pre-scanning destination for existing blocks
-retool copy E:\Backups F:\Backups -r --scan-dest
+retool copy E:\Backups F:\Backups -r -d
 
 # Dry-run to preview a copy operation
-retool copy E:\Backups\2024 E:\Backups\2025 -r --dry-run
+retool copy E:\Backups\2024 E:\Backups\2025 -r -n
 
 # Deduplicate an entire ReFS volume in-place (dry-run first)
-retool dedup E:\ --dry-run
+retool dedup E:\ -n
 retool dedup E:\
 
 # Deduplicate two specific files
@@ -197,8 +202,8 @@ retool dedup E:\vms\base.vmdk E:\vms\clone.vmdk
 retool volume E:\
 
 # Output any command as JSON
-retool inspect E:\Data\backup.vbk --json
-retool dedup E:\ --dry-run --json -o dedup-report.json
+retool inspect E:\Data\backup.vbk -j
+retool dedup E:\ -n -j -o dedup-report.json
 ```
 
 ---
@@ -211,6 +216,14 @@ retool dedup E:\ --dry-run --json -o dedup-report.json
 - LCN values (logical cluster numbers) are volume-relative and directly comparable across files on the same volume — two files referencing the same LCN share that physical block.
 - All block-level operations require Administrator privileges.
 
+---
+
+## AI Usage Disclosure
+
+This project utilizes AI coding assistants (Gemini and Claude) for code generation and debugging. All AI-generated code has been reviewed, tested, and validated by human maintainers.
+
 ## License
 
 MIT License. Copyright (c) 2026. See [LICENSE](LICENSE) for details.
+
+> Inspired by [blockstat](https://github.com/tdewin/blockstat) by tdewin.
