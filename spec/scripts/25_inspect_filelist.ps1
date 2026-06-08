@@ -37,8 +37,8 @@ Assert-FileExists -Path $listPath -Description "File list created at C:\Temp\ret
 
 # ── Act ───────────────────────────────────────────────────────────────────────
 Write-Section "Run: retool inspect -i <filelist>"
-$out = Invoke-Retool -Args @('inspect', '-i', $listPath)
-& $env:RETOOL_EXE inspect -i $listPath | Out-Null
+$out = Invoke-Retool -Args @('inspect', '-i', $listPath, '-e')
+& $env:RETOOL_EXE inspect -i $listPath -e | Out-Null
 $exitCode = $LASTEXITCODE
 
 # ── Assert ────────────────────────────────────────────────────────────────────

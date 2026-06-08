@@ -32,8 +32,8 @@ Assert-FileExists -Path $file2 -Description "file2 copied to Drive A"
 
 # ── Act ───────────────────────────────────────────────────────────────────────
 Write-Section "Run: retool inspect <file1> <file2>"
-$out = Invoke-Retool -Args @('inspect', $file1, $file2)
-& $env:RETOOL_EXE inspect $file1 $file2 | Out-Null
+$out = Invoke-Retool -Args @('inspect', $file1, $file2, '-e')
+& $env:RETOOL_EXE inspect $file1 $file2 -e | Out-Null
 $exitCode = $LASTEXITCODE
 
 # ── Assert ────────────────────────────────────────────────────────────────────

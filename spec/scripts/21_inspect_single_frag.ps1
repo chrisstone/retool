@@ -23,8 +23,8 @@ Assert-FileExists -Path $dest -Description "Test file copied to Drive A"
 
 # ── Act ───────────────────────────────────────────────────────────────────────
 Write-Section "Run: retool inspect <file> -r"
-$out = Invoke-Retool -Args @('inspect', $dest, '-r')
-& $env:RETOOL_EXE inspect $dest -r | Out-Null
+$out = Invoke-Retool -Args @('inspect', $dest, '-r', '-e')
+& $env:RETOOL_EXE inspect $dest -r -e | Out-Null
 $exitCode = $LASTEXITCODE
 
 # ── Assert ────────────────────────────────────────────────────────────────────
