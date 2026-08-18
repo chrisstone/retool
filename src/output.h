@@ -63,15 +63,33 @@ struct IOutput {
     virtual void end_table() = 0;
 
     /**
-     * @brief Report file transfer progress (copy command only).
+     * @brief Report per-item progress (file transfer, scan, etc.).
      *
-     * CLI renders a progress bar; JSON ignores this entirely.
+     * CLI renders a progress bar; JSON and quiet are no-ops.
      *
-     * @param filename  Display name of the file being transferred.
-     * @param current   Bytes transferred so far for this file.
-     * @param total     Total bytes for this file.
+     * @param displayName  Label shown on the bar (filename, operation name, etc.).
+     * @param current      Units completed so far.
+     * @param total        Total units.
+     * @param rateUnit     Unit label for the throughput display (e.g. L"MBps"). Empty = no rate shown.
+     * @param showCounts   If true, shows "current/total" alongside the bar.
      */
-    virtual void progress(const std::wstring& filename, ULONGLONG current, ULONGLONG total) = 0;
+    virtual void progress(const std::wstring& displayName, ULONGLONG current, ULONGLONG total,
+                          const std::wstring& rateUnit = L"MBps", bool showCounts = false) = 0;
+
+    /**
+     * @brief Report overall/secondary progress packed beside the primary bar.
+     *
+     * When both progress() and progress_overall() are active, CliOutput renders
+     * them side-by-side on one line. Default no-op for JSON and quiet.
+     *
+     * @param displayName  Label for the overall bar (e.g. L"files").
+     * @param current      Overall units completed.
+     * @param total        Overall total units.
+     * @param rateUnit     Unit label. Empty = no rate shown (typical for count-based bars).
+     * @param showCounts   If true, shows "current/total" alongside the bar.
+     */
+    virtual void progress_overall(const std::wstring& /*displayName*/, ULONGLONG /*current*/, ULONGLONG /*total*/,
+                                   const std::wstring& /*rateUnit*/ = L"", bool /*showCounts*/ = true) {}
 
     /**
      * @brief Gracefully tear down the output interface.
@@ -115,7 +133,8 @@ struct QuietOutput : IOutput {
     void begin_table(const std::vector<std::wstring>&) override {}
     void table_row(const std::vector<std::wstring>&) override {}
     void end_table() override {}
-    void progress(const std::wstring&, ULONGLONG, ULONGLONG) override {}
+    void progress(const std::wstring&, ULONGLONG, ULONGLONG, const std::wstring&, bool) override {}
+    void progress_overall(const std::wstring&, ULONGLONG, ULONGLONG, const std::wstring&, bool) override {}
     void graceful_teardown() override {}
 
 private:
@@ -142,27 +161,48 @@ struct CliOutput : IOutput {
     void begin_table(const std::vector<std::wstring>& columns) override;
     void table_row(const std::vector<std::wstring>& values) override;
     void end_table() override;
-    void progress(const std::wstring& filename, ULONGLONG current, ULONGLONG total) override;
+    void progress(const std::wstring& displayName, ULONGLONG current, ULONGLONG total,
+                  const std::wstring& rateUnit, bool showCounts) override;
+    void progress_overall(const std::wstring& displayName, ULONGLONG current, ULONGLONG total,
+                          const std::wstring& rateUnit, bool showCounts) override;
     void graceful_teardown() override;
 
 private:
-    /// @brief Renders the 20-character progress bar string from a percentage.
-    std::string render_progress_bar(double percent) const;
+    struct ProgressState {
+        std::wstring displayName;
+        std::wstring rateUnit;
+        bool showCounts = false;
+        ULONGLONG current = 0;
+        ULONGLONG total = 0;
+        bool active = false;
+        std::chrono::steady_clock::time_point startTime{};
+        std::chrono::steady_clock::time_point lastTime{};
+    };
+
+    /// @brief Renders an N-character progress bar string from a percentage.
+    std::string render_progress_bar(double percent, int width = 20) const;
 
     /// @brief Returns the active output stream (file or wcout).
     std::wostream& out();
 
-    /// @brief Clears the progress line if one is active.
+    /// @brief Clears the in-progress line from the console and deactivates all bars.
     void clear_progress_line();
+
+    /// @brief Updates a bar's state; returns true if a render should follow.
+    bool update_bar(ProgressState& state, const std::wstring& displayName,
+                    ULONGLONG current, ULONGLONG total,
+                    const std::wstring& rateUnit, bool showCounts,
+                    std::chrono::steady_clock::time_point now);
+
+    /// @brief Renders the current composite or single progress line to the console.
+    void render_progress_line(std::chrono::steady_clock::time_point now);
 
     void flush() override;
 
     std::wofstream file_out_;                                              ///< File output stream (if -o specified).
     bool use_file_ = false;                                                ///< True if outputting to file.
-    std::wstring last_progress_file_;                                      ///< Last file reported for progress.
-    std::chrono::steady_clock::time_point last_progress_time_{};           ///< Timestamp of last progress render.
-    std::chrono::steady_clock::time_point progress_start_time_{};          ///< Start time for throughput calc.
-    bool progress_active_ = false;                                         ///< True if a progress line is on screen.
+    ProgressState primary_;                                                ///< Per-item progress bar state.
+    ProgressState secondary_;                                              ///< Overall progress bar state (packed beside primary).
     size_t last_line_len_ = 0;                                             ///< Length of the last rendered progress line.
     std::vector<std::wstring> table_columns_;                              ///< Current table column headers.
     std::vector<std::vector<std::wstring>> table_rows_;                    ///< Buffered rows; flushed by end_table.
@@ -197,7 +237,8 @@ struct JsonOutput : IOutput {
     void begin_table(const std::vector<std::wstring>& columns) override;
     void table_row(const std::vector<std::wstring>& values) override;
     void end_table() override;
-    void progress(const std::wstring& filename, ULONGLONG current, ULONGLONG total) override;
+    void progress(const std::wstring& displayName, ULONGLONG current, ULONGLONG total,
+                  const std::wstring& rateUnit, bool showCounts) override;
     void graceful_teardown() override;
 
 private:

@@ -62,3 +62,22 @@ target_include_directories(retool PRIVATE
 # Link Shlwapi for path handling if needed, and standard Win32 libraries
 target_link_libraries(retool PRIVATE Shlwapi.lib nlohmann_json::nlohmann_json)
 
+# Standalone test executable for pure-logic components (no ReFS/volume access
+# required). Currently covers the LCN interval index sweep-line/lookup logic.
+add_executable(retool_tests
+    tests/test_lcn_interval.cpp
+    src/inspect.cpp
+    src/inspect.h
+    src/util.cpp
+    src/util.h
+    src/output.h
+    ${CMAKE_CURRENT_BINARY_DIR}/src/version.h
+)
+
+target_include_directories(retool_tests PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(retool_tests PRIVATE Bcrypt.lib nlohmann_json::nlohmann_json)
+

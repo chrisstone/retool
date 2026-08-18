@@ -1,3 +1,4 @@
+#include <atomic>
 #include <expected>
 #include <fcntl.h>
 #include <io.h>
@@ -68,7 +69,7 @@ void print_command_help(const std::wstring& cmd) {
                    << L"  <file1> <file2> Multiple files - per-file cluster sharing report\n"
                    << L"  <dir>           Directory - recursively enumerates all files\n"
                    << L"  <glob>          Glob pattern e.g. E:\\Data\\*.vbk (non-recursive)\n"
-                   << L"  <volume-root>   Volume scan e.g. E:\\ - full LCN index\n\n"
+                   << L"  <volume>        Volume scan e.g. E: - full LCN index (no trailing backslash)\n\n"
                    << L"Options:\n"
                    << L"  -e            Extended mode: extent table (single-file) or sharing\n"
                    << L"                matrix (multi-file); per-file cluster table always shown\n"
@@ -82,14 +83,28 @@ void print_command_help(const std::wstring& cmd) {
                    << L"  -r            Recursive directory copy\n"
                    << L"  -n            Dry run: simulate without writing\n"
                    << L"  -d            Pre-scan destination volume to seed dedup index\n"
-                   << L"  -s            Strict: abort on first error (default: best-effort)\n";
+                   << L"  -s            Strict: abort on first error (default: best-effort)\n"
+                   << L"  -xs           Skip file if destination exists with same size and date\n"
+                   << L"  -t <count>    Retries per file on failure (default: 3; 0 = no retry)\n"
+                   << L"  -w <secs>     Seconds to wait between retries (default: 30; 0 = immediate)\n"
+                   << L"  -c:<flags>    What to copy per file: D=Data A=Attribs T=Times S=Security O=Owner\n"
+                   << L"                (default: DATSO = all)\n"
+                   << L"  -ca:<flags>   Attribute bits to copy when A is in -c: (R=ReadOnly A=Archive\n"
+                   << L"                S=System H=Hidden; default: RASH = all)\n";
         print_global();
     } else if (cmd == L"dedup" || cmd == L"dd") {
-        std::wcout << L"Usage: retool dedup <volume-root> [options]\n"
-                   << L"       retool dedup <file1> <file2> [options]\n\n"
+        std::wcout << L"Usage: retool dedup <volume> [options]\n"
+                   << L"       retool dedup <fileRef> <fileOp> [options]\n\n"
                    << L"Modes:\n"
-                   << L"  <volume-root>       Volume-wide deduplication scan (e.g. E:\\\\)\n"
-                   << L"  <file1> <file2>     Pair-wise deduplication of two files\n\n"
+                   << L"  <volume>               Volume-wide deduplication scan (e.g. E: - no trailing backslash)\n"
+                   << L"  <fileRef> <fileOp>      Pair-wise deduplication of two files:\n"
+                   << L"                            fileRef  Reference file - read only; its clusters\n"
+                   << L"                                     are used as the content source.\n"
+                   << L"                            fileOp   Operand file - the file that is rebuilt.\n"
+                   << L"                                     Renamed to <name>.old, replaced with a\n"
+                   << L"                                     new file cloned from fileRef (and any\n"
+                   << L"                                     other matching files), then .old is\n"
+                   << L"                                     deleted on success.\n\n"
                    << L"Options:\n"
                    << L"  -n            Dry run: simulate without writing\n"
                    << L"  -s            Strict: abort on first error\n";
@@ -111,18 +126,20 @@ void print_command_help(const std::wstring& cmd) {
     }
 }
 
-static output::IOutput* g_active_output = nullptr;
-static bool g_is_copy_or_dedup = false;
+static output::IOutput* g_active_output  = nullptr;
+static bool             g_is_copy_or_dedup = false;
+
+/// @brief Set to true by ConsoleCtrlHandler; polled by active long-running operations.
+std::atomic<bool> util::g_cancel_requested{false};
 
 /**
  * @brief Windows console control handler callback to process Ctrl+C and Ctrl+Break.
- * Sets the copy cancellation flags to signal active copying operations to stop and clean up,
- * and gracefully tears down the output interface.
+ * Sets util::g_cancel_requested to signal active long-running operations to stop
+ * gracefully, and tears down the output interface.
  */
 BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
     if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT || ctrlType == CTRL_CLOSE_EVENT) {
-        copy::g_cancel_requested = true;
-        copy::g_cancel_requested_bool = TRUE;
+        util::g_cancel_requested = true;
         if (g_active_output) {
             g_active_output->graceful_teardown();
         }
@@ -181,8 +198,8 @@ int wmain(int argc, wchar_t* argv[]) {
 
     // Handle empty command, help, or version
     if (args.command.empty() || args.command == L"help" || args.command == L"h" || args.command == L"-h" || args.command == L"--help") {
-        if (args.command == L"help" && !args.positional.empty()) {
-            print_command_help(args.positional[0]);
+        if (args.command == L"help" && !args.file_specs.empty()) {
+            print_command_help(args.file_specs[0].path);
         } else {
             print_general_help();
         }
@@ -236,16 +253,46 @@ int wmain(int argc, wchar_t* argv[]) {
     // Register console control handler for all commands (handles teardown on Ctrl+C)
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
-    // Dispatch subcommands
+    // Dispatch subcommands via prepare / execute / cleanup
     std::expected<int, std::wstring> run_res;
+
     if (args.command == L"inspect" || args.command == L"i") {
-        run_res = inspect::execute_inspect(args, *out);
+        auto ctx = inspect::prepare(args);
+        if (!ctx) {
+            run_res = std::unexpected(ctx.error());
+        } else {
+            run_res = inspect::execute(*ctx, *out);
+            inspect::cleanup(*ctx);
+        }
     } else if (args.command == L"copy" || args.command == L"cp") {
-        run_res = copy::execute_copy(args, *out);
+        auto ctx = copy::prepare(args);
+        if (!ctx) {
+            run_res = std::unexpected(ctx.error());
+        } else {
+            auto gather_ok = copy::gather(**ctx, *out);
+            if (!gather_ok) {
+                run_res = std::unexpected(gather_ok.error());
+            } else {
+                run_res = copy::execute(**ctx, *out);
+            }
+            copy::cleanup(*ctx);
+        }
     } else if (args.command == L"dedup" || args.command == L"dd") {
-        run_res = dedup::execute_dedup(args, *out);
+        auto ctx = dedup::prepare(args);
+        if (!ctx) {
+            run_res = std::unexpected(ctx.error());
+        } else {
+            run_res = dedup::execute(**ctx, *out);
+            dedup::cleanup(*ctx);
+        }
     } else if (args.command == L"volume" || args.command == L"vol") {
-        run_res = volume::execute_volume(args, *out);
+        auto ctx = volume::prepare(args);
+        if (!ctx) {
+            run_res = std::unexpected(ctx.error());
+        } else {
+            run_res = volume::execute(*ctx, *out);
+            volume::cleanup(*ctx);
+        }
     } else {
         std::wcerr << L"ERROR: Unknown command '" << args.command << L"'.\n" << std::endl;
         print_general_help();

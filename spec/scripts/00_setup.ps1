@@ -19,7 +19,23 @@
     clusters, leaving just enough room for one 50 MB test file.  All subsequent
     "copies" of that file (without dedup) fill the disk, forcing retool's
     deduplication code paths to be exercised before additional files can coexist.
+
+    RE-RUNNING WITHOUT TEARDOWN:
+    If leftover state from a previous run (env file, VHDX files, or a mounted
+    Retool* volume) is detected, this script refuses to proceed and tells you
+    to run 99_teardown.ps1 first - or pass -Force to wipe and recreate the
+    environment directly. This prevents accidentally destroying a test
+    environment someone is still mid-investigation of.
+
+.PARAMETER Force
+    Proceed even if leftover state from a previous, uncleaned run is detected -
+    wiping and recreating the environment (env file, VHDXs, mounted volumes).
+    Without this switch, leftover state causes the script to abort untouched.
 #>
+
+param(
+    [switch] $Force
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -30,6 +46,43 @@ $repoRoot   = Resolve-Path (Join-Path $scriptDir '..\..')
 $retoolExe  = Join-Path $repoRoot 'build\debug\Debug\retool.exe'
 $vhdxDir    = 'C:\Temp'
 $envFile    = Join-Path $scriptDir '.retool_env.ps1'
+$testFile   = Join-Path $vhdxDir 'testfile.bin'
+$vhdxA      = Join-Path $vhdxDir 'retool-a.vhdx'
+$vhdxB      = Join-Path $vhdxDir 'retool-b.vhdx'
+$vhdxC      = Join-Path $vhdxDir 'retool-c.vhdx'
+
+# -- 0. Detect leftover state from a previous, uncleaned run -------------------
+Write-Host "==> Checking for leftover state from a previous run..." -ForegroundColor Cyan
+$leftovers = @()
+if (Test-Path $envFile) { $leftovers += ("Environment file: {0}" -f $envFile) }
+foreach ($vhdx in @($vhdxA, $vhdxB, $vhdxC)) {
+    if (Test-Path $vhdx) { $leftovers += ("VHDX file: {0}" -f $vhdx) }
+}
+$orphanVolumes = Get-Volume -ErrorAction SilentlyContinue |
+    Where-Object { $_.FileSystemLabel -in @('RetoolA', 'RetoolB', 'RetoolC') }
+foreach ($vol in $orphanVolumes) {
+    $leftovers += ("Mounted volume: {0}: (label={1})" -f $vol.DriveLetter, $vol.FileSystemLabel)
+}
+
+if ($leftovers.Count -gt 0 -and -not $Force) {
+    Write-Host ""
+    Write-Host "==> Found leftover state from a previous run that was not torn down:" -ForegroundColor Red
+    foreach ($item in $leftovers) {
+        Write-Host ("    - {0}" -f $item) -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "    Run 99_teardown.ps1 first, or re-run this script with -Force to" -ForegroundColor Yellow
+    Write-Host "    detach/delete/reformat this leftover state and start clean." -ForegroundColor Yellow
+    Write-Error "Refusing to overwrite an existing, uncleaned test environment."
+    exit 1
+} elseif ($leftovers.Count -gt 0) {
+    Write-Host "==> -Force specified - wiping leftover state from a previous run:" -ForegroundColor Yellow
+    foreach ($item in $leftovers) {
+        Write-Host ("    - {0}" -f $item) -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "    No leftover state found." -ForegroundColor Green
+}
 
 # -- 1. Verify retool.exe -----------------------------------------------------
 Write-Host "==> Verifying retool.exe..." -ForegroundColor Cyan
@@ -49,7 +102,6 @@ if (-not (Test-Path $vhdxDir)) {
 }
 
 # -- 3. Create 50 MB test file -----------------------------------------------
-$testFile = Join-Path $vhdxDir 'testfile.bin'
 Write-Host ("==> Creating 50 MB test file at {0}..." -f $testFile) -ForegroundColor Cyan
 if (Test-Path $testFile) {
     Write-Host "    Removing existing test file" -ForegroundColor Yellow
@@ -134,10 +186,6 @@ function New-RetoolVhdx {
 }
 
 # -- 4. Create three VHDXs ----------------------------------------------------
-$vhdxA = Join-Path $vhdxDir 'retool-a.vhdx'
-$vhdxB = Join-Path $vhdxDir 'retool-b.vhdx'
-$vhdxC = Join-Path $vhdxDir 'retool-c.vhdx'
-
 Write-Host "==> Creating VHDX A (ReFS 64K cluster)..." -ForegroundColor Cyan
 $driveA = New-RetoolVhdx -VhdxPath $vhdxA -SizeMB 1024 -ClusterSizeBytes 65536 -VolumeLabel 'RetoolA'
 

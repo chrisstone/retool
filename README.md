@@ -93,12 +93,23 @@ For incompatible volumes (non-ReFS destination, cluster size mismatch), retool f
 | `-n` | Simulate the operation without writing any data |
 | `-d` | Pre-scan destination volume to seed the dedup block index |
 | `-s` | Abort on first error (default: best-effort, errors reported at end) |
+| `-xs` | Skip a file if the destination already exists with the same size and last-write date |
+| `-t <count>` | Retries per file on failure (default: `3`; `-t 0` disables retry) |
+| `-w <secs>` | Seconds to wait between retries (default: `30`; `-w 0` retries immediately) |
+| `-c:<flags>` | What to copy for each file. One or more of `D`ata `A`ttributes `T`imestamps `S`ecurity `O`wner (default: `DATSO` = all) |
+| `-ca:<flags>` | Which attribute bits to copy when `A` is in `-c:`. One or more of `R`ead-only `A`rchive `S`ystem `H`idden (default: `RASH` = all) |
 | `-j` | Output results in JSON format |
 | `-q` | Suppress all output |
 | `-o <file>` | Redirect output to a file |
 
 > [!NOTE]
 > `-d` performs a full volume hash scan before copying begins. On large volumes this adds significant setup time but can substantially reduce the data physically written.
+
+> [!NOTE]
+> Retry applies to individual file copies. A transient error (e.g. a locked source file, a momentary I/O failure) triggers a warning with full error detail and remaining retry count before each re-attempt. Non-retryable failures (e.g. cancellation via Ctrl+C) are not retried.
+
+> [!NOTE]
+> `-c:S` copies the DACL (discretionary ACL / standard file permissions). `-c:O` copies the owner SID and primary group. Security failures are reported as warnings since the data copy already succeeded; setting owner in particular may require `SeRestorePrivilege`.
 
 ---
 

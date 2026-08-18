@@ -90,15 +90,21 @@ Before any implementation task:
 
 ## Build & Test
 
-```powershell
-# Debug build
+The easiest way to setup the build environment is to call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+
+```cmd
+# Configure (once, or after CMakeLists.txt changes)
 cmake --preset debug
-cmake --build --preset debug
+cmake --preset release
+
+# Debug build
+cmake --build build/debug --config Debug
 
 # Release build
-cmake --preset release
-cmake --build --preset release
+cmake --build build/release --config Release
 ```
+
+> `CMakePresets.json` only defines `configurePresets`, not `buildPresets` - `cmake --build --preset <name>` will fail. Always build with `cmake --build <dir> --config <Debug|Release>` as shown above. See [doc/build.md](doc/build.md) for full instructions, including the fallback path when `cmake` isn't on your system PATH.
 
 > Note: Test infrastructure is not yet defined. When adding tests, follow the conventions established by the first test added and document the approach here.
 
@@ -111,3 +117,80 @@ cmake --build --preset release
   - **Commit Messages:** Follow the Conventional Commits specification.
   - **Documentation:** Use Doxygen formatting for inline code documentation.
 - **Tags:** Version tags (e.g., `v*`) must only be created/added by the user directly. Do not automate or push version tags.
+
+## Architectual Considerations
+
+### 1. High-Level Architectural Patterns
+
+To describe the structure where the command-line utility delegates specific subcommands to independent files/execution paths, use the following terms:
+
+#### Routing and Execution: **Command Pattern**
+
+The **Command Pattern** is the standard behavioral design pattern for CLI applications with subcommands (`inspect`, `copy`, `deduplicate`).
+
+* **Application:** The main entry point acts as the *Invoker* or *Router*, parsing the command-line arguments and routing execution to a specific, self-contained command object or function (e.g., `execute_inspect`).
+* **Documentation Terminology:** *"The application implements the **Command Pattern** for subcommand routing. Each subcommand (e.g., `inspect`, `copy`) must encapsulate its execution logic within an isolated module."*
+
+#### Separation of Concerns: **Modular Design / Layered Architecture**
+
+By isolating each subcommand into its own dedicated file (e.g., `inspect.cpp`), you are enforcing strict modularity.
+
+* **Documentation Terminology:** *"The codebase enforces a **Modular Architecture** with strict **Separation of Concerns (SoC)**. Subcommand implementations must remain completely decoupled from one another; shared logic must be abstracted into common utility modules."*
+
+---
+
+### 2. Subcommand Execution Lifecycle (Prepare, Execute, Cleanup)
+
+Your three-step execution sequence aligns with several critical defensive programming and transactional execution paradigms:
+
+```
+[ Step 1: Prepare ] --------> [ Step 2: Execute ] --------> [ Step 3: Cleanup ]
+(Validation & Phase)         (Non-Destructive Work)       (RAII & Summary Phase)
+
+```
+
+#### Phase 1 (Prepare): **Input Validation and Precondition Checking**
+
+This phase focuses on ensuring the system state and inputs are valid before any side effects occur.
+
+* **Design by Contract (DbC):** A paradigm where software correctness is guaranteed by checking **Preconditions** before a function runs.
+* **Fail-Fast Principle:** The practice of checking constraints early and terminating execution immediately if a violation is detected, preventing the system from entering an unstable state.
+* **Documentation Terminology:** *"The **Prepare** phase must implement a **Fail-Fast** approach by validating all **Preconditions** and constraints before mutating state or initiating data operations."*
+
+#### Phase 2 (Execute): **Transactional Execution & Single Mutation Point**
+
+To avoid destructive operations during execution (e.g., preventing partial writes or corrupted files if a failure occurs mid-process), you are describing transactional safety.
+
+* **ACID Semantics (specifically Atomicity):** The operation should either completely succeed or fail with no side effects (all-or-nothing).
+* **Copy-on-Write / Shadow Staging:** If writing data, working on a temporary copy or staging area before committing ensures the original data is never corrupted mid-execution.
+* **Documentation Terminology:** *"The **Execute** phase must prioritize **Atomic Operations** and transactional safety. Avoid in-place destructive operations; state mutations or file writes should utilize staging mechanisms to ensure data integrity in the event of an interruption."*
+
+#### Phase 3 (Cleanup): **RAII and Postcondition Validation**
+
+C++ handles resource management through a specific core paradigm that automates cleanup.
+
+* **RAII (Resource Acquisition Is Initialization):** The fundamental C++ paradigm where resource lifecycle (closing files, freeing memory, releasing locks) is bound to object lifetime via destructors. This ensures cleanup happens even if the program throws an error.
+* **Postcondition Validation:** Verifying that the output matches expectations and the system is left in a valid state.
+* **Documentation Terminology:** *"The **Cleanup** phase must handle **Postcondition Validation** and reporting. All resource management (memory, file handles, descriptors) must strictly adhere to **RAII** principles to guarantee leaks are avoided during normal or exceptional termination."*
+
+---
+
+### 3. Helper Functions and Object Passing
+
+Your requirements for reusable functions and object-oriented data passing map directly to core SOLID design principles and clean code clean practices:
+
+#### Object Passing: **Domain-Driven Objects / Data Transfer Objects (DTO)**
+
+Instead of passing loose, primitive variables (like strings and integers) through helper functions, you want to pass structured objects that represent the data entities.
+
+* **Domain Modeling:** Grouping related data and behavior into structured types that reflect real-world entities.
+* **Data Transfer Objects (DTO):** Structures or classes specifically designed to carry data between processes or functions to reduce function signature complexity.
+* **Documentation Terminology:** *"Helper functions must favor passing **Domain Objects** or **Data Transfer Objects (DTOs)** rather than long lists of primitive parameters. Avoid primitive obsession."*
+
+#### Code Reusability: **DRY Principle & Parameterization**
+
+To avoid "highly similar functions that do almost the same thing," you are invoking a foundational software engineering axiom.
+
+* **DRY (Don't Repeat Yourself):** A core principle aimed at reducing the repetition of software patterns.
+* **Parameterization / Abstraction:** Creating a single, highly flexible function that uses parameters, configuration objects, or templates to alter its behavior, rather than duplicating the code logic.
+* **Documentation Terminology:** *"Strictly adhere to the **DRY (Don't Repeat Yourself)** principle. Avoid creating redundant, highly similar helper functions. Instead, design single, highly flexible functions utilizing **Parameterization** or configuration structs to handle behavioral variations."*

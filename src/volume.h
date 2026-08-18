@@ -13,15 +13,29 @@
 
 namespace volume {
 
+/// @brief Validated context produced by prepare() and consumed by execute().
+struct VolumeContext {
+    std::wstring input_path;  ///< Volume or file path to query.
+};
+
 /**
- * @brief Executes the volume subcommand using the parsed command line arguments.
- *
- * Retrieves filesystem info, cluster size, and cluster capacity/usage information for the specified volume.
- *
- * @param args The parsed CLI arguments containing the target volume path.
- * @param out  The output interface for formatted results.
- * @return std::expected<int, std::wstring> Exit code on success, or an error message on failure.
+ * @brief Phase 1 — Validates arguments and constructs a VolumeContext.
+ * @return Populated context on success, or error string on failure.
  */
-std::expected<int, std::wstring> execute_volume(const util::CliArg& args, output::IOutput& out);
+std::expected<VolumeContext, std::wstring> prepare(const util::CliArg& args);
+
+/**
+ * @brief Phase 2 — Retrieves volume statistics and emits results.
+ * @param ctx  Context produced by prepare().
+ * @param out  Output interface.
+ * @return Exit code on success, or error string on failure.
+ */
+std::expected<int, std::wstring> execute(VolumeContext& ctx, output::IOutput& out);
+
+/**
+ * @brief Phase 3 — Releases any resources held by the context.
+ * No-op for VolumeContext; provided for API consistency.
+ */
+void cleanup(VolumeContext& ctx) noexcept;
 
 } // namespace volume

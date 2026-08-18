@@ -33,10 +33,21 @@ function Invoke-Retool {
     )
     Write-Host "    > retool $($ToolArgs -join ' ')" -ForegroundColor DarkGray
     $oldEncoding = [Console]::OutputEncoding
+    # retool's top-level fatal errors (bad CLI args, operational failures - see
+    # main.cpp) go to stderr; CliOutput itself writes everything else (including
+    # WARNING/ERROR-labeled messages) to stdout. Under the script-wide
+    # $ErrorActionPreference = 'Stop', merging stderr via 2>&1 wraps each stderr
+    # line as a terminating NativeCommandError *at this call site* - before
+    # $AllowFailure below ever gets a chance to matter. Relax it just for this
+    # call so an expected failure's stderr text becomes ordinary output instead
+    # of an uncatchable termination.
+    $oldEap = $ErrorActionPreference
     try {
         [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $ErrorActionPreference = 'Continue'
         $output = & $env:RETOOL_EXE @ToolArgs 2>&1
     } finally {
+        $ErrorActionPreference = $oldEap
         [Console]::OutputEncoding = $oldEncoding
     }
     if ($LASTEXITCODE -ne 0 -and -not $AllowFailure) {

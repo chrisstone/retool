@@ -43,19 +43,17 @@ std::wostream& CliOutput::out() {
 }
 
 void CliOutput::clear_progress_line() {
-    if (progress_active_) {
-        // Clear the progress line on console (progress always goes to console)
+    if (primary_.active || secondary_.active) {
         HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD written = 0;
-        // Overwrite with exactly as many spaces as the last line, then CR
         size_t clear_len = last_line_len_ > 0 ? last_line_len_ : 80;
         std::string blank(clear_len + 2, ' ');
         blank[0] = '\r';
         blank[clear_len + 1] = '\r';
         WriteConsoleA(console, blank.c_str(), static_cast<DWORD>(blank.size()), &written, NULL);
-        progress_active_ = false;
+        primary_.active = false;
+        secondary_.active = false;
         last_line_len_ = 0;
-        last_progress_file_.clear();
     }
 }
 
@@ -155,144 +153,207 @@ void CliOutput::end_table() {
     table_rows_.clear();
 }
 
-/**
- * @brief Renders a 20-character progress bar using ASCII block characters.
- *
- * Each of the 20 slots covers 5 percentage points. Within each slot,
- * the sub-percentage maps to one of 5 visual states:
- *   - ' '  (0x20)  = 0%
- *   - '░'  (0xB0)  = 1-24%
- *   - '▒'  (0xB1)  = 25-49%
- *   - '▓'  (0xB2)  = 50-74%
- *   - '█'  (0xDB)  = 75-100%
- *
- * @param percent Completion percentage (0.0 to 100.0).
- * @return std::string The 20-character bar (narrow chars for console output).
- */
-std::string CliOutput::render_progress_bar(double percent) const {
+// Each slot covers (100/width) percentage points. Within each slot the sub-percentage
+// maps to one of 5 visual states: ' ' ░ ▒ ▓ █
+std::string CliOutput::render_progress_bar(double percent, int width) const {
     if (percent < 0.0) percent = 0.0;
     if (percent > 100.0) percent = 100.0;
 
-    std::string bar(20, ' ');
+    std::string bar(width, ' ');
+    double slot_size = 100.0 / width;
 
-    for (int slot = 0; slot < 20; ++slot) {
-        double slot_start = slot * 5.0;
-        double slot_end = slot_start + 5.0;
+    for (int slot = 0; slot < width; ++slot) {
+        double slot_start = slot * slot_size;
+        double slot_end   = slot_start + slot_size;
 
         if (percent >= slot_end) {
             bar[slot] = static_cast<char>(0xDB); // █
         } else if (percent <= slot_start) {
             bar[slot] = ' ';
         } else {
-            double sub = (percent - slot_start) / 5.0;
-            if (sub < 0.01) {
-                bar[slot] = ' ';
-            } else if (sub < 0.25) {
-                bar[slot] = static_cast<char>(0xB0); // ░
-            } else if (sub < 0.50) {
-                bar[slot] = static_cast<char>(0xB1); // ▒
-            } else if (sub < 0.75) {
-                bar[slot] = static_cast<char>(0xB2); // ▓
-            } else {
-                bar[slot] = static_cast<char>(0xDB); // █
-            }
+            double sub = (percent - slot_start) / slot_size;
+            if      (sub < 0.01) bar[slot] = ' ';
+            else if (sub < 0.25) bar[slot] = static_cast<char>(0xB0); // ░
+            else if (sub < 0.50) bar[slot] = static_cast<char>(0xB1); // ▒
+            else if (sub < 0.75) bar[slot] = static_cast<char>(0xB2); // ▓
+            else                 bar[slot] = static_cast<char>(0xDB); // █
         }
     }
 
     return bar;
 }
 
-void CliOutput::progress(const std::wstring& filename, ULONGLONG current, ULONGLONG total) {
-    if (total == 0) return;
+bool CliOutput::update_bar(ProgressState& state, const std::wstring& displayName,
+                           ULONGLONG current, ULONGLONG total,
+                           const std::wstring& rateUnit, bool showCounts,
+                           std::chrono::steady_clock::time_point now) {
+    if (total == 0) return false;
+    if (displayName == state.displayName && !state.active) return false; // completed; ignore duplicate
 
-    // Ignore duplicate progress calls for an already completed file
-    if (filename == last_progress_file_ && !progress_active_) {
-        return;
+    if (!state.active || displayName != state.displayName) {
+        state.startTime   = now;
+        state.lastTime    = {};
+        state.displayName = displayName;
+        state.active      = true;
     }
-
-    auto now = std::chrono::steady_clock::now();
-
-    // Initialize timing on first call or new file
-    if (!progress_active_ || filename != last_progress_file_) {
-        progress_start_time_ = now;
-        last_progress_time_ = {};
-        last_progress_file_ = filename;
-        progress_active_ = true;
-    }
+    state.current    = current;
+    state.total      = total;
+    state.rateUnit   = rateUnit;
+    state.showCounts = showCounts;
 
     bool is_complete = (current >= total);
-
-    // Throttle updates to 1 per second (unless complete)
     if (!is_complete) {
-        auto elapsed_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_progress_time_);
-        if (elapsed_since_last.count() < 1000 && last_progress_time_.time_since_epoch().count() > 0) {
-            return;
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - state.lastTime);
+        if (elapsed.count() < 1000 && state.lastTime.time_since_epoch().count() > 0) {
+            return false; // throttled
+        }
+    }
+    state.lastTime = now;
+    return true;
+}
+
+void CliOutput::render_progress_line(std::chrono::steady_clock::time_point now) {
+    bool has_pri = primary_.active;
+    bool has_sec = secondary_.active;
+    if (!has_pri && !has_sec) return;
+
+    // Returns throughput in natural units for the given bar.
+    // MBps: bytes -> MB/s.  Anything else: units/sec (count-based).
+    auto calc_rate = [&now](const ProgressState& s) -> ULONGLONG {
+        double elapsed = std::chrono::duration<double>(now - s.startTime).count();
+        if (elapsed < 0.01 || s.rateUnit.empty()) return 0;
+        if (s.rateUnit == L"MBps")
+            return static_cast<ULONGLONG>(s.current / (elapsed * 1024.0 * 1024.0));
+        return static_cast<ULONGLONG>(s.current / elapsed);
+    };
+
+    auto strip_path = [](const std::wstring& name) -> std::wstring {
+        size_t slash = name.find_last_of(L"\\/");
+        return (slash != std::wstring::npos) ? name.substr(slash + 1) : name;
+    };
+
+    auto trunc = [](std::string s, size_t max) -> std::string {
+        return s.size() > max ? s.substr(0, max - 3) + "..." : s;
+    };
+
+    char line[512];
+    int len = 0;
+
+    if (has_pri && has_sec) {
+        // ── Composite: two 10-char bars packed on one line ──────────────────────
+        double pri_pct = static_cast<double>(primary_.current)   / primary_.total   * 100.0;
+        double sec_pct = static_cast<double>(secondary_.current) / secondary_.total * 100.0;
+        std::string pri_bar = render_progress_bar(pri_pct, 10);
+        std::string sec_bar = render_progress_bar(sec_pct, 10);
+
+        std::string pri_name = trunc(util::to_string(strip_path(primary_.displayName)), 20);
+        std::string sec_name = util::to_string(secondary_.displayName);
+
+        ULONGLONG pri_rate = calc_rate(primary_);
+        std::string pri_unit = util::to_string(primary_.rateUnit);
+
+        if (secondary_.showCounts) {
+            if (!primary_.rateUnit.empty()) {
+                len = std::snprintf(line, sizeof(line),
+                    "\r[%s] %llu/%llu %s | [%s] %-20s %llu %s",
+                    sec_bar.c_str(), secondary_.current, secondary_.total, sec_name.c_str(),
+                    pri_bar.c_str(), pri_name.c_str(), pri_rate, pri_unit.c_str());
+            } else {
+                len = std::snprintf(line, sizeof(line),
+                    "\r[%s] %llu/%llu %s | [%s] %-20s",
+                    sec_bar.c_str(), secondary_.current, secondary_.total, sec_name.c_str(),
+                    pri_bar.c_str(), pri_name.c_str());
+            }
+        } else {
+            std::string sec_label = trunc(sec_name, 12);
+            if (!primary_.rateUnit.empty()) {
+                len = std::snprintf(line, sizeof(line),
+                    "\r[%s] %-12s | [%s] %-20s %llu %s",
+                    sec_bar.c_str(), sec_label.c_str(),
+                    pri_bar.c_str(), pri_name.c_str(), pri_rate, pri_unit.c_str());
+            } else {
+                len = std::snprintf(line, sizeof(line),
+                    "\r[%s] %-12s | [%s] %-20s",
+                    sec_bar.c_str(), sec_label.c_str(),
+                    pri_bar.c_str(), pri_name.c_str());
+            }
+        }
+    } else {
+        // ── Single bar ───────────────────────────────────────────────────────────
+        const ProgressState& s = has_pri ? primary_ : secondary_;
+        double pct = static_cast<double>(s.current) / s.total * 100.0;
+        std::string bar = render_progress_bar(pct, 20);
+
+        std::wstring disp = has_pri ? strip_path(s.displayName) : s.displayName;
+        std::string name = trunc(util::to_string(disp), 30);
+
+        ULONGLONG rate = calc_rate(s);
+        std::string unit = util::to_string(s.rateUnit);
+
+        if (s.showCounts && !s.rateUnit.empty()) {
+            len = std::snprintf(line, sizeof(line), "\r[%s] %llu/%llu %-24s %llu %s",
+                bar.c_str(), s.current, s.total, name.c_str(), rate, unit.c_str());
+        } else if (s.showCounts) {
+            len = std::snprintf(line, sizeof(line), "\r[%s] %llu/%llu %-24s",
+                bar.c_str(), s.current, s.total, name.c_str());
+        } else if (!s.rateUnit.empty()) {
+            len = std::snprintf(line, sizeof(line), "\r[%s] %-30s %llu %s",
+                bar.c_str(), name.c_str(), rate, unit.c_str());
+        } else {
+            len = std::snprintf(line, sizeof(line), "\r[%s] %-30s",
+                bar.c_str(), name.c_str());
         }
     }
 
-    last_progress_time_ = now;
+    if (len <= 0) return;
 
-    double percent = (static_cast<double>(current) / total) * 100.0;
-    std::string bar = render_progress_bar(percent);
-
-    // Calculate throughput (MBps)
-    double elapsed_sec = std::chrono::duration<double>(now - progress_start_time_).count();
-    ULONGLONG mbps = 0;
-    if (elapsed_sec > 0.01) {
-        mbps = static_cast<ULONGLONG>(current / (elapsed_sec * 1024.0 * 1024.0));
+    std::string out_line(line);
+    size_t current_len = static_cast<size_t>(len);
+    if (current_len < last_line_len_) {
+        out_line.append(last_line_len_ - current_len, ' ');
     }
+    last_line_len_ = current_len;
 
-    // Extract just the filename (no directory path)
-    std::wstring display_name = filename;
-    size_t last_slash = filename.find_last_of(L"\\/");
-    if (last_slash != std::wstring::npos) {
-        display_name = filename.substr(last_slash + 1);
+    HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD written = 0;
+    WriteConsoleA(console, out_line.c_str(), static_cast<DWORD>(out_line.size()), &written, NULL);
+
+    // Mark completed bars inactive; newline when all bars are done.
+    if (has_pri && primary_.current >= primary_.total)     primary_.active   = false;
+    if (has_sec && secondary_.current >= secondary_.total) secondary_.active = false;
+    if (!primary_.active && !secondary_.active) {
+        WriteConsoleA(console, "\n", 1, &written, NULL);
+        last_line_len_ = 0;
     }
+}
 
-    // Truncate long filenames for display
-    const size_t kMaxNameLen = 30;
-    if (display_name.size() > kMaxNameLen) {
-        display_name = display_name.substr(0, kMaxNameLen - 3) + L"...";
+void CliOutput::progress(const std::wstring& displayName, ULONGLONG current, ULONGLONG total,
+                         const std::wstring& rateUnit, bool showCounts) {
+    auto now = std::chrono::steady_clock::now();
+    if (update_bar(primary_, displayName, current, total, rateUnit, showCounts, now)) {
+        render_progress_line(now);
     }
+}
 
-    // Render: [XXXXXXXXXXXXXXXXXXXX] filename Y MBps
-    std::string narrow_name = util::to_string(display_name);
-
-    char line[256];
-    int len = std::snprintf(line, sizeof(line), "\r[%s] %-30s %llu MBps",
-        bar.c_str(), narrow_name.c_str(), mbps);
-
-    if (len > 0) {
-        size_t current_len = static_cast<size_t>(len);
-        std::string out_line(line);
-        if (current_len < last_line_len_) {
-            out_line.append(last_line_len_ - current_len, ' ');
-        }
-        last_line_len_ = current_len;
-
-        // Write directly via console handle for code page control
-        // Progress always goes to console, never to file
-        HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
-        DWORD written = 0;
-        WriteConsoleA(console, out_line.c_str(), static_cast<DWORD>(out_line.size()), &written, NULL);
-
-        if (is_complete) {
-            WriteConsoleA(console, "\n", 1, &written, NULL);
-            progress_active_ = false;
-            last_line_len_ = 0;
-        }
+void CliOutput::progress_overall(const std::wstring& displayName, ULONGLONG current, ULONGLONG total,
+                                  const std::wstring& rateUnit, bool showCounts) {
+    auto now = std::chrono::steady_clock::now();
+    if (update_bar(secondary_, displayName, current, total, rateUnit, showCounts, now)) {
+        render_progress_line(now);
     }
 }
 
 void CliOutput::flush() {
-    if (progress_active_) {
+    if (primary_.active || secondary_.active) {
         HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD written = 0;
         WriteConsoleA(console, "\n", 1, &written, NULL);
-        progress_active_ = false;
+        primary_.active   = false;
+        secondary_.active = false;
         last_line_len_ = 0;
     }
-    last_progress_file_.clear();
+    primary_.displayName.clear();
+    secondary_.displayName.clear();
     out().flush();
     flushed_ = true;
 }
@@ -602,7 +663,7 @@ void JsonOutput::end_table() {
     current_table_key_.clear();
 }
 
-void JsonOutput::progress(const std::wstring&, ULONGLONG, ULONGLONG) {
+void JsonOutput::progress(const std::wstring&, ULONGLONG, ULONGLONG, const std::wstring&, bool) {
     // JSON does not output progress information.
 }
 

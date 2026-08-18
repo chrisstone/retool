@@ -309,57 +309,59 @@ A global `std::atomic<bool> copy::g_cancel_requested` is checked at every copy-l
 
 ### Purpose
 
-Deduplicate files already resident on a ReFS volume in-place using `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Identifies clusters with identical SHA-256 content and replaces physical duplicates with shared block references - reclaiming disk space without modifying file content.
+Deduplicate files already resident on a ReFS volume in-place using `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Identifies clusters with identical SHA-256 content and rebuilds each file so its physical blocks are shared with other files — reclaiming disk space without modifying file content.
 
 ### Pipeline Architecture
 
 `execute_dedup` is a three-phase pipeline:
 
-1. **Inspection** (`inspect_and_prepare`) - validate arguments, verify ReFS, run `build_lcn_index(kWithHash)`, select strategy.
-2. **Operation** (`execute_operation`) - apply `FSCTL_DUPLICATE_EXTENTS_TO_FILE` to each candidate cluster.
+1. **Inspection** (`inspect_and_prepare`) - validate arguments, verify ReFS, run `build_lcn_index(kWithHash)`, precompute auxiliary maps (`lcn_hash`, `file_clusters`), select strategy.
+2. **Operation** (`execute_operation`) - rebuild each file one at a time using the uniform `rebuild_file()` protocol.
 3. **Finalization** (`finalize_and_report`) - emit summary statistics.
 
 ### Modes and Strategy Selection
 
-| Invocation | Strategy | Description |
-|-----------|----------|-------------|
-| `retool dedup <volume-root>` | `VolumeWideDedupStrategy` | Deduplicates all hash-matched clusters across the entire volume |
-| `retool dedup <file1> <file2>` | `PairwiseDedupStrategy` | Deduplicates matching clusters between exactly two named files |
+Strategies determine **which files to rebuild** and in what order. The rebuild operation itself is identical regardless of mode.
 
-### Volume-Wide Deduplication (`VolumeWideDedupStrategy`)
+| Invocation | Strategy | Files Selected |
+|-----------|----------|----------------|
+| `retool dedup <volume-root>` | `VolumeWideDedupStrategy` | Every file on the volume with ≥1 hash-matched cluster in a different file |
+| `retool dedup <file1> <file2>` | `PairwiseDedupStrategy` | `file2` only; `file1` is left untouched and serves as a source |
 
-1. Receives the `ScanResult` from `build_lcn_index(kWithHash)`.
-2. Iterates `HashIndex` - for each SHA-256 digest with two or more LCNs:
-   - Designates `lcns[0]` as the canonical (master) cluster.
-   - For each subsequent LCN in the group: produces a `DedupCandidate` with `canonical_path/offset` and `duplicate_path/offset`.
-3. Returns the full candidate list for Phase 2 execution.
+### File Rebuild Protocol
 
-### Pair-Wise Deduplication (`PairwiseDedupStrategy`)
+The same operation is used for every file regardless of how it was selected. For each `FileRebuildPlan` in order:
 
-1. Partitions the `LcnIndex` by file - identifies exactly two distinct file paths.
-2. Iterates `HashIndex` - for each digest where one LCN belongs to file A and one to file B: produces a `DedupCandidate` pointing from file A (canonical) to file B (duplicate).
-3. Skips hashes where both LCNs belong to the same file.
+1. **Pre-check:** Evaluate source priority for all clusters. Skip this file if zero dedup candidates exist.
+2. **Rename:** `MoveFileW(original_path → original_path + ".old")`.
+3. **Create:** `CreateFileW(original_path, CREATE_NEW, GENERIC_READ|GENERIC_WRITE)`.
+4. **Pre-size:** `SetFileInformationByHandle(FileEndOfFileInfo)` rounded up to a full cluster boundary. Trimmed to exact byte size after cloning.
+5. **Clone all clusters** via `FSCTL_DUPLICATE_EXTENTS_TO_FILE` using `select_source()` with the following **priority per cluster**:
+   - **Priority 1 — already-rebuilt files:** Files successfully rebuilt earlier in this same run. Maximises chain deduplication and avoids circular block dependencies.
+   - **Priority 2 — other non-origin files:** Any other file on the volume with a matching SHA-256 hash at a different LCN.
+   - **Priority 3 — origin `.old`:** Unique content (no match in another file). No space savings for this cluster.
+6. **Trim:** `SetFileInformationByHandle(FileEndOfFileInfo)` to the exact original file size.
+7. **Delete:** `DeleteFileW(original_path + ".old")`.
+8. **Mark processed:** Added to `DedupContext::processed` so it is available as a Priority 1 source for all subsequent files.
 
-### Operation - Cluster-Level Dedup
+**On failure at any step:** the partial new file is deleted and `.old` is renamed back to the original path. A `CRITICAL` error message is emitted if the rename-back also fails.
 
-For each `DedupCandidate`:
+**Dry-run (`-n`):** The same source priority evaluation runs, but no filesystem changes are made. The `processed` set is still updated so estimated savings account for chain deduplication effects.
 
-1. Opens the canonical file read-only and the duplicate file read/write (handles cached across candidates to avoid per-cluster `CreateFileW` overhead).
-2. Issues `DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)` with `ByteCount = cluster_size`.
-3. Respects `g_cancel_requested` for cooperative Ctrl+C cancellation.
-4. In `-n` mode: increments stats counters without issuing the ioctl.
-
-### DedupCandidate Structure
+### `FileRebuildPlan` Structure
 
 ```cpp
-struct DedupCandidate {
-    std::wstring canonical_path;    // File that owns the canonical cluster
-    ULONGLONG    canonical_offset;  // Byte offset within canonical_path
-    std::wstring duplicate_path;    // File to receive the clone
-    ULONGLONG    duplicate_offset;  // Byte offset within duplicate_path
-    ULONGLONG    cluster_size;      // Bytes in this cluster
+struct FileRebuildPlan {
+    uint32_t     file_index;       // Index into ScanResult::file_table
+    std::wstring original_path;    // Path where the rebuilt file will land
+    std::wstring old_path;         // Backup during rebuild (original_path + ".old")
+    ULONGLONG    file_size;        // Exact byte size of the file
+    // Clusters sorted ascending by file_offset: {file_offset, lcn}
+    std::vector<std::pair<ULONGLONG, LONGLONG>> ordered_clusters;
 };
 ```
+
+Source selection happens dynamically in `rebuild_file()` via `select_source()`, consulting `DedupContext::lcn_hash` (LCN→digest reverse map), `DedupContext::scan` (hash_index + lcn_index), and `DedupContext::processed`.
 
 ### Output (summary)
 
@@ -502,8 +504,8 @@ Key types as implemented:
 | [`copy::CopyContext`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp#L142) | [`src/copy.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp) | Pipeline state: paths, volumes, strategy, lcn_map, hash_index, stats |
 | [`copy::ICopyStrategy`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp#L205) | [`src/copy.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp) | Abstract interface: `copy_file(src, dest, args, context)` |
 | [`copy::CopyStats`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp#L27) | [`src/copy.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/copy.cpp) | Accumulated totals: files, bytes, cloned, fallback, errors |
-| [`dedup::DedupContext`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp#L52) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | Pipeline state: volume, scan, strategy, candidates, stats |
-| [`dedup::IDedupStrategy`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp#L74) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | Abstract interface: `build_candidates(scan, context)` |
-| [`dedup::DedupCandidate`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp#L43) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | One cluster-level dedup operation: canonical+duplicate path/offset |
-| [`dedup::DedupStats`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp#L34) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | Accumulated totals: files, clusters, bytes, errors |
+| [`dedup::DedupContext`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | Pipeline state: volume, scan, lcn_hash, file_clusters, strategy, plans, processed, stats |
+| [`dedup::IDedupStrategy`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | Abstract interface: `build_plans(context)` — selects files to rebuild |
+| [`dedup::FileRebuildPlan`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | One file's rebuild plan: original/old paths, file size, ordered cluster list |
+| [`dedup::DedupStats`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | [`src/dedup.cpp`](file:///c:/Users/chris.stone/workspace/retool/src/dedup.cpp) | Accumulated totals: files_rebuilt, clusters_deduped, bytes_reclaimed, errors |
 | [`output::IOutput`](file:///c:/Users/chris.stone/workspace/retool/src/output.h#L41) | [`src/output.h`](file:///c:/Users/chris.stone/workspace/retool/src/output.h) | Abstract output interface: message, field, table, progress, graceful_teardown |

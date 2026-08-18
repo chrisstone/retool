@@ -8,7 +8,19 @@
     - Dismounts all three retool VHDXs (if attached)
     - Deletes all three VHDX files from C:\Temp
     - Deletes the test file and environment file
+    - Deletes stray files/dirs that individual test scripts write directly to
+      C:\Temp instead of onto a VHDX-mounted drive (VHDX-hosted artifacts are
+      cleaned automatically when the VHDX itself is deleted, above): the file
+      list and JSON output from 25/26_inspect_*.ps1, and the resident-file
+      fixtures from 37_copy_small_files.ps1
     - Does NOT delete C:\Temp itself (it may have been pre-existing)
+
+    KNOWN LIMITATION: if a VHDX's backing file was deleted (e.g. by hand)
+    while it was still attached, the resulting orphaned mount isn't detected
+    or dismounted here (Remove-Vhdx only acts on VHDX paths that still exist
+    on disk). 00_setup.ps1's leftover check will flag such an orphan volume,
+    but clearing it requires manually detaching it (e.g. via Disk Management
+    or `mountvol /d`) before re-running setup.
 #>
 
 Set-StrictMode -Version Latest
@@ -76,13 +88,27 @@ if (Test-Path $envFile) {
     Write-Host ("    Deleted: {0}" -f $envFile) -ForegroundColor Green
 }
 
-# Also clean up any stray JSON or filelist files left by tests
-$tempFiles = @(
+# Also clean up any stray files left directly on C:\Temp by tests that don't
+# write onto a VHDX-mounted drive - 25/26_inspect_*.ps1's file list and JSON
+# output, and 37_copy_small_files.ps1's resident-file fixtures (only linger
+# if that script was interrupted before its own end-of-section cleanup ran).
+$strayFiles = @(
     'C:\Temp\retool_filelist.txt',
-    'C:\Temp\retool_inspect_out.json'
+    'C:\Temp\retool_inspect_out.json',
+    'C:\Temp\small_same_src.txt',
+    'C:\Temp\small_same_dest.txt',
+    'C:\Temp\small_xvol_src.txt'
 )
-foreach ($f in $tempFiles) {
+foreach ($f in $strayFiles) {
     if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+}
+
+$strayDirs = @(
+    'C:\Temp\small_same_dir_src',
+    'C:\Temp\small_same_dir_dst'
+)
+foreach ($d in $strayDirs) {
+    if (Test-Path $d) { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host ""

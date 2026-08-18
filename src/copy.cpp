@@ -1,13 +1,19 @@
 #include <algorithm>
-#include <atomic>
+#include <cwctype>
 #include <expected>
 #include <list>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include <aclapi.h>
 #include <windows.h>
+
+#pragma comment(lib, "Advapi32.lib")
 
 #include "copy.h"
 #include "inspect.h"
@@ -16,61 +22,29 @@
 
 namespace copy {
 
-std::atomic<bool> g_cancel_requested{false};
-BOOL g_cancel_requested_bool = FALSE;
 
 // ============================================================================
 // Data Structures
 // ============================================================================
 
+/// @brief A single source→destination file mapping produced during the gather phase.
+struct FilePair {
+    std::wstring src;
+    std::wstring dest;
+};
+
 /// @brief Accumulated statistics for a copy operation.
 struct CopyStats {
-    ULONGLONG total_files = 0;
-    ULONGLONG cloned_files = 0;
+    ULONGLONG total_files    = 0;
+    ULONGLONG cloned_files   = 0;
     ULONGLONG fallback_files = 0;
-    ULONGLONG total_bytes = 0;
+    ULONGLONG skipped_files  = 0;
+    ULONGLONG total_bytes    = 0;
     std::vector<std::wstring> errors;
 };
 
-/// @brief RAII wrapper for Win32 HANDLE lifetime management.
-struct ScopedHandle {
-    HANDLE handle = INVALID_HANDLE_VALUE;
-
-    explicit ScopedHandle(HANDLE h = INVALID_HANDLE_VALUE) : handle(h) {}
-    ~ScopedHandle() { close(); }
-
-    ScopedHandle(const ScopedHandle&) = delete;
-    ScopedHandle& operator=(const ScopedHandle&) = delete;
-
-    ScopedHandle(ScopedHandle&& other) noexcept : handle(other.handle) {
-        other.handle = INVALID_HANDLE_VALUE;
-    }
-
-    ScopedHandle& operator=(ScopedHandle&& other) noexcept {
-        if (this != &other) {
-            close();
-            handle = other.handle;
-            other.handle = INVALID_HANDLE_VALUE;
-        }
-        return *this;
-    }
-
-    void close() {
-        if (handle != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle);
-            handle = INVALID_HANDLE_VALUE;
-        }
-    }
-
-    explicit operator bool() const { return handle != INVALID_HANDLE_VALUE; }
-    HANDLE get() const { return handle; }
-
-    HANDLE release() {
-        HANDLE h = handle;
-        handle = INVALID_HANDLE_VALUE;
-        return h;
-    }
-};
+/// @brief Win32 HANDLE RAII wrapper - shared definition, see util::ScopedHandle.
+using ScopedHandle = util::ScopedHandle;
 
 /// @brief LRU cache for previously-opened destination file handles.
 ///
@@ -138,45 +112,131 @@ private:
 // Forward declarations
 struct ICopyStrategy;
 
+/**
+ * @brief Incrementally-built source-LCN -> destination-location map for live copy execution.
+ *
+ * Unlike inspect::LcnIntervalIndex (built once via a batch sweep over a complete
+ * claim list gathered up front), this supports insertion one physically-contiguous
+ * run at a time as the copy progresses. Every run passed to insert_run() was just
+ * written or hash-matched-and-cloned to arithmetically contiguous destination byte
+ * offsets within a single destination file - the caller guarantees that per call.
+ * This class never infers or assumes destination contiguity across separate
+ * insert_run() calls, even when their source LCN ranges are numerically adjacent:
+ * two source LCNs that are contiguous may have been recorded by two unrelated
+ * earlier insertions (different files, unrelated destination positions), and a
+ * lookup here only ever returns what a single insert_run() call actually claimed.
+ */
+class CopySourceLcnMap {
+public:
+    /// @brief Records [src_lcn_start, src_lcn_start + run_length) mapping into
+    /// dest_path_index, starting at dest_offset_start at src_lcn_start.
+    void insert_run(LONGLONG src_lcn_start, ULONGLONG run_length,
+                     uint32_t dest_path_index, ULONGLONG dest_offset_start) {
+        if (run_length == 0) return;
+        runs_[src_lcn_start] = {src_lcn_start + static_cast<LONGLONG>(run_length),
+                                dest_path_index, dest_offset_start};
+    }
+
+    /// @brief Destination location for src_lcn, and how many further clusters
+    /// (starting at src_lcn) stay within that same previously-inserted run.
+    struct Lookup {
+        uint32_t  dest_path_index;
+        ULONGLONG dest_offset;             ///< Destination byte offset AT src_lcn.
+        ULONGLONG run_clusters_remaining;  ///< Clusters from src_lcn through this run's end.
+    };
+
+    /// @brief Looks up src_lcn. cluster_size is needed to compute the offset
+    /// within the run (this class stores no cluster size of its own).
+    std::optional<Lookup> find(LONGLONG src_lcn, DWORD cluster_size) const {
+        auto it = runs_.upper_bound(src_lcn);
+        if (it == runs_.begin()) return std::nullopt;
+        --it;
+        if (src_lcn >= it->second.end_lcn) return std::nullopt;
+
+        ULONGLONG delta = static_cast<ULONGLONG>(src_lcn - it->first);
+        Lookup result;
+        result.dest_path_index        = it->second.dest_path_index;
+        result.dest_offset            = it->second.dest_offset_start + delta * cluster_size;
+        result.run_clusters_remaining = static_cast<ULONGLONG>(it->second.end_lcn - src_lcn);
+        return result;
+    }
+
+    /// @brief Cheaper existence check when the destination location isn't needed yet.
+    bool contains(LONGLONG src_lcn) const {
+        auto it = runs_.upper_bound(src_lcn);
+        if (it == runs_.begin()) return false;
+        --it;
+        return src_lcn < it->second.end_lcn;
+    }
+
+private:
+    struct Run {
+        LONGLONG  end_lcn;
+        uint32_t  dest_path_index;
+        ULONGLONG dest_offset_start;
+    };
+    std::map<LONGLONG, Run> runs_;
+};
+
 /// @brief Shared state for the entire copy pipeline.
 struct CopyContext {
-    // -- Populated during Phase 1: Inspection --
+    // -- Populated during Phase 1: prepare() --
     std::wstring src_path;              ///< Resolved absolute source path.
     std::wstring dest_path;             ///< Resolved absolute destination path.
     bool is_directory = false;          ///< True if source is a directory.
 
     std::wstring src_volume_root;       ///< Source volume root (e.g., L"E:\\").
     std::wstring dest_volume_root;      ///< Destination volume root (e.g., L"F:\\").
-    bool same_volume = false;           ///< True if src and dest are on the same volume.
-    bool dest_is_refs = false;          ///< True if destination is ReFS.
-    DWORD src_cluster_size = 0;         ///< Source volume cluster size in bytes.
+    bool same_volume    = false;        ///< True if src and dest are on the same volume.
+    bool src_is_refs    = false;        ///< True if source volume is ReFS.
+    bool dest_is_refs   = false;        ///< True if destination is ReFS.
+    DWORD src_cluster_size  = 0;        ///< Source volume cluster size in bytes.
     DWORD dest_cluster_size = 0;        ///< Destination volume cluster size in bytes.
 
     std::unique_ptr<ICopyStrategy> strategy;  ///< Selected copy strategy.
     output::IOutput* out = nullptr;           ///< Non-owning pointer to the output interface.
 
-    // -- Populated during Phase 2: Operation --
+    // -- Populated during Phase 2: gather() --
+    std::vector<FilePair> file_pairs;           ///< All source→destination file mappings.
+    ULONGLONG total_unique_src_lcns = 0;        ///< Unique source LCNs (overall progress total).
+
     /// Interned destination paths: maps index -> path string. Avoids storing
     /// a full wstring copy per lcn_map entry (saves ~5 GB at 31M entries).
+    /// Reserved in gather() to avoid rehashing during execute().
     std::vector<std::wstring> dest_path_table;
 
-    /// Map: source LCN -> {dest_path_index, dest_offset_in_bytes}
-    std::unordered_map<LONGLONG, std::pair<uint32_t, ULONGLONG>> lcn_map;
+    /// Incremental interval map: source LCN -> {dest_path_index, dest_offset}.
+    /// Built up one contiguous run at a time as execute() proceeds - see
+    /// CopySourceLcnMap for the contiguity guarantees this relies on.
+    CopySourceLcnMap lcn_map;
 
-    /// Destination LCN index seeded by --scan-dest pre-scan; maps dest LCN -> file+offset.
-    inspect::LcnIndex dest_lcn_index;
+    /// Destination first-occurrence LCN interval index seeded by --scan-dest.
+    /// Built with ClaimOccurrence::kFirst - one representative owner per run -
+    /// since copy only needs one location per dest LCN to clone from.
+    inspect::LcnIntervalIndex dest_lcn_index;
 
     /// Interned file paths from the destination scan (resolves BlockEntry::file_index).
     std::vector<std::wstring> dest_scan_file_table;
 
-    /// Content hash index seeded by --scan-dest pre-scan (kWithHash); maps SHA-256 -> dest LCNs.
+    /// Content hash index seeded by --scan-dest when source is non-ReFS.
+    /// Empty when both volumes are ReFS (LCN tracking handles dedup without hashing).
     inspect::HashIndex hash_index;
 
-    /// Reusable I/O buffer for copy_bytes_physical (allocated once, 4 MB).
+    /// Reusable I/O buffer for copy_bytes_physical (allocated once in prepare(), 4 MB).
     std::vector<BYTE> io_buffer;
+
+    /// SHA-256 hasher for --scan-dest per-cluster content matching, opened lazily
+    /// on first use in copy_new_run_with_hash_matching and reused for the rest of
+    /// the copy operation - avoids reopening the BCrypt provider every cluster.
+    std::optional<inspect::Sha256Hasher> hasher;
+
+    // -- Updated during Phase 3: execute() --
+    ULONGLONG processed_lcns = 0;  ///< Unique source LCNs copied so far (for progress_overall).
 
     CopyStats stats;
     HandleLruCache handle_cache;
+
+    util::CliArg args_snapshot;     ///< Copy of the parsed CLI args captured during prepare().
 
     CopyContext() = default;
     ~CopyContext() { handle_cache.close_all(); }
@@ -224,35 +284,6 @@ struct ICopyStrategy {
 // ============================================================================
 // Pure Helper Functions
 // ============================================================================
-
-/**
- * @brief Checks if the given volume root path is formatted with the ReFS filesystem.
- *
- * @param volume_root The root path of the volume (e.g. L"C:\\").
- * @return true If the volume is ReFS.
- * @return false If the volume is not ReFS or information could not be retrieved.
- */
-bool is_refs_volume(const std::wstring& volume_root) {
-    wchar_t fs_name[MAX_PATH] = {0};
-    if (GetVolumeInformationW(volume_root.c_str(), NULL, 0, NULL, NULL, NULL, fs_name, MAX_PATH)) {
-        return (wcscmp(fs_name, L"ReFS") == 0);
-    }
-    return false;
-}
-
-/**
- * @brief Retrieves the cluster allocation size for the given volume.
- *
- * @param volume_root The root path of the volume.
- * @return DWORD The cluster size in bytes, or 0 if retrieval fails.
- */
-DWORD get_cluster_size(const std::wstring& volume_root) {
-    DWORD sectors_per_cluster = 0, bytes_per_sector = 0, free_clusters = 0, total_clusters = 0;
-    if (GetDiskFreeSpaceW(volume_root.c_str(), &sectors_per_cluster, &bytes_per_sector, &free_clusters, &total_clusters)) {
-        return sectors_per_cluster * bytes_per_sector;
-    }
-    return 0;
-}
 
 /**
  * @brief Converts a relative path into a fully qualified absolute path name.
@@ -355,21 +386,14 @@ std::expected<DestSizeTracker, std::wstring> pre_size_dest_file(HANDLE dest_hand
         return tracker;
     }
 
-    LARGE_INTEGER li;
-    li.QuadPart = src_size;
-    if (SetFilePointerEx(dest_handle, li, NULL, FILE_BEGIN) && SetEndOfFile(dest_handle)) {
+    if (util::set_file_eof(dest_handle, static_cast<ULONGLONG>(src_size))) {
         tracker.current_eof = src_size;
     } else {
         tracker.incremental = true;
     }
 
-    // Seek back to beginning regardless
-    LARGE_INTEGER zero;
-    zero.QuadPart = 0;
-    if (!SetFilePointerEx(dest_handle, zero, NULL, FILE_BEGIN)) {
-        return std::unexpected(L"Failed to reset destination file pointer: " + util::get_win32_error_message(GetLastError()));
-    }
-
+    // No seek-reset needed: unlike SetFilePointerEx + SetEndOfFile, set_file_eof
+    // (SetFileInformationByHandle) never moves the handle's file pointer.
     return tracker;
 }
 
@@ -389,79 +413,28 @@ std::expected<bool, std::wstring> ensure_dest_size(HANDLE dest_handle, DestSizeT
         return true;
     }
 
-    LARGE_INTEGER li;
-    li.QuadPart = required_size;
-    if (!SetFilePointerEx(dest_handle, li, NULL, FILE_BEGIN) || !SetEndOfFile(dest_handle)) {
-        return std::unexpected(L"Incremental sizing failed: " + util::get_win32_error_message(GetLastError()));
+    auto eof_ok = util::set_file_eof(dest_handle, required_size);
+    if (!eof_ok) {
+        return std::unexpected(L"Incremental sizing failed: " + eof_ok.error());
     }
     tracker.current_eof = required_size;
     return true;
 }
 
-/// @brief A single VCN extent with its LCN mapping.
-struct Extent {
-    LONGLONG vcn = 0;       ///< Starting VCN of this extent.
-    LONGLONG next_vcn = 0;  ///< VCN of the next extent (or EOF).
-    LONGLONG lcn = 0;       ///< Starting LCN (-1 for sparse).
-
-    ULONGLONG cluster_count() const { return next_vcn - vcn; }
-    bool is_sparse() const { return lcn == (LONGLONG)-1; }
-};
+/// @brief Extent type shared with inspect.h - the single place the
+/// FSCTL_GET_RETRIEVAL_POINTERS walk is implemented.
+using Extent = inspect::Extent;
 
 /**
  * @brief Queries all retrieval pointers (extents) for a file.
  *
- * Iterates FSCTL_GET_RETRIEVAL_POINTERS until all extents are retrieved.
+ * Thin wrapper over inspect::collect_extents() for call-site compatibility.
  *
  * @param file_handle  Handle to the file.
  * @return Vector of extents on success, or error message on failure.
  */
 std::expected<std::vector<Extent>, std::wstring> query_retrieval_pointers(HANDLE file_handle) {
-    std::vector<Extent> extents;
-
-    STARTING_VCN_INPUT_BUFFER input = {0};
-    input.StartingVcn.QuadPart = 0;
-
-    const DWORD buf_size = sizeof(RETRIEVAL_POINTERS_BUFFER) + sizeof(RETRIEVAL_POINTERS_BUFFER::Extents[0]) * 16;
-    std::vector<BYTE> buffer(buf_size);
-    auto output = reinterpret_cast<PRETRIEVAL_POINTERS_BUFFER>(buffer.data());
-
-    bool done = false;
-    while (!done) {
-        DWORD bytes_returned = 0;
-        BOOL ok = DeviceIoControl(
-            file_handle,
-            FSCTL_GET_RETRIEVAL_POINTERS,
-            &input,
-            sizeof(input),
-            output,
-            buf_size,
-            &bytes_returned,
-            NULL
-        );
-
-        DWORD err = GetLastError();
-        if (!ok && err != ERROR_MORE_DATA) {
-            if (err == ERROR_HANDLE_EOF) break;
-            return std::unexpected(L"FSCTL_GET_RETRIEVAL_POINTERS failed: " + util::get_win32_error_message(err));
-        }
-
-        if (ok) done = true;
-
-        LONGLONG current_vcn = output->StartingVcn.QuadPart;
-        for (DWORD i = 0; i < output->ExtentCount; ++i) {
-            Extent ext;
-            ext.vcn = current_vcn;
-            ext.next_vcn = output->Extents[i].NextVcn.QuadPart;
-            ext.lcn = output->Extents[i].Lcn.QuadPart;
-            extents.push_back(ext);
-            current_vcn = ext.next_vcn;
-        }
-
-        input.StartingVcn.QuadPart = extents.empty() ? 0 : extents.back().next_vcn;
-    }
-
-    return extents;
+    return inspect::collect_extents(file_handle);
 }
 
 /**
@@ -478,17 +451,7 @@ std::expected<bool, std::wstring> clone_extent_same_volume(
     HANDLE dest_handle, HANDLE src_handle,
     ULONGLONG src_offset, ULONGLONG dest_offset, ULONGLONG byte_count
 ) {
-    DUPLICATE_EXTENTS_DATA dup_data;
-    dup_data.FileHandle = src_handle;
-    dup_data.SourceFileOffset.QuadPart = src_offset;
-    dup_data.TargetFileOffset.QuadPart = dest_offset;
-    dup_data.ByteCount.QuadPart = byte_count;
-
-    DWORD dup_returned = 0;
-    if (!DeviceIoControl(dest_handle, FSCTL_DUPLICATE_EXTENTS_TO_FILE, &dup_data, sizeof(dup_data), NULL, 0, &dup_returned, NULL)) {
-        return std::unexpected(L"FSCTL_DUPLICATE_EXTENTS_TO_FILE failed: " + util::get_win32_error_message(GetLastError()));
-    }
-    return true;
+    return util::duplicate_extents(dest_handle, src_handle, src_offset, dest_offset, byte_count);
 }
 
 /**
@@ -508,22 +471,7 @@ std::expected<bool, std::wstring> clone_extent_from_dest(
     HANDLE dest_handle, HANDLE prev_dest_handle,
     ULONGLONG prev_dest_offset, ULONGLONG dest_offset, ULONGLONG byte_count
 ) {
-    DUPLICATE_EXTENTS_DATA dup_data;
-    dup_data.FileHandle = prev_dest_handle;
-    dup_data.SourceFileOffset.QuadPart = prev_dest_offset;
-    dup_data.TargetFileOffset.QuadPart = dest_offset;
-    dup_data.ByteCount.QuadPart = byte_count;
-
-    DWORD dup_returned = 0;
-    if (!DeviceIoControl(dest_handle, FSCTL_DUPLICATE_EXTENTS_TO_FILE, &dup_data, sizeof(dup_data), NULL, 0, &dup_returned, NULL)) {
-        DWORD err = GetLastError();
-        return std::unexpected(L"FSCTL_DUPLICATE_EXTENTS_TO_FILE failed on target volume (SourceOffset="
-            + std::to_wstring(dup_data.SourceFileOffset.QuadPart)
-            + L", TargetOffset=" + std::to_wstring(dup_data.TargetFileOffset.QuadPart)
-            + L", ByteCount=" + std::to_wstring(dup_data.ByteCount.QuadPart)
-            + L"): " + util::get_win32_error_message(err));
-    }
-    return true;
+    return util::duplicate_extents(dest_handle, prev_dest_handle, prev_dest_offset, dest_offset, byte_count);
 }
 
 /**
@@ -566,7 +514,7 @@ std::expected<bool, std::wstring> copy_bytes_physical(
     ULONGLONG copied = 0;
 
     while (copied < byte_count) {
-        if (g_cancel_requested) {
+        if (util::g_cancel_requested) {
             return std::unexpected(L"Copy cancelled by user.");
         }
         DWORD to_read = static_cast<DWORD>(std::min<ULONGLONG>(io_buffer.size(), byte_count - copied));
@@ -598,30 +546,107 @@ std::expected<bool, std::wstring> copy_bytes_physical(
 }
 
 /**
- * @brief Sets the final destination file size and copies timestamps/attributes.
+ * @brief Sets the final destination file size.
+ *
+ * Truncates or extends the destination to the exact source file size.
+ * File metadata (attributes, timestamps, security, owner) is applied
+ * separately by copy_file_metadata() after the data copy succeeds.
  *
  * @param dest_handle  Handle to the destination file.
- * @param src_handle   Handle to the source file (for reading attributes).
  * @param src_size     The exact file size to set on the destination.
  * @return true on success, or error message on failure.
  */
-std::expected<bool, std::wstring> finalize_dest_file(HANDLE dest_handle, HANDLE src_handle, LONGLONG src_size) {
-    // Truncate/extend destination to exact source size
-    LARGE_INTEGER li;
-    li.QuadPart = src_size;
-    if (!SetFilePointerEx(dest_handle, li, NULL, FILE_BEGIN)) {
-        return std::unexpected(L"Failed to set file pointer: " + util::get_win32_error_message(GetLastError()));
+std::expected<bool, std::wstring> finalize_dest_file(HANDLE dest_handle, LONGLONG src_size) {
+    auto eof_ok = util::set_file_eof(dest_handle, static_cast<ULONGLONG>(src_size));
+    if (!eof_ok) {
+        return std::unexpected(L"Failed to finalize destination file size: " + eof_ok.error());
     }
-    if (!SetEndOfFile(dest_handle)) {
-        return std::unexpected(L"SetEndOfFile failed: " + util::get_win32_error_message(GetLastError()));
+    return true;
+}
+
+// ============================================================================
+// Copy Attempt Fallback
+// ============================================================================
+
+/**
+ * @brief Fallback to a standard byte-by-byte copy after a clone/dedup failure.
+ *
+ * Deletes the partially-written destination, warns the user, then performs a
+ * manual read/write copy. File metadata (attributes, timestamps, security,
+ * owner) is NOT applied here; it is handled by copy_file_metadata() in
+ * retry_copy_file() after this function returns.
+ *
+ * @param src             Source file path.
+ * @param dest            Destination file path.
+ * @param original_error  Error from the failed clone attempt.
+ * @param context         Shared copy context.
+ * @return true on success, or error string on failure.
+ */
+std::expected<bool, std::wstring> attempt_fallback(
+    const std::wstring& src,
+    const std::wstring& dest,
+    const std::wstring& original_error,
+    CopyContext& context
+) {
+    DeleteFileW(dest.c_str());
+    if (util::g_cancel_requested) return std::unexpected(L"Copy cancelled by user.");
+
+    context.out->message(output::Level::warn,
+        L"Deduplication-preserving copy failed (" + original_error +
+        L"). Falling back to standard copy for: " + src);
+
+    auto src_result = open_source_file(src);
+    if (!src_result) {
+        return std::unexpected(L"Dedup copy failed (" + original_error +
+            L"), and fallback open failed: " + src_result.error());
+    }
+    ScopedHandle src_h = std::move(*src_result);
+
+    auto dest_result = create_dest_file(dest);
+    if (!dest_result) {
+        return std::unexpected(L"Dedup copy failed (" + original_error +
+            L"), and fallback create failed: " + dest_result.error());
+    }
+    ScopedHandle dest_h = std::move(*dest_result);
+
+    LARGE_INTEGER src_size = {0};
+    if (!GetFileSizeEx(src_h.get(), &src_size)) {
+        return std::unexpected(L"Fallback: failed to get source size: " +
+                               util::get_win32_error_message(GetLastError()));
     }
 
-    // Copy file times and attributes
-    FILE_BASIC_INFO basic_info;
-    if (GetFileInformationByHandleEx(src_handle, FileBasicInfo, &basic_info, sizeof(basic_info))) {
-        SetFileInformationByHandle(dest_handle, FileBasicInfo, &basic_info, sizeof(basic_info));
+    auto tracker_result = pre_size_dest_file(dest_h.get(), src_size.QuadPart);
+    if (!tracker_result) {
+        return std::unexpected(L"Fallback: pre-size failed: " + tracker_result.error());
     }
 
+    if (src_size.QuadPart > 0) {
+        auto copy_ok = copy_bytes_physical(
+            src_h.get(), dest_h.get(),
+            0, 0, static_cast<ULONGLONG>(src_size.QuadPart),
+            context.io_buffer, context.out, src,
+            0, static_cast<ULONGLONG>(src_size.QuadPart)
+        );
+        if (!copy_ok) {
+            dest_h.close();
+            src_h.close();
+            if (util::g_cancel_requested) {
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            return std::unexpected(L"Dedup copy failed (" + original_error +
+                L"), and fallback copy failed: " + copy_ok.error());
+        }
+    }
+
+    auto final_ok = finalize_dest_file(dest_h.get(), src_size.QuadPart);
+    if (!final_ok) {
+        return std::unexpected(L"Fallback: finalize failed: " + final_ok.error());
+    }
+
+    context.stats.fallback_files++;
+    context.stats.total_files++;
+    context.stats.total_bytes += static_cast<ULONGLONG>(src_size.QuadPart);
     return true;
 }
 
@@ -630,10 +655,11 @@ std::expected<bool, std::wstring> finalize_dest_file(HANDLE dest_handle, HANDLE 
 // ============================================================================
 
 /**
- * @brief Fallback strategy using standard CopyFileExW.
+ * @brief Fallback strategy using standard byte-by-byte file copy.
  *
  * Used when the destination is non-ReFS or cluster sizes are mismatched,
- * making block cloning impossible.
+ * making block cloning impossible. File metadata is NOT applied here; it
+ * is handled by copy_file_metadata() in retry_copy_file().
  */
 struct FallbackCopyStrategy : ICopyStrategy {
     std::expected<bool, std::wstring> copy_file(
@@ -643,69 +669,66 @@ struct FallbackCopyStrategy : ICopyStrategy {
         CopyContext& context
     ) override {
         if (args.dry_run) {
-            context.out->message(output::Level::info, L"[DRY-RUN] Would copy with standard fallback: " + src + L" -> " + dest);
+            context.out->message(output::Level::info,
+                L"[DRY-RUN] Would copy with standard fallback: " + src + L" -> " + dest);
             context.stats.fallback_files++;
             context.stats.total_files++;
             return true;
         }
 
         if (!context.dest_is_refs) {
-            context.out->message(output::Level::warn, L"Destination volume is non-ReFS. Falling back to standard copy for: " + src);
+            context.out->message(output::Level::warn,
+                L"Destination volume is non-ReFS. Using standard copy for: " + src);
         } else {
-            context.out->message(output::Level::warn, L"Destination volume cluster size mismatch ("
-                + std::to_wstring(context.dest_cluster_size) + L" vs " + std::to_wstring(context.src_cluster_size)
-                + L"). Falling back to standard copy for: " + src);
+            context.out->message(output::Level::warn,
+                L"Destination volume cluster size mismatch ("
+                + std::to_wstring(context.dest_cluster_size) + L" vs "
+                + std::to_wstring(context.src_cluster_size)
+                + L"). Using standard copy for: " + src);
         }
 
-        // Use progress callback for CopyFileExW
-        ProgressContext prog_ctx{src, context.out};
-        if (!CopyFileExW(src.c_str(), dest.c_str(), &copy_progress_callback, &prog_ctx, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
-            DWORD error = GetLastError();
-            return std::unexpected(L"Fallback CopyFileExW failed: " + util::get_win32_error_message(error));
+        auto src_result = open_source_file(src);
+        if (!src_result) return std::unexpected(src_result.error());
+        ScopedHandle src_handle = std::move(*src_result);
+
+        auto dest_result = create_dest_file(dest);
+        if (!dest_result) return std::unexpected(dest_result.error());
+        ScopedHandle dest_handle = std::move(*dest_result);
+
+        LARGE_INTEGER src_size = {0};
+        if (!GetFileSizeEx(src_handle.get(), &src_size)) {
+            return std::unexpected(L"Failed to get source file size: " +
+                                   util::get_win32_error_message(GetLastError()));
         }
 
-        // Report completion
-        if (prog_ctx.total_size > 0) {
-            context.out->progress(src, prog_ctx.total_size, prog_ctx.total_size);
+        auto tracker_result = pre_size_dest_file(dest_handle.get(), src_size.QuadPart);
+        if (!tracker_result) return std::unexpected(tracker_result.error());
+
+        if (src_size.QuadPart > 0) {
+            auto copy_ok = copy_bytes_physical(
+                src_handle.get(), dest_handle.get(),
+                0, 0, static_cast<ULONGLONG>(src_size.QuadPart),
+                context.io_buffer, context.out, src,
+                0, static_cast<ULONGLONG>(src_size.QuadPart)
+            );
+            if (!copy_ok) {
+                dest_handle.close();
+                src_handle.close();
+                if (util::g_cancel_requested) {
+                    DeleteFileW(dest.c_str());
+                    return std::unexpected(L"Copy cancelled by user.");
+                }
+                return std::unexpected(copy_ok.error());
+            }
         }
+
+        auto final_ok = finalize_dest_file(dest_handle.get(), src_size.QuadPart);
+        if (!final_ok) return std::unexpected(final_ok.error());
 
         context.stats.fallback_files++;
         context.stats.total_files++;
-        context.stats.total_bytes += prog_ctx.total_size;
+        context.stats.total_bytes += static_cast<ULONGLONG>(src_size.QuadPart);
         return true;
-    }
-
-private:
-    /// @brief Context passed to CopyFileExW progress callback.
-    struct ProgressContext {
-        std::wstring filename;
-        output::IOutput* out;
-        ULONGLONG total_size = 0;
-    };
-
-    /// @brief CopyFileExW progress routine that forwards to IOutput::progress.
-    static DWORD CALLBACK copy_progress_callback(
-        LARGE_INTEGER TotalFileSize,
-        LARGE_INTEGER TotalBytesTransferred,
-        LARGE_INTEGER /*StreamSize*/,
-        LARGE_INTEGER /*StreamBytesTransferred*/,
-        DWORD /*dwStreamNumber*/,
-        DWORD /*dwCallbackReason*/,
-        HANDLE /*hSourceFile*/,
-        HANDLE /*hDestinationFile*/,
-        LPVOID lpData
-    ) {
-        auto* ctx = static_cast<ProgressContext*>(lpData);
-        ctx->total_size = TotalFileSize.QuadPart;
-        if (g_cancel_requested) {
-            return PROGRESS_CANCEL;
-        }
-        if (ctx->out) {
-            ctx->out->progress(ctx->filename,
-                static_cast<ULONGLONG>(TotalBytesTransferred.QuadPart),
-                static_cast<ULONGLONG>(TotalFileSize.QuadPart));
-        }
-        return PROGRESS_CONTINUE;
     }
 };
 
@@ -754,7 +777,7 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
         if (!extents_result) {
             dest_handle.close();
             src_handle.close();
-            if (g_cancel_requested) {
+            if (util::g_cancel_requested) {
                 DeleteFileW(dest.c_str());
                 return std::unexpected(L"Copy cancelled by user.");
             }
@@ -766,14 +789,14 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
         for (const auto& ext : *extents_result) {
             if (ext.is_sparse()) continue;
 
-            if (g_cancel_requested) {
+            if (util::g_cancel_requested) {
                 dest_handle.close();
                 src_handle.close();
                 DeleteFileW(dest.c_str());
                 return std::unexpected(L"Copy cancelled by user.");
             }
 
-            ULONGLONG src_offset = ext.vcn * context.src_cluster_size;
+            ULONGLONG src_offset = ext.start_vcn * context.src_cluster_size;
             ULONGLONG byte_count = ext.cluster_count() * context.src_cluster_size;
             ULONGLONG required_size = src_offset + byte_count;
 
@@ -781,7 +804,7 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
             if (!size_ok) {
                 dest_handle.close();
                 src_handle.close();
-                if (g_cancel_requested) {
+                if (util::g_cancel_requested) {
                     DeleteFileW(dest.c_str());
                     return std::unexpected(L"Copy cancelled by user.");
                 }
@@ -792,7 +815,7 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
             if (!clone_ok) {
                 dest_handle.close();
                 src_handle.close();
-                if (g_cancel_requested) {
+                if (util::g_cancel_requested) {
                     DeleteFileW(dest.c_str());
                     return std::unexpected(L"Copy cancelled by user.");
                 }
@@ -803,12 +826,32 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
             context.out->progress(src, bytes_cloned, static_cast<ULONGLONG>(src_size.QuadPart));
         }
 
+        // A non-empty source with nothing cloned means every extent was sparse, or
+        // there were no extents at all - both happen for resident files (their
+        // content lives in file-record metadata, invisible to FSCTL_GET_RETRIEVAL_
+        // POINTERS) as well as for genuinely all-sparse files. The two can't be told
+        // apart from the extent list alone, so fall back to a standard read/write
+        // copy rather than silently finalizing a correctly-sized but zero-content
+        // file - the fallback is correct either way, since ReadFile transparently
+        // returns zeros for sparse holes.
+        if (bytes_cloned == 0 && src_size.QuadPart > 0) {
+            dest_handle.close();
+            src_handle.close();
+            if (util::g_cancel_requested) {
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            return attempt_fallback(src, dest,
+                L"No clonable extents found for non-empty source (resident or fully-sparse file)",
+                context);
+        }
+
         // Finalize
-        auto final_ok = finalize_dest_file(dest_handle.get(), src_handle.get(), src_size.QuadPart);
+        auto final_ok = finalize_dest_file(dest_handle.get(), src_size.QuadPart);
         if (!final_ok) {
             dest_handle.close();
             src_handle.close();
-            if (g_cancel_requested) {
+            if (util::g_cancel_requested) {
                 DeleteFileW(dest.c_str());
                 return std::unexpected(L"Copy cancelled by user.");
             }
@@ -818,40 +861,6 @@ struct SameVolumeCopyStrategy : ICopyStrategy {
         context.stats.cloned_files++;
         context.stats.total_files++;
         context.stats.total_bytes += src_size.QuadPart;
-        return true;
-    }
-
-private:
-    /**
-     * @brief Attempts a standard copy fallback after a clone failure.
-     *
-     * Deletes the partially-written destination file and falls back to CopyFileExW.
-     */
-    std::expected<bool, std::wstring> attempt_fallback(
-        const std::wstring& src, const std::wstring& dest,
-        const std::wstring& original_error, CopyContext& context
-    ) {
-        DeleteFileW(dest.c_str());
-        if (g_cancel_requested) {
-            return std::unexpected(L"Copy cancelled by user.");
-        }
-        context.out->message(output::Level::warn, L"Deduplication-preserving copy failed (" + original_error
-            + L"). Falling back to standard copy for: " + src);
-
-        if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
-            DWORD error = GetLastError();
-            return std::unexpected(L"Dedup copy failed (" + original_error + L"), and fallback copy failed: " + util::get_win32_error_message(error));
-        }
-
-        // Query file size for stats tracking
-        WIN32_FILE_ATTRIBUTE_DATA fad;
-        if (GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &fad)) {
-            ULONGLONG sz = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
-            context.stats.total_bytes += sz;
-        }
-
-        context.stats.fallback_files++;
-        context.stats.total_files++;
         return true;
     }
 };
@@ -902,7 +911,7 @@ struct CrossVolumeRefsCopyStrategy : ICopyStrategy {
         if (!extents_result) {
             dest_handle.close();
             src_handle.close();
-            if (g_cancel_requested) {
+            if (util::g_cancel_requested) {
                 DeleteFileW(dest.c_str());
                 return std::unexpected(L"Copy cancelled by user.");
             }
@@ -914,7 +923,7 @@ struct CrossVolumeRefsCopyStrategy : ICopyStrategy {
         for (const auto& ext : *extents_result) {
             if (ext.is_sparse()) continue;
 
-            if (g_cancel_requested) {
+            if (util::g_cancel_requested) {
                 dest_handle.close();
                 src_handle.close();
                 DeleteFileW(dest.c_str());
@@ -928,7 +937,7 @@ struct CrossVolumeRefsCopyStrategy : ICopyStrategy {
             if (!result) {
                 dest_handle.close();
                 src_handle.close();
-                if (g_cancel_requested) {
+                if (util::g_cancel_requested) {
                     DeleteFileW(dest.c_str());
                     return std::unexpected(L"Copy cancelled by user.");
                 }
@@ -936,12 +945,29 @@ struct CrossVolumeRefsCopyStrategy : ICopyStrategy {
             }
         }
 
+        // Same reasoning as SameVolumeCopyStrategy: a non-empty source with nothing
+        // processed means the extent list was empty or entirely sparse, which is
+        // indistinguishable between a resident file and a genuinely all-sparse one
+        // from the extent list alone. Fall back to a standard copy rather than
+        // silently finalizing a correctly-sized but zero-content file.
+        if (bytes_processed == 0 && src_size.QuadPart > 0) {
+            dest_handle.close();
+            src_handle.close();
+            if (util::g_cancel_requested) {
+                DeleteFileW(dest.c_str());
+                return std::unexpected(L"Copy cancelled by user.");
+            }
+            return attempt_fallback(src, dest,
+                L"No clonable extents found for non-empty source (resident or fully-sparse file)",
+                context);
+        }
+
         // Finalize
-        auto final_ok = finalize_dest_file(dest_handle.get(), src_handle.get(), src_size.QuadPart);
+        auto final_ok = finalize_dest_file(dest_handle.get(), src_size.QuadPart);
         if (!final_ok) {
             dest_handle.close();
             src_handle.close();
-            if (g_cancel_requested) {
+            if (util::g_cancel_requested) {
                 DeleteFileW(dest.c_str());
                 return std::unexpected(L"Copy cancelled by user.");
             }
@@ -971,18 +997,18 @@ private:
     ) {
         ULONGLONG c_offset = 0;
         while (c_offset < ext.cluster_count()) {
-            if (g_cancel_requested) {
+            if (util::g_cancel_requested) {
                 return std::unexpected(L"Copy cancelled by user.");
             }
             LONGLONG current_lcn = ext.lcn + c_offset;
-            ULONGLONG src_offset = (ext.vcn + c_offset) * context.src_cluster_size;
+            ULONGLONG src_offset = (ext.start_vcn + c_offset) * context.src_cluster_size;
 
-            auto map_it = context.lcn_map.find(current_lcn);
-            if (map_it != context.lcn_map.end()) {
+            auto lookup = context.lcn_map.find(current_lcn, context.src_cluster_size);
+            if (lookup) {
                 // Duplicate LCN: clone from previously-copied destination
                 ULONGLONG pre_offset = c_offset;
                 auto result = clone_duplicate_run(
-                    ext, c_offset, map_it->second, src_offset,
+                    ext, c_offset, *lookup, src_offset,
                     dest_handle, tracker, context
                 );
                 if (!result) return std::unexpected(result.error());
@@ -998,8 +1024,13 @@ private:
                 bytes_processed += (c_offset - pre_offset) * context.src_cluster_size;
             }
 
-            // Report progress
+            // Report per-file byte progress
             context.out->progress(src_path, bytes_processed, static_cast<ULONGLONG>(src_file_size));
+            // Report overall unique-LCN progress (secondary bar; throttled internally)
+            if (context.total_unique_src_lcns > 0) {
+                context.out->progress_overall(L"clusters", context.processed_lcns,
+                                               context.total_unique_src_lcns, L"", true);
+            }
         }
         return true;
     }
@@ -1007,44 +1038,34 @@ private:
     /**
      * @brief Clones a contiguous run of duplicate LCNs from a previously-copied destination file.
      *
-     * Scans forward from c_offset to find how many consecutive LCNs map to the
-     * same contiguous region, then clones the entire run in one ioctl.
+     * The run length comes directly from the interval the lookup already resolved
+     * (CopySourceLcnMap never merges separate insertions, so this is exactly the
+     * span one earlier insert_run() call actually claimed) - capped by how much
+     * of the current source extent remains, since the two are independent.
      *
      * @param c_offset Updated in-place to advance past the cloned run.
      */
     std::expected<bool, std::wstring> clone_duplicate_run(
         const Extent& ext, ULONGLONG& c_offset,
-        const std::pair<uint32_t, ULONGLONG>& master,
+        const CopySourceLcnMap::Lookup& master,
         ULONGLONG src_offset, HANDLE dest_handle,
         DestSizeTracker& tracker, CopyContext& context
     ) {
-        // Find contiguous run length
-        ULONGLONG run_clusters = 1;
-        while (c_offset + run_clusters < ext.cluster_count()) {
-            LONGLONG next_lcn = ext.lcn + c_offset + run_clusters;
-            auto next_it = context.lcn_map.find(next_lcn);
-            if (next_it == context.lcn_map.end()) break;
-
-            const auto& next_master = next_it->second;
-            if (next_master.first != master.first ||
-                next_master.second != master.second + run_clusters * context.src_cluster_size) {
-                break;
-            }
-            run_clusters++;
-        }
+        ULONGLONG ext_remaining = ext.cluster_count() - c_offset;
+        ULONGLONG run_clusters = (std::min)(master.run_clusters_remaining, ext_remaining);
 
         ULONGLONG byte_count = run_clusters * context.src_cluster_size;
         auto size_ok = ensure_dest_size(dest_handle, tracker, src_offset + byte_count);
         if (!size_ok) return std::unexpected(size_ok.error());
 
         // Resolve interned path and get handle to the previously-copied destination file
-        const std::wstring& master_path = context.resolve_path(master.first);
+        const std::wstring& master_path = context.resolve_path(master.dest_path_index);
         HANDLE prev_dest_handle = context.handle_cache.get(master_path);
         if (prev_dest_handle == INVALID_HANDLE_VALUE) {
             return std::unexpected(L"Failed to open previously copied destination file: " + master_path);
         }
 
-        auto clone_ok = clone_extent_from_dest(dest_handle, prev_dest_handle, master.second, src_offset, byte_count);
+        auto clone_ok = clone_extent_from_dest(dest_handle, prev_dest_handle, master.dest_offset, src_offset, byte_count);
         if (!clone_ok) return std::unexpected(clone_ok.error());
 
         c_offset += run_clusters;
@@ -1108,11 +1129,13 @@ private:
                 if (!copy_ok) return std::unexpected(copy_ok.error());
             }
 
-            // Record LCNs in the map for future dedup (using interned path index)
+            // Record this run for future dedup (using interned path index). The
+            // whole run lands at contiguous destination offsets by construction
+            // (a straight physical copy mirrors source position), so it's one
+            // interval, not one insertion per cluster.
             uint32_t path_idx = context.intern_path(dest_path);
-            for (ULONGLONG k = 0; k < run_clusters; ++k) {
-                context.lcn_map[ext.lcn + c_offset + k] = {path_idx, src_offset + k * context.src_cluster_size};
-            }
+            context.lcn_map.insert_run(ext.lcn + static_cast<LONGLONG>(c_offset), run_clusters, path_idx, src_offset);
+            context.processed_lcns += run_clusters;
 
             c_offset += run_clusters;
         }
@@ -1140,6 +1163,14 @@ private:
         DWORD cluster_size = context.src_cluster_size;
         uint32_t path_idx = context.intern_path(dest_path);
 
+        // Open the BCrypt provider once and reuse it for the rest of the copy
+        // operation, instead of paying BCryptOpenAlgorithmProvider/Close per cluster.
+        if (!context.hasher) {
+            auto hasher_res = inspect::make_sha256_hasher();
+            if (!hasher_res) return std::unexpected(hasher_res.error());
+            context.hasher = std::move(*hasher_res);
+        }
+
         // Seek source to beginning of this run
         LARGE_INTEGER li_src;
         li_src.QuadPart = src_offset;
@@ -1148,7 +1179,7 @@ private:
         }
 
         for (ULONGLONG k = 0; k < run_clusters; ++k) {
-            if (g_cancel_requested) {
+            if (util::g_cancel_requested) {
                 return std::unexpected(L"Copy cancelled by user.");
             }
 
@@ -1160,8 +1191,8 @@ private:
             DWORD to_read = static_cast<DWORD>(std::min<ULONGLONG>(cluster_size, bytes_remaining));
 
             if (to_read == 0) {
-                // Past EOF - record in map and skip
-                context.lcn_map[ext.lcn + c_offset + k] = {path_idx, cluster_offset};
+                // Past EOF - nothing to hash or write, but still part of this
+                // run's LCN range; covered by the single insert_run() below.
                 continue;
             }
 
@@ -1172,7 +1203,7 @@ private:
             }
 
             // Hash the cluster
-            std::string digest = inspect::compute_sha256(context.io_buffer.data(), bytes_read);
+            std::string digest = context.hasher->hash(context.io_buffer.data(), bytes_read);
             bool cloned = false;
 
             if (!digest.empty()) {
@@ -1180,16 +1211,19 @@ private:
                 if (hash_it != context.hash_index.end() && !hash_it->second.empty()) {
                     // Found a content match on the destination volume.
                     // Resolve the first matching destination LCN to a file+offset.
+                    // lcn_interval_find_at() corrects file_offset for dest_lcn's exact
+                    // position within its interval - lcn_interval_find() would return
+                    // the offset at the interval's start_lcn regardless of dest_lcn,
+                    // which is wrong for any cluster past a multi-cluster file's first.
                     LONGLONG dest_lcn = hash_it->second[0];
-                    auto lcn_it = context.dest_lcn_index.find(dest_lcn);
-                    if (lcn_it != context.dest_lcn_index.end() && !lcn_it->second.empty()) {
-                        const auto& block = lcn_it->second[0];
-                        const std::wstring& block_path = context.dest_scan_file_table[block.file_index];
+                    auto block = inspect::lcn_interval_find_at(context.dest_lcn_index, dest_lcn, cluster_size);
+                    if (block) {
+                        const std::wstring& block_path = context.dest_scan_file_table[block->file_index];
                         HANDLE match_handle = context.handle_cache.get(block_path);
                         if (match_handle != INVALID_HANDLE_VALUE) {
                             auto clone_ok = clone_extent_from_dest(
                                 dest_handle, match_handle,
-                                block.file_offset, cluster_offset, cluster_size
+                                block->file_offset, cluster_offset, cluster_size
                             );
                             if (clone_ok) {
                                 cloned = true;
@@ -1213,114 +1247,100 @@ private:
                 }
             }
 
-            // Record in lcn_map for future cross-file dedup within this copy operation
-            context.lcn_map[ext.lcn + c_offset + k] = {path_idx, cluster_offset};
+            context.processed_lcns++;
 
             // Report progress
             context.out->progress(src_path, cluster_offset + bytes_read, static_cast<ULONGLONG>(src_file_size));
         }
 
+        // Every cluster in this run lands at a contiguous destination offset
+        // within dest_path (mirroring its source position), regardless of
+        // whether any individual cluster was hash-matched-and-cloned or
+        // physically written - so the whole run is recorded as one interval,
+        // not per cluster. This is distinct from (and unaffected by) whichever
+        // *other* file a hash match above may have cloned bytes from.
+        context.lcn_map.insert_run(ext.lcn + static_cast<LONGLONG>(c_offset), run_clusters, path_idx, src_offset);
+
         c_offset += run_clusters;
-        return true;
-    }
-
-    /**
-     * @brief Attempts a standard copy fallback after a clone/copy failure.
-     */
-    std::expected<bool, std::wstring> attempt_fallback(
-        const std::wstring& src, const std::wstring& dest,
-        const std::wstring& original_error,
-        CopyContext& context
-    ) {
-        DeleteFileW(dest.c_str());
-        if (g_cancel_requested) {
-            return std::unexpected(L"Copy cancelled by user.");
-        }
-        context.out->message(output::Level::warn, L"Deduplication-preserving copy failed (" + original_error
-            + L"). Falling back to standard copy for: " + src);
-
-        if (!CopyFileExW(src.c_str(), dest.c_str(), NULL, NULL, &g_cancel_requested_bool, COPY_FILE_ALLOW_DECRYPTED_DESTINATION)) {
-            DWORD error = GetLastError();
-            return std::unexpected(L"Dedup copy failed (" + original_error + L"), and fallback copy failed: " + util::get_win32_error_message(error));
-        }
-
-        // Query file size for stats tracking
-        WIN32_FILE_ATTRIBUTE_DATA fad;
-        if (GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &fad)) {
-            ULONGLONG sz = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
-            context.stats.total_bytes += sz;
-        }
-
-        context.stats.fallback_files++;
-        context.stats.total_files++;
         return true;
     }
 };
 
-// ============================================================================
-// Phase 1: Inspection - Validate & Decorate Context
-// ============================================================================
-
 /**
- * @brief Phase 1: Validates inputs and populates the CopyContext.
+ * @brief Phase 1 - Validates arguments, queries volumes, and selects copy strategy.
  *
- * Resolves absolute paths, verifies source existence, queries volume
- * information (filesystem type, cluster size), and selects the appropriate
- * copy strategy based on volume topology.
+ * No filesystem writes are performed. Returns a heap-allocated CopyContext ready
+ * for execute(). The caller is responsible for calling cleanup().
  *
- * @param args  CLI arguments with positional source/dest paths.
- * @return Fully decorated CopyContext on success, or error string.
+ * @param args  CLI arguments with file_specs[0]=source, file_specs[1]=destination.
+ * @return Heap-allocated CopyContext on success, or error string on failure.
  */
-std::expected<CopyContext, std::wstring> inspect_and_prepare(const util::CliArg& args) {
-    if (args.positional.size() < 2) {
+std::expected<CopyContext*, std::wstring> prepare(const util::CliArg& args) {
+    // copy only operates on kPath specifiers (files, directories, globs).
+    for (const auto& spec : args.file_specs) {
+        if (spec.kind == util::FileSpecKind::kVolume) {
+            return std::unexpected(
+                L"Error: copy does not accept volume specifiers ('" + spec.path +
+                L"'). Use a full path such as E:\\ or E:\\folder\\.");
+        }
+    }
+
+    if (args.file_specs.size() < 2) {
         return std::unexpected(L"Error: Missing source or destination path. Usage: retool copy <src> <dest> [options]");
     }
 
-    CopyContext context;
-    context.src_path = get_absolute_path(args.positional[0]);
-    context.dest_path = get_absolute_path(args.positional[1]);
-
-    // Validate source
-    DWORD src_attr = GetFileAttributesW(context.src_path.c_str());
-    if (src_attr == INVALID_FILE_ATTRIBUTES) {
-        return std::unexpected(L"Source path does not exist: " + context.src_path);
+    // When more than two specifiers are given, the last must be a directory
+    // (multi-source copy: retool copy src1 src2 ... dest_dir).
+    // Currently only single-source is implemented; reject multi-source for now.
+    if (args.file_specs.size() > 2) {
+        return std::unexpected(
+            L"Error: Multiple source files are not yet supported. "
+            L"Usage: retool copy <src> <dest> [options]");
     }
 
-    context.is_directory = (src_attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    if (context.is_directory && !args.recursive) {
+    auto ctx = std::make_unique<CopyContext>();
+    ctx->args_snapshot = args;
+    ctx->src_path  = get_absolute_path(args.file_specs[0].path);
+    ctx->dest_path = get_absolute_path(args.file_specs[1].path);
+
+    // Validate source
+    DWORD src_attr = GetFileAttributesW(ctx->src_path.c_str());
+    if (src_attr == INVALID_FILE_ATTRIBUTES) {
+        return std::unexpected(L"Source path does not exist: " + ctx->src_path);
+    }
+
+    ctx->is_directory = (src_attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (ctx->is_directory && !args.recursive) {
         return std::unexpected(L"Error: Source is a directory but -r (recursive) was not specified.");
     }
 
-    // Resolve volume roots
-    wchar_t src_volume[MAX_PATH];
-    wchar_t dest_volume[MAX_PATH];
-    if (!GetVolumePathNameW(context.src_path.c_str(), src_volume, MAX_PATH)) {
-        return std::unexpected(L"Failed to get source volume root: " + util::get_win32_error_message(GetLastError()));
-    }
-    if (!GetVolumePathNameW(context.dest_path.c_str(), dest_volume, MAX_PATH)) {
-        return std::unexpected(L"Failed to get destination volume root: " + util::get_win32_error_message(GetLastError()));
-    }
+    // Resolve volume roots and cluster sizes - once per volume, not per file.
+    auto src_vol = util::resolve_volume_info(ctx->src_path);
+    if (!src_vol) return std::unexpected(L"Failed to resolve source volume: " + src_vol.error());
+    auto dest_vol = util::resolve_volume_info(ctx->dest_path);
+    if (!dest_vol) return std::unexpected(L"Failed to resolve destination volume: " + dest_vol.error());
 
-    context.src_volume_root = src_volume;
-    context.dest_volume_root = dest_volume;
-    context.same_volume = (wcscmp(src_volume, dest_volume) == 0);
-    context.dest_is_refs = is_refs_volume(dest_volume);
-    context.src_cluster_size = get_cluster_size(src_volume);
-    context.dest_cluster_size = get_cluster_size(dest_volume);
+    ctx->src_volume_root   = src_vol->volume_root;
+    ctx->dest_volume_root  = dest_vol->volume_root;
+    ctx->same_volume       = (ctx->src_volume_root == ctx->dest_volume_root);
+    ctx->src_is_refs       = (src_vol->fs_name == L"ReFS");
+    ctx->dest_is_refs      = (dest_vol->fs_name == L"ReFS");
+    ctx->src_cluster_size  = src_vol->cluster_size;
+    ctx->dest_cluster_size = dest_vol->cluster_size;
 
     // Allocate reusable I/O buffer (4 MB)
-    context.io_buffer.resize(4 * 1024 * 1024);
+    ctx->io_buffer.resize(4 * 1024 * 1024);
 
     // Select strategy
-    if (context.same_volume) {
-        context.strategy = std::make_unique<SameVolumeCopyStrategy>();
-    } else if (context.dest_is_refs && context.src_cluster_size == context.dest_cluster_size) {
-        context.strategy = std::make_unique<CrossVolumeRefsCopyStrategy>();
+    if (ctx->same_volume) {
+        ctx->strategy = std::make_unique<SameVolumeCopyStrategy>();
+    } else if (ctx->dest_is_refs && ctx->src_cluster_size == ctx->dest_cluster_size) {
+        ctx->strategy = std::make_unique<CrossVolumeRefsCopyStrategy>();
     } else {
-        context.strategy = std::make_unique<FallbackCopyStrategy>();
+        ctx->strategy = std::make_unique<FallbackCopyStrategy>();
     }
 
-    return std::move(context);
+    return ctx.release();
 }
 
 /**
@@ -1334,116 +1354,517 @@ std::expected<CopyContext, std::wstring> inspect_and_prepare(const util::CliArg&
  * @return true on success, or error string on failure.
  */
 std::expected<bool, std::wstring> seed_from_dest_scan(CopyContext& context) {
-    context.out->message(output::Level::info, L"[seed_from_dest_scan] Pre-scanning destination volume " +
-                        context.dest_volume_root + L" for deduplication...");
+    // When both volumes are ReFS, the within-operation lcn_map handles dedup tracking
+    // without content hashing. Use kLcnOnly to avoid the SHA-256 overhead and the
+    // HashIndex memory cost.
+    const bool both_refs = context.src_is_refs && context.dest_is_refs;
+    const inspect::ScanMode scan_mode = both_refs
+        ? inspect::ScanMode::kLcnOnly
+        : inspect::ScanMode::kWithHash;
 
-    auto scan = inspect::build_lcn_index(
-        context.dest_volume_root, inspect::ScanMode::kWithHash, *context.out);
+    context.out->message(output::Level::info,
+        L"[seed_from_dest_scan] Pre-scanning destination volume " + context.dest_volume_root +
+        L" (" + (both_refs ? L"LCN-only, no hash" : L"with content hash") + L")...");
+
+    auto scan = inspect::build_dest_lcn_index(
+        util::FileSpecifier{util::FileSpecKind::kVolume, context.dest_volume_root},
+        scan_mode, *context.out);
     if (!scan) return std::unexpected(scan.error());
 
-    // Store the destination LcnIndex and file_table so hash matches can be
-    // resolved to destination file+offset for cloning.
-    context.dest_lcn_index = std::move(scan->lcn_index);
+    context.dest_lcn_index      = std::move(scan->lcn_index);
     context.dest_scan_file_table = std::move(scan->file_table);
-    context.hash_index = std::move(scan->hash_index);
+    context.hash_index           = std::move(scan->hash_index);
 
-    ULONGLONG hash_groups = 0;
-    for (const auto& [digest, lcns] : context.hash_index) {
-        if (lcns.size() >= 1) hash_groups++;
-    }
-
-    context.out->message(output::Level::info, L"[seed_from_dest_scan] Done. " +
-                        std::to_wstring(hash_groups) + L" unique hashes indexed from destination.");
+    context.out->message(output::Level::info,
+        L"[seed_from_dest_scan] Done. " +
+        std::to_wstring(context.dest_lcn_index.size()) + L" dest LCN runs indexed" +
+        (context.hash_index.empty() ? L"." : L", " +
+         std::to_wstring(context.hash_index.size()) + L" hash groups."));
     return true;
 }
 
 // ============================================================================
-// Phase 2: Operation - Directory Recursion
+// Metadata Helpers and Predicates
+// ============================================================================
+
+/// @brief Returns true if the given component letter is in args.copy_components.
+bool has_component(const util::CliArg& args, wchar_t c) {
+    return args.copy_components.find(static_cast<wchar_t>(towupper(c))) != std::wstring::npos;
+}
+
+/// @brief Returns true if the given RASH attribute letter is in args.copy_attr_mask.
+bool has_attr(const util::CliArg& args, wchar_t c) {
+    return args.copy_attr_mask.find(static_cast<wchar_t>(towupper(c))) != std::wstring::npos;
+}
+
+/// @brief Builds the Win32 attribute bitmask (FILE_ATTRIBUTE_*) from args.copy_attr_mask.
+DWORD build_attr_mask(const util::CliArg& args) {
+    DWORD mask = 0;
+    if (has_attr(args, L'R')) mask |= FILE_ATTRIBUTE_READONLY;
+    if (has_attr(args, L'A')) mask |= FILE_ATTRIBUTE_ARCHIVE;
+    if (has_attr(args, L'S')) mask |= FILE_ATTRIBUTE_SYSTEM;
+    if (has_attr(args, L'H')) mask |= FILE_ATTRIBUTE_HIDDEN;
+    return mask;
+}
+
+/**
+ * @brief Returns true if the destination file should be skipped.
+ *
+ * A file is skippable when -xs is active and the destination already has
+ * the same size and last-write timestamp as the source.
+ *
+ * @param src   Absolute source file path.
+ * @param dest  Absolute destination file path.
+ * @return true if the file should be skipped; false if it should be copied.
+ */
+bool should_skip_file(const std::wstring& src, const std::wstring& dest) {
+    WIN32_FILE_ATTRIBUTE_DATA dest_info{};
+    if (!GetFileAttributesExW(dest.c_str(), GetFileExInfoStandard, &dest_info)) return false;
+
+    WIN32_FILE_ATTRIBUTE_DATA src_info{};
+    if (!GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &src_info)) return false;
+
+    if (dest_info.nFileSizeHigh != src_info.nFileSizeHigh ||
+        dest_info.nFileSizeLow  != src_info.nFileSizeLow)  return false;
+
+    return CompareFileTime(&dest_info.ftLastWriteTime, &src_info.ftLastWriteTime) == 0;
+}
+
+/**
+ * @brief Copies timestamps and/or file attribute bits from source to destination.
+ *
+ * Reads FILE_BASIC_INFO from the source and applies it selectively:
+ *   - T component: copies creation, access, write, and change timestamps.
+ *     Time fields set to 0 in FILE_BASIC_INFO mean "no change".
+ *   - A component: merges the attribute bits selected by -ca: (RASH subset)
+ *     with the current destination attributes; only the masked bits are copied.
+ *     FileAttributes of 0 means "no change".
+ *
+ * @param src   Source file path.
+ * @param dest  Destination file path.
+ * @param args  CLI arguments (copy_components, copy_attr_mask).
+ * @return true on success, or error string on failure.
+ */
+std::expected<bool, std::wstring> copy_timestamps_and_attrs(
+    const std::wstring& src,
+    const std::wstring& dest,
+    const util::CliArg& args
+) {
+    bool do_attrs = has_component(args, L'A');
+    bool do_times = has_component(args, L'T');
+    if (!do_attrs && !do_times) return true;
+
+    ScopedHandle src_h(CreateFileW(
+        src.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL
+    ));
+    if (!src_h) {
+        return std::unexpected(L"Failed to open source for attribute query: " +
+                               util::get_win32_error_message(GetLastError()));
+    }
+
+    FILE_BASIC_INFO src_info{};
+    if (!GetFileInformationByHandleEx(src_h.get(), FileBasicInfo, &src_info, sizeof(src_info))) {
+        return std::unexpected(L"GetFileInformationByHandleEx failed on source: " +
+                               util::get_win32_error_message(GetLastError()));
+    }
+    src_h.close();
+
+    ScopedHandle dest_h(CreateFileW(
+        dest.c_str(), FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL
+    ));
+    if (!dest_h) {
+        return std::unexpected(L"Failed to open destination for attribute write: " +
+                               util::get_win32_error_message(GetLastError()));
+    }
+
+    // Zero fields = "no change" for times; FileAttributes = 0 = "no change".
+    FILE_BASIC_INFO out_info{};
+
+    if (do_times) {
+        out_info.CreationTime   = src_info.CreationTime;
+        out_info.LastAccessTime = src_info.LastAccessTime;
+        out_info.LastWriteTime  = src_info.LastWriteTime;
+        out_info.ChangeTime     = src_info.ChangeTime;
+    }
+
+    if (do_attrs) {
+        DWORD attr_mask      = build_attr_mask(args);
+        DWORD cur_dest_attrs = GetFileAttributesW(dest.c_str());
+        if (cur_dest_attrs == INVALID_FILE_ATTRIBUTES) cur_dest_attrs = FILE_ATTRIBUTE_NORMAL;
+        DWORD new_attrs = (cur_dest_attrs & ~attr_mask) | (src_info.FileAttributes & attr_mask);
+        out_info.FileAttributes = (new_attrs == 0) ? FILE_ATTRIBUTE_NORMAL : new_attrs;
+    }
+
+    if (!SetFileInformationByHandle(dest_h.get(), FileBasicInfo, &out_info, sizeof(out_info))) {
+        return std::unexpected(L"SetFileInformationByHandle failed: " +
+                               util::get_win32_error_message(GetLastError()));
+    }
+
+    return true;
+}
+
+/**
+ * @brief Copies security (DACL) and/or owner/group from source to destination.
+ *
+ * Uses GetNamedSecurityInfoW / SetNamedSecurityInfoW. Failures are warnings,
+ * not errors - the data copy already succeeded, and security propagation may
+ * fail legitimately (e.g. setting owner requires SeRestorePrivilege).
+ *
+ * Components copied:
+ *   - S: DACL (discretionary ACL - standard file permissions).
+ *   - O: owner SID and primary group SID.
+ *
+ * @param src   Source file path.
+ * @param dest  Destination file path.
+ * @param args  CLI arguments (copy_components).
+ * @param out   Output interface for warning messages.
+ */
+void copy_security_info(
+    const std::wstring& src,
+    const std::wstring& dest,
+    const util::CliArg& args,
+    output::IOutput& out
+) {
+    bool do_security = has_component(args, L'S');
+    bool do_owner    = has_component(args, L'O');
+    if (!do_security && !do_owner) return;
+
+    SECURITY_INFORMATION si = 0;
+    if (do_security) si |= DACL_SECURITY_INFORMATION;
+    if (do_owner)    si |= OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION;
+
+    PSID                 owner_sid = nullptr;
+    PSID                 group_sid = nullptr;
+    PACL                 dacl      = nullptr;
+    PSECURITY_DESCRIPTOR sd        = nullptr;
+
+    DWORD err = GetNamedSecurityInfoW(
+        src.c_str(), SE_FILE_OBJECT, si,
+        do_owner    ? &owner_sid : nullptr,
+        do_owner    ? &group_sid : nullptr,
+        do_security ? &dacl      : nullptr,
+        nullptr, &sd
+    );
+
+    if (err != ERROR_SUCCESS) {
+        out.message(output::Level::warn,
+            L"[copy.copy_security_info] Failed to read security from '" + src +
+            L"': " + util::get_win32_error_message(err));
+        return;
+    }
+
+    err = SetNamedSecurityInfoW(
+        const_cast<LPWSTR>(dest.c_str()), SE_FILE_OBJECT, si,
+        do_owner    ? owner_sid : nullptr,
+        do_owner    ? group_sid : nullptr,
+        do_security ? dacl      : nullptr,
+        nullptr
+    );
+
+    LocalFree(sd);
+
+    if (err != ERROR_SUCCESS) {
+        out.message(output::Level::warn,
+            L"[copy.copy_security_info] Failed to apply security to '" + dest +
+            L"': " + util::get_win32_error_message(err));
+    }
+}
+
+/**
+ * @brief Applies post-copy metadata to the destination file.
+ *
+ * Applies each component selected by -c:X and -ca:X:
+ *   A - file attribute bits (subset from -ca:)
+ *   T - timestamps (creation, access, write, change)
+ *   S - DACL (security / ACLs)
+ *   O - owner SID and primary group
+ *
+ * All failures are emitted as warnings; the data copy already succeeded.
+ *
+ * @param src   Source file path (metadata is read from here).
+ * @param dest  Destination file path (metadata is applied here).
+ * @param args  CLI arguments.
+ * @param out   Output interface for warning messages.
+ */
+void copy_file_metadata(
+    const std::wstring& src,
+    const std::wstring& dest,
+    const util::CliArg& args,
+    output::IOutput& out
+) {
+    auto ta_ok = copy_timestamps_and_attrs(src, dest, args);
+    if (!ta_ok) {
+        out.message(output::Level::warn,
+            L"[copy.copy_file_metadata] Attribute/timestamp copy failed for '" +
+            dest + L"': " + ta_ok.error());
+    }
+    copy_security_info(src, dest, args, out);
+}
+
+// ============================================================================
+// Retry-Aware Copy Wrapper
 // ============================================================================
 
 /**
- * @brief Recursively copies a directory tree from source to destination.
+ * @brief Copies a single file with skip-if-exists, retry-on-failure, and
+ *        selective metadata application.
  *
- * Replicates the directory structure and delegates file copying to the
- * strategy selected during Phase 1. Ignores system-attributed files and folders.
+ * Execution order:
+ *   1. If -xs is set and the destination is up-to-date (same size and
+ *      last-write time), skip the file and return immediately.
+ *   2. If 'D' is in -c:X, run the copy strategy with the retry loop.
+ *   3. Apply file metadata (A, T, S, O) from -c:X unless dry-run.
  *
- * @param src_dir   The source directory path.
- * @param dest_dir  The destination directory path.
- * @param args      The command line arguments.
- * @param context   The shared copy tracking context.
- * @return true on success, or error message on failure.
+ * @param src      Absolute source file path.
+ * @param dest     Absolute destination file path.
+ * @param args     CLI arguments.
+ * @param context  Shared copy context.
+ * @return true on success, or the last error string on final failure.
  */
-std::expected<bool, std::wstring> copy_directory_recursive(
-    const std::wstring& src_dir,
-    const std::wstring& dest_dir,
+std::expected<bool, std::wstring> retry_copy_file(
+    const std::wstring& src,
+    const std::wstring& dest,
     const util::CliArg& args,
     CopyContext& context
 ) {
+    // ── Skip-if-exists check ──────────────────────────────────────────────────
+    if (args.skip_existing && should_skip_file(src, dest)) {
+        context.out->message(output::Level::info,
+            L"[copy.retry_copy_file] Skipping (destination up-to-date): " + dest);
+        context.stats.skipped_files++;
+        context.stats.total_files++;
+        return true;
+    }
+
+    // ── Data copy (strategy with retry loop) ─────────────────────────────────
+    if (has_component(args, L'D')) {
+        int32_t attempts_remaining = args.retry_count;
+        int32_t attempt_num        = 0;
+        std::wstring last_error;
+
+        while (true) {
+            ++attempt_num;
+            auto result = context.strategy->copy_file(src, dest, args, context);
+            if (result) break; // Data copy succeeded
+
+            if (util::g_cancel_requested) return result;
+
+            last_error = result.error();
+
+            if (attempts_remaining <= 0) {
+                if (args.retry_count == 0) {
+                    context.out->message(output::Level::error,
+                        L"[copy.retry_copy_file] Copy failed (no retry configured): "
+                        + src + L" -> " + dest + L"\n  Error: " + last_error);
+                } else {
+                    context.out->message(output::Level::error,
+                        L"[copy.retry_copy_file] Copy failed after all retries exhausted: "
+                        + src + L" -> " + dest + L"\n  Final error: " + last_error);
+                }
+                return std::unexpected(last_error);
+            }
+
+            context.out->message(output::Level::warn,
+                L"[copy.retry_copy_file] Copy attempt " + std::to_wstring(attempt_num)
+                + L" of " + std::to_wstring(args.retry_count + 1)
+                + L" failed for: " + src + L" -> " + dest
+                + L"\n  Error: " + last_error
+                + L"\n  Retries remaining: " + std::to_wstring(attempts_remaining));
+
+            if (!args.dry_run) DeleteFileW(dest.c_str());
+
+            if (args.retry_wait > 0) {
+                context.out->message(output::Level::warn,
+                    L"[copy.retry_copy_file] Waiting " + std::to_wstring(args.retry_wait)
+                    + L" second(s) before retry "
+                    + std::to_wstring(attempt_num + 1)
+                    + L" of " + std::to_wstring(args.retry_count + 1) + L"...");
+                Sleep(static_cast<DWORD>(args.retry_wait) * 1000UL);
+            } else {
+                context.out->message(output::Level::warn,
+                    L"[copy.retry_copy_file] Retrying immediately (attempt "
+                    + std::to_wstring(attempt_num + 1)
+                    + L" of " + std::to_wstring(args.retry_count + 1) + L")...");
+            }
+
+            --attempts_remaining;
+        }
+    } else {
+        // D not in components: metadata-only mode.
+        // The destination must already exist (we have no data to write).
+        if (!args.dry_run) {
+            if (GetFileAttributesW(dest.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                context.out->message(output::Level::warn,
+                    L"[copy.retry_copy_file] 'D' not in copy components and destination does "
+                    L"not exist: " + dest + L". Skipping.");
+                return true;
+            }
+        }
+        context.stats.total_files++;
+    }
+
+    // ── Metadata copy (A, T, S, O) ────────────────────────────────────────────
     if (!args.dry_run) {
-        if (!CreateDirectoryW(dest_dir.c_str(), NULL)) {
-            DWORD error = GetLastError();
-            if (error != ERROR_ALREADY_EXISTS) {
-                return std::unexpected(L"Failed to create directory " + dest_dir + L": " + util::get_win32_error_message(error));
-            }
+        copy_file_metadata(src, dest, args, *context.out);
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Phase 2: Gather - Directory Enumeration and LCN Collection
+// ============================================================================
+
+/**
+ * @brief Creates a directory and all required parent directories (mkdir -p semantics).
+ *
+ * Silently succeeds if the directory already exists. Used in execute() to
+ * lazily create destination directory structure before copying each file.
+ */
+static void create_directory_recursive(const std::wstring& path) {
+    if (path.size() <= 3) return; // Drive root (e.g. "C:\")
+    if (CreateDirectoryW(path.c_str(), NULL) || GetLastError() == ERROR_ALREADY_EXISTS) return;
+
+    // Create parent, then retry this directory
+    size_t last_sep = path.find_last_of(L"\\/");
+    if (last_sep != std::wstring::npos && last_sep > 2) {
+        create_directory_recursive(path.substr(0, last_sep));
+        CreateDirectoryW(path.c_str(), NULL);
+    }
+}
+
+/**
+ * @brief Queries retrieval pointers for all source files and counts unique source LCNs.
+ *
+ * Only called for cross-volume ReFS copies where the lcn_map dedup mechanism is active.
+ * The resulting count is stored in ctx.total_unique_src_lcns for use as the overall
+ * progress bar denominator. Also reserves dest_path_table capacity to minimize
+ * hash-table rehashing during execute().
+ *
+ * Claims accumulate per extent, not per cluster, so this stays cheap even at
+ * 31M+ clusters - only fragment count drives memory here, not data volume.
+ *
+ * @return Unique source LCN count, or error string on unexpected failure.
+ */
+std::expected<ULONGLONG, std::wstring> gather_src_lcns(CopyContext& ctx, output::IOutput& out) {
+    const ULONGLONG total_files = static_cast<ULONGLONG>(ctx.file_pairs.size());
+    ULONGLONG files_done = 0;
+
+    out.message(output::Level::info,
+        L"[gather] Collecting source LCN map (" + std::to_wstring(total_files) + L" files)...");
+
+    std::vector<inspect::LcnClaim> claims;
+
+    for (const auto& pair : ctx.file_pairs) {
+        if (util::g_cancel_requested) break;
+
+        out.progress(L"scanning sources", files_done, total_files);
+
+        auto h_result = open_source_file(pair.src);
+        if (!h_result) {
+            ctx.stats.errors.push_back(pair.src + L": " + h_result.error());
+            ++files_done;
+            continue;
+        }
+        ScopedHandle h = std::move(*h_result);
+
+        auto extents_res = inspect::collect_extents(h.get());
+        if (!extents_res) {
+            ctx.stats.errors.push_back(pair.src + L": " + extents_res.error());
+            ++files_done;
+            continue;
+        }
+
+        for (const auto& ext : *extents_res) {
+            if (ext.is_sparse()) continue;
+            claims.push_back({0, ext.lcn, ext.lcn + static_cast<LONGLONG>(ext.cluster_count()), 0});
+        }
+
+        ++files_done;
+    }
+
+    out.progress(L"scanning sources", total_files, total_files);
+
+    // File identity doesn't matter for a pure distinct-LCN count, so every claim
+    // shares file_index 0; the interval index just needs to know which LCNs are
+    // covered by *some* source file, not which one specifically.
+    auto interval_index = inspect::build_lcn_interval_index(
+        std::move(claims), ctx.src_cluster_size, inspect::ClaimOccurrence::kFirst);
+    ULONGLONG unique_lcns = 0;
+    for (const auto& iv : interval_index) {
+        unique_lcns += static_cast<ULONGLONG>(iv.end_lcn - iv.start_lcn);
+    }
+
+    ctx.dest_path_table.reserve(ctx.file_pairs.size());
+
+    out.message(output::Level::info,
+        L"[gather] Source scan complete: " + std::to_wstring(unique_lcns) +
+        L" unique LCNs across " + std::to_wstring(files_done) + L" files.");
+
+    return unique_lcns;
+}
+
+/**
+ * @brief Phase 2 - Enumerate files, collect source LCNs, and optionally pre-scan destination.
+ *
+ * Populates ctx.file_pairs from the source tree. For cross-volume ReFS copies,
+ * runs gather_src_lcns() to count unique source LCNs for the overall progress bar
+ * and to pre-reserve lcn_map capacity. Runs seed_from_dest_scan() when --scan-dest
+ * is active, moving all large allocations out of execute().
+ */
+std::expected<bool, std::wstring> gather(CopyContext& ctx, output::IOutput& out) {
+    ctx.out = &out;
+    const util::CliArg& args = ctx.args_snapshot;
+
+    // Build the flat file-pair list (pure discovery, no filesystem writes)
+    if (ctx.is_directory) {
+        out.message(output::Level::info, L"[gather] Enumerating source files...");
+
+        // util::enumerate_files_recursive requires a trailing separator and is
+        // unconditionally recursive - both fine here, since prepare() already
+        // rejected a directory source without -r.
+        std::wstring src_dir = ctx.src_path + L"\\";
+        std::vector<std::wstring> src_files;
+        util::enumerate_files_recursive(src_dir, src_files, ctx.stats.errors);
+
+        for (const auto& src_file : src_files) {
+            std::wstring relative = src_file.substr(src_dir.size());
+            ctx.file_pairs.push_back({src_file, ctx.dest_path + L"\\" + relative});
+        }
+    } else {
+        ctx.file_pairs.push_back({ctx.src_path, ctx.dest_path});
+    }
+
+    out.message(output::Level::info,
+        L"[gather] Found " + std::to_wstring(ctx.file_pairs.size()) + L" file(s) to copy.");
+
+    // Collect source LCNs for the overall progress bar (cross-volume ReFS only).
+    // This is the condition that selects CrossVolumeRefsCopyStrategy in prepare().
+    const bool do_lcn_gather = ctx.src_is_refs && !ctx.same_volume &&
+                               ctx.dest_is_refs && ctx.src_cluster_size == ctx.dest_cluster_size;
+    if (do_lcn_gather && !ctx.file_pairs.empty()) {
+        auto lcn_count = gather_src_lcns(ctx, out);
+        if (lcn_count) {
+            ctx.total_unique_src_lcns = *lcn_count;
+        }
+        // Non-fatal: if this fails the overall bar simply won't appear
+    }
+
+    // Pre-scan destination for dedup seeding (moved from execute() to keep all
+    // large allocations in the gather phase)
+    if (args.scan_dest && !ctx.same_volume && ctx.dest_is_refs) {
+        auto seed_ok = seed_from_dest_scan(ctx);
+        if (!seed_ok) {
+            out.message(output::Level::warn,
+                L"Destination pre-scan failed: " + seed_ok.error() +
+                L". Continuing without scan-dest seeding.");
         }
     }
 
-    std::wstring search_path = src_dir + L"\\*";
-    WIN32_FIND_DATAW find_data;
-    HANDLE find_handle = FindFirstFileW(search_path.c_str(), &find_data);
-
-    if (find_handle == INVALID_HANDLE_VALUE) {
-        DWORD error = GetLastError();
-        return std::unexpected(L"Failed to scan directory " + src_dir + L": " + util::get_win32_error_message(error));
-    }
-
-    do {
-        if (g_cancel_requested) {
-            FindClose(find_handle);
-            return std::unexpected(L"Copy cancelled by user.");
-        }
-
-        std::wstring name = find_data.cFileName;
-        if (name == L"." || name == L"..") continue;
-
-        std::wstring src_item = src_dir + L"\\" + name;
-        std::wstring dest_item = dest_dir + L"\\" + name;
-
-        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) continue;
-
-        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (args.recursive) {
-                auto res = copy_directory_recursive(src_item, dest_item, args, context);
-                if (!res) {
-                    if (g_cancel_requested) {
-                        FindClose(find_handle);
-                        return std::unexpected(res.error());
-                    }
-                    context.stats.errors.push_back(src_item + L": " + res.error());
-                    if (args.strict) {
-                        FindClose(find_handle);
-                        return std::unexpected(res.error());
-                    }
-                }
-            }
-        } else {
-            auto res = context.strategy->copy_file(src_item, dest_item, args, context);
-            if (!res) {
-                if (g_cancel_requested) {
-                    FindClose(find_handle);
-                    return std::unexpected(res.error());
-                }
-                context.stats.errors.push_back(src_item + L": " + res.error());
-                if (args.strict) {
-                    FindClose(find_handle);
-                    return std::unexpected(res.error());
-                }
-            }
-        }
-
-    } while (FindNextFileW(find_handle, &find_data));
-
-    FindClose(find_handle);
     return true;
 }
 
@@ -1465,8 +1886,8 @@ int finalize_and_report(CopyContext& context) {
     out.field(L"Total Files",     std::to_wstring(stats.total_files));
     out.field(L"Cloned Files",    std::to_wstring(stats.cloned_files));
     out.field(L"Fallback Copies", std::to_wstring(stats.fallback_files));
-    out.field(L"Total Bytes",     util::format_size(stats.total_bytes) +
-              L" (" + std::to_wstring(stats.total_bytes) + L" bytes)");
+    out.field(L"Skipped Files",   std::to_wstring(stats.skipped_files));
+    out.field(L"Total Bytes",     util::format_size_detailed(stats.total_bytes));
 
     for (const auto& err : stats.errors) {
         out.message(output::Level::error, err);
@@ -1482,43 +1903,48 @@ int finalize_and_report(CopyContext& context) {
 // ============================================================================
 
 /**
- * @brief Executes the copy subcommand.
+ * @brief Phase 3 - Copies source file(s) or directories to the destination.
  *
- * Orchestrates a three-phase pipeline:
- *   1. Inspection - validate inputs, query volumes, select strategy.
- *   2. Operation - recursively copy files using the selected strategy.
- *   3. Finalization - print summary statistics, return exit code.
+ * Iterates ctx.file_pairs populated by gather(). Destination directories are
+ * created lazily (just-in-time before each file), so the gather phase remains
+ * read-only. No new large data structures are allocated here; lcn_map and
+ * dest_path_table grow within their pre-reserved capacity from gather().
  *
- * @param args CLI arguments containing positional source and destination paths.
+ * @param ctx  Context produced by prepare() and populated by gather().
+ * @param out  Output interface for formatted results and progress.
  * @return Exit code on success, or error string on failure.
  */
-std::expected<int, std::wstring> execute_copy(const util::CliArg& args, output::IOutput& out) {
-    // Phase 1: Inspection
-    auto context = inspect_and_prepare(args);
-    if (!context) return std::unexpected(context.error());
+std::expected<int, std::wstring> execute(CopyContext& ctx, output::IOutput& out) {
+    ctx.out = &out;
+    const util::CliArg& args = ctx.args_snapshot;
 
-    context->out = &out;
+    for (const auto& pair : ctx.file_pairs) {
+        if (util::g_cancel_requested) break;
 
-    // Phase 1b: Optionally pre-scan destination to seed deduplication indexes
-    if (args.scan_dest && !context->same_volume && context->dest_is_refs) {
-        auto seed_ok = seed_from_dest_scan(*context);
-        if (!seed_ok) {
-            context->out->message(output::Level::warn, L"Destination pre-scan failed: " + seed_ok.error() +
-                               L". Continuing without scan-dest seeding.");
+        // Lazily create the destination directory tree before each file
+        if (!args.dry_run) {
+            size_t sep = pair.dest.find_last_of(L"\\/");
+            if (sep != std::wstring::npos) {
+                create_directory_recursive(pair.dest.substr(0, sep));
+            }
+        }
+
+        auto result = retry_copy_file(pair.src, pair.dest, args, ctx);
+        if (!result) {
+            if (util::g_cancel_requested) break;
+            ctx.stats.errors.push_back(pair.src + L": " + result.error());
+            if (args.strict) return std::unexpected(result.error());
         }
     }
 
-    // Phase 2: Operation
-    if (context->is_directory) {
-        auto result = copy_directory_recursive(context->src_path, context->dest_path, args, *context);
-        if (!result && args.strict) return std::unexpected(result.error());
-    } else {
-        auto result = context->strategy->copy_file(context->src_path, context->dest_path, args, *context);
-        if (!result) return std::unexpected(result.error());
-    }
+    return finalize_and_report(ctx);
+}
 
-    // Phase 3: Finalization
-    return finalize_and_report(*context);
+/**
+ * @brief Phase 3 - Releases all resources held by the context and deletes it.
+ */
+void cleanup(CopyContext* ctx) noexcept {
+    delete ctx;
 }
 
 } // namespace copy
