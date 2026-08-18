@@ -11,11 +11,13 @@ permissions:
 jobs:
   release:
     name: Build and Release
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch ${{ github.ref_name }} https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git .
 
       - name: Configure CMake
         shell: pwsh
