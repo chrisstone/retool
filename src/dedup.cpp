@@ -379,36 +379,50 @@ std::expected<DedupContext*, std::wstring> prepare(const util::CliArg& args) {
                                L"). Dedup requires ReFS.");
     }
 
-    // Output is not yet available in prepare(); defer progress messages to execute().
-    // We create a temporary silent outputter to satisfy build_lcn_index_for_files.
-    output::QuietOutput silent;
-
-    auto scan = inspect::build_lcn_index_for_files(ctx->volume_root,
-                                                    inspect::ScanMode::kWithHash, silent);
-    if (!scan) return std::unexpected(scan.error());
-    ctx->scan = std::move(*scan);
-
-    // Pair-wise: confirm both files appear in the scan.
-    if (!ctx->is_volume_wide) {
-        const std::wstring& p1 = args.file_specs[0].path;
-        const std::wstring& p2 = args.file_specs[1].path;
-        bool found1 = false, found2 = false;
-        for (const auto& path : ctx->scan.file_table) {
-            if (path == p1) found1 = true;
-            if (path == p2) found2 = true;
-            if (found1 && found2) break;
-        }
-        if (!found1) silent.message(output::Level::warn,
-            L"File not found in scan results: " + p1);
-        if (!found2) silent.message(output::Level::warn,
-            L"File not found in scan results: " + p2);
-    }
-
     return ctx.release();
 }
 
 // ============================================================================
-// Phase 2: Execute Operation
+// Phase 2: Gather (Volume Scan)
+// ============================================================================
+
+/**
+ * @brief Runs the LCN/hash scan and populates ctx.scan.
+ */
+std::expected<bool, std::wstring> gather(DedupContext& ctx, output::IOutput& out) {
+    ctx.out = &out;
+
+    // Pair-wise mode only ever needs fileRef/fileOp's own clusters, so restrict
+    // the scan to those two paths - a full volume enumeration would otherwise
+    // be performed for no benefit (see build_lcn_index_for_files' targeted mode).
+    auto scan = ctx.is_volume_wide
+        ? inspect::build_lcn_index_for_files(ctx.volume_root, inspect::ScanMode::kWithHash, out)
+        : inspect::build_lcn_index_for_files(ctx.volume_root, inspect::ScanMode::kWithHash, out,
+                                              ctx.target_paths);
+    if (!scan) return std::unexpected(scan.error());
+    ctx.scan = std::move(*scan);
+
+    // Pair-wise: confirm both files appear in the scan.
+    if (!ctx.is_volume_wide) {
+        const std::wstring& p1 = ctx.target_paths[0];
+        const std::wstring& p2 = ctx.target_paths[1];
+        bool found1 = false, found2 = false;
+        for (const auto& path : ctx.scan.file_table) {
+            if (path == p1) found1 = true;
+            if (path == p2) found2 = true;
+            if (found1 && found2) break;
+        }
+        if (!found1) out.message(output::Level::warn,
+            L"File not found in scan results: " + p1);
+        if (!found2) out.message(output::Level::warn,
+            L"File not found in scan results: " + p2);
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Phase 3: Execute Operation
 // ============================================================================
 
 /**
@@ -663,14 +677,14 @@ static int finalize_and_report(const DedupContext& context, bool dry_run) {
 }
 
 // ============================================================================
-// Phase 2: Execute
+// Phase 3: Execute
 // ============================================================================
 
 std::expected<int, std::wstring> execute(DedupContext& ctx, output::IOutput& out) {
     ctx.out = &out;
 
     out.message(output::Level::info,
-        L"[dedup.execute] Scanning " + ctx.volume_root + L"...");
+        L"[dedup.execute] Building rebuild plan for " + ctx.volume_root + L"...");
 
     // Precompute auxiliary maps shared by all strategies and rebuild_file().
     // file_clusters expands the interval index back to one entry per cluster:
@@ -717,7 +731,7 @@ std::expected<int, std::wstring> execute(DedupContext& ctx, output::IOutput& out
 }
 
 // ============================================================================
-// Phase 3: Cleanup
+// Phase 4: Cleanup
 // ============================================================================
 
 void cleanup(DedupContext* ctx) noexcept {

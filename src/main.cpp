@@ -282,7 +282,12 @@ int wmain(int argc, wchar_t* argv[]) {
         if (!ctx) {
             run_res = std::unexpected(ctx.error());
         } else {
-            run_res = dedup::execute(**ctx, *out);
+            auto gather_ok = dedup::gather(**ctx, *out);
+            if (!gather_ok) {
+                run_res = std::unexpected(gather_ok.error());
+            } else {
+                run_res = dedup::execute(**ctx, *out);
+            }
             dedup::cleanup(*ctx);
         }
     } else if (args.command == L"volume" || args.command == L"vol") {

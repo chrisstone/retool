@@ -18,14 +18,14 @@ namespace dedup {
 struct DedupContext;
 
 /**
- * @brief Phase 1 - Validates arguments, scans the volume, and builds the dedup plan.
+ * @brief Phase 1 - Validates arguments and selects the dedup strategy.
  *
  * Accepts either:
  *  - A single kVolume specifier (e.g. E:) for volume-wide deduplication.
  *  - Two kPath specifiers for pair-wise deduplication of fileRef and fileOp.
  *
- * This phase performs the volume scan (FSCTL_GET_RETRIEVAL_POINTERS + SHA-256 hash)
- * and constructs the rebuild plans. It is the most time-consuming phase.
+ * No filesystem scanning is performed here (no real IOutput exists yet at this
+ * point in main()) - that is gather()'s job.
  *
  * @param args Parsed CLI arguments.
  * @return Heap-allocated DedupContext on success, or error string on failure.
@@ -34,19 +34,32 @@ struct DedupContext;
 std::expected<DedupContext*, std::wstring> prepare(const util::CliArg& args);
 
 /**
- * @brief Phase 2 - Executes the deduplication rebuild plans.
+ * @brief Phase 2 - Scans the volume and populates the context with LCN/hash data.
+ *
+ * Performs the volume scan (FSCTL_GET_RETRIEVAL_POINTERS + SHA-256 hash). It is
+ * the most time-consuming phase, so it runs with a real IOutput so progress is
+ * visible - unlike prepare(), which runs before main() has constructed one.
+ *
+ * @param ctx  Context produced by prepare().
+ * @param out  Output interface for status and progress.
+ * @return true on success, or error string on failure.
+ */
+std::expected<bool, std::wstring> gather(DedupContext& ctx, output::IOutput& out);
+
+/**
+ * @brief Phase 3 - Builds and executes the deduplication rebuild plans.
  *
  * Issues FSCTL_DUPLICATE_EXTENTS_TO_FILE for each cluster that can be shared.
  * Respects dry-run mode and Ctrl+C cancellation.
  *
- * @param ctx  Context produced by prepare().
+ * @param ctx  Context produced by prepare() and populated by gather().
  * @param out  Output interface for status, progress, and summary results.
  * @return Exit code on success, or error string on failure.
  */
 std::expected<int, std::wstring> execute(DedupContext& ctx, output::IOutput& out);
 
 /**
- * @brief Phase 3 - Releases all resources held by the context and deletes it.
+ * @brief Phase 4 - Releases all resources held by the context and deletes it.
  *
  * Must be called even if execute() failed or was cancelled.
  *
